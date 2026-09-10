@@ -1,0 +1,21 @@
+# Byggekontekst for Dockerfile.agent er FAU-prosjektroten, som inneholder lokale
+# hemmeligheter (.env med TTYD_PASSWORD) og hele dokumentasjonen. Ingenting av
+# det skal sendes til Docker-daemonen eller kunne havne i imaget ved en feil.
+#
+# Strategi: ekskluder alt, og ta bare inn igjen det bygget faktisk trenger.
+# Foreldremapper må gjeninkluderes eksplisitt, ellers beskjæres treet.
+*
+
+# Favro-CLI-kilden bygges inn i imaget (cargo install --locked).
+!.agents
+.agents/*
+!.agents/skills
+.agents/skills/*
+!.agents/skills/favro
+.agents/skills/favro/*
+!.agents/skills/favro/favro-cli
+.agents/skills/favro/favro-cli/target
+
+# Byggeinstruksjonene selv.
+!Dockerfile.agent
+!.dockerignore

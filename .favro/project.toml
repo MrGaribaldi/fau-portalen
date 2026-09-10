@@ -1,0 +1,118 @@
+[project]
+collection = "FAU-plattform"
+default_human = "owner"
+visibility = "users"
+
+[workflow]
+lanes = ["Inbox", "Backlog", "Ready", "In Progress", "Waiting", "Blocked", "Review", "Done"]
+inbox = "Inbox"
+backlog = "Backlog"
+ready = "Ready"
+doing = "In Progress"
+waiting = "Waiting"
+blocked = "Blocked"
+review = "Review"
+done = "Done"
+
+[interviews]
+card_granularity = "topic"
+
+[templates]
+work = "Purpose/outcome:\nNext action:\nAcceptance:"
+code = "Change:\nAcceptance:"
+
+[completion]
+require_result = true
+require_review = true
+
+[history]
+require_archive_reference = true
+path = "docs/planning-decisions.md"
+
+[compatibility]
+# legacy_cache_path = "/absolute/path/to/pre-0.2/favro-state.json"
+allow_unassigned_handoffs = false
+
+[credentials]
+env_files = ["/infra-runtime/infrastructure/favro.env"]
+
+
+[auth.primary]
+email_env = "FAVRO_EMAIL"
+token_env = "FAVRO_TOKEN"
+user_id = "LvyDh64LZp5peZRS5"
+
+[participants.owner]
+user_id = "LvyDh64LZp5peZRS5"
+
+[roles.product]
+emoji = "🧭"
+label = "Produkt og prosjektledelse"
+board = "Produkt og prosjektledelse"
+auth = "primary"
+
+[roles.organization]
+emoji = "👥"
+label = "Brukerbehov og FAU-organisering"
+board = "Brukerbehov og FAU-organisering"
+auth = "primary"
+
+[roles.architecture]
+emoji = "🧱"
+label = "Systemarkitektur og datamodell"
+board = "Systemarkitektur og datamodell"
+auth = "primary"
+
+[roles.security]
+emoji = "🔐"
+label = "Sikkerhet og GDPR"
+board = "Sikkerhet og GDPR"
+auth = "primary"
+
+[roles.infra]
+emoji = "💾"
+label = "Infrastruktur, drift og lagringsøkonomi"
+board = "Infrastruktur, drift og lagringsøkonomi"
+auth = "primary"
+
+[roles.ux]
+emoji = "🎨"
+label = "UX og universell utforming"
+board = "UX og universell utforming"
+auth = "primary"
+
+[roles.market]
+emoji = "💰"
+label = "Forretningsmodell, marked og prising"
+board = "Forretningsmodell, marked og prising"
+auth = "primary"
+
+[roles.legal]
+emoji = "⚖️"
+label = "Juridiske rammer og avtaler"
+board = "Juridiske rammer og avtaler"
+auth = "primary"
+
+[roles.quality]
+emoji = "🧪"
+label = "Kvalitet, test og risiko"
+board = "Kvalitet, test og risiko"
+auth = "primary"
+
+[roles.sales]
+emoji = "📣"
+label = "Salg, pilotering og kundekontakt"
+board = "Salg, pilotering og kundekontakt"
+auth = "primary"
+
+[roles.backend]
+emoji = "🦀"
+label = "Backend og integrasjon"
+board = "Backend og integrasjon"
+auth = "primary"
+
+[roles.frontend]
+emoji = "🖥️"
+label = "Frontend og nettsted"
+board = "Frontend og nettsted"
+auth = "primary"

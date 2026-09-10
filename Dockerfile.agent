@@ -1,0 +1,153 @@
+# FAU-eid agent-image: agent-box + verktøykjeden FAU og /opt/infra-tools krever.
+#
+# Rebuild gjøres fra verten, i FAU-mappen der denne fila og docker-compose.yml ligger:
+#   docker compose build agent
+#   docker compose up -d agent
+#
+# docker-compose.yml peker agent-tjenesten hit med context "." (FAU-prosjektroten),
+# fordi Favro-CLI-kilden i .agents/skills/favro/favro-cli bygges inn. .dockerignore
+# holder .env og resten av prosjektet utenfor byggekonteksten.
+#
+# Kontrollert i basisimaget 8. september 2026, derfor IKKE reinstallert her:
+#   terraform 1.16.1 (infra-tools krever >= 1.15.0), docker compose v5.5.1,
+#   node 22.23.2, npm 10.9.8, python 3.13.5, kubectl 1.37.0, git 2.47.3, ssh, ttyd.
+# Basisimaget mangler derimot C-kompilator/linker (ingen cc/gcc/make/pkg-config),
+# som Rust-bygg krever. Entrypoint /ep.sh og Claude-funksjonene beholdes uendret.
+#
+# Observert lokal digest 8. september 2026:
+#   sha256:9c7d39007dfd4b219916caa8c34cb0d561bea6697db597d90739ae960c081d5b
+# Taggen beholdes i FROM slik at bygget også virker når verten henter imaget på
+# nytt fra GHCR; digesten står her som kontrollpunkt.
+FROM ghcr.io/akantodevs/agent-box:v1.4.2
+
+# Basisimaget har ingen USER (kjører /ep.sh som root, som dropper til claude).
+USER root
+
+# ---------------------------------------------------------------------------
+# Systempakker
+# ---------------------------------------------------------------------------
+# gcc, libc6-dev, make, pkg-config
+#   C-kompilator og linker for Rust-bygg. Favro-CLI-ens avhengighetskjede
+#   (rustls 0.23 -> ring 0.17 via cc 1.2) kompilerer C, og basisimaget har
+#   ingen cc i det hele tatt. Trengs også for FAU-backend i Rust senere.
+# wireguard-tools, iptables, openresolv
+#   Prerequisite i infra-tools/readme.md, brukt fra steg 1 for å nå clusteret
+#   over privatnett. Pakkene i imaget gir i seg selv INGEN nettverkstilgang:
+#   NET_ADMIN og /dev/net/tun er bevisst ikke gitt i docker-compose.yml. VPN-
+#   ruting fra agentmiljøet er en egen beslutning før steg 1 (pre-0-guide S12)
+#   og er ikke nødvendig for steg 0. De ligger her nå bare for å unngå en ny
+#   verts-rebuild når steg 1 skal forberedes.
+# age
+#   Manuell inspeksjon/dekryptering av age-nøkkelen steg 0 lager. Steg 0 selv
+#   trenger den ikke: nøkkelen genereres av terraform-provideren
+#   clementblaise/age, ikke av et CLI (shared-modules/sops/main.tf).
+# postgresql-client
+#   psql mot den senere db-tjenesten i denne compose-stacken.
+# sudo
+#   Kun for å reise WireGuard-tunnelen. cap_add: NET_ADMIN i docker-compose.yml
+#   fyller containerens bounding set, som bare root-prosesser arver; sesjonen
+#   kjører som claude (uid 1000). Uten en smal sudo-regel er wg-quick ubrukelig
+#   selv med NET_ADMIN. Regelen under gir claude NOPASSWD på wg-quick, wg og ip
+#   og ingenting annet. Containeren bind-mounter allerede Docker-socketen, som
+#   basis-entrypointen selv kaller root-ekvivalent på verten, så dette er en
+#   marginal utvidelse.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      gcc \
+      libc6-dev \
+      make \
+      pkg-config \
+      wireguard-tools \
+      iptables \
+      openresolv \
+      age \
+      postgresql-client \
+      sudo \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# SOPS
+# ---------------------------------------------------------------------------
+# Versjonen infra-tools/readme.md pinner for gitops-secrets (day-2-drift, ikke
+# steg 0). Ikke i Debian trixie, så det pinnede release-binæret hentes og
+# sjekksummeres mot getsops sin publiserte checksums-fil.
+ARG SOPS_VERSION=3.11.0
+ARG SOPS_SHA256=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
+RUN curl -fsSL -o /tmp/sops \
+      "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" \
+ && echo "${SOPS_SHA256}  /tmp/sops" | sha256sum -c - \
+ && install -m 0755 /tmp/sops /usr/local/bin/sops \
+ && rm -f /tmp/sops \
+ && sops --version --disable-version-check
+
+# ---------------------------------------------------------------------------
+# WireGuard: smal sudo-regel
+# ---------------------------------------------------------------------------
+# Trengs fra steg 1 for å nå clusteret over privatnett: kubeconfig.yaml peker på
+# https://10.0.1.250:6443, og klientkonfigurasjonen ligger i runtime-volumet som
+# .config/fau.conf.
+#
+# Bare to kommandoer, ingen wildcard-shell. ip og resolvconf trenger IKKE egne
+# regler: wg-quick kjører selv som root under sudo, så alt det kaller internt er
+# allerede root. Verifiserte stier i imaget: /usr/bin/wg-quick og /usr/bin/wg.
+RUN printf '%s\n' \
+      'claude ALL=(root) NOPASSWD: /usr/bin/wg-quick, /usr/bin/wg' \
+      > /etc/sudoers.d/50-wireguard \
+ && chmod 0440 /etc/sudoers.d/50-wireguard \
+ && visudo -c -f /etc/sudoers.d/50-wireguard
+
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+# Favro-CLI krever Rust >= 1.82 (favro-cli/Cargo.toml), og FAU-backend skal
+# skrives i Rust. Toolchainen legges systemvidt, ikke i /home/claude, fordi
+# hjemmemappa bare er vedvarende for .claude og .codex.
+ARG RUST_VERSION=1.98.1
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_INIT_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL -o /tmp/rustup-init \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+ && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+ && chmod 0755 /tmp/rustup-init \
+ && /tmp/rustup-init -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_VERSION}" \
+      --component clippy --component rustfmt \
+ && rm -f /tmp/rustup-init \
+ && chmod -R a+w "${RUSTUP_HOME}" "${CARGO_HOME}" \
+ && rustc --version \
+ && cargo --version
+
+# Sesjonsterminalen er et login-shell og setter PATH fra Debian-standarden, ikke
+# fra imagets ENV. Uten denne profilfila er cargo/rustc usynlig i sesjonene.
+RUN printf '%s\n' \
+      'export RUSTUP_HOME=/usr/local/rustup' \
+      'export CARGO_HOME=/usr/local/cargo' \
+      'case ":$PATH:" in' \
+      '  *":/usr/local/cargo/bin:"*) ;;' \
+      '  *) PATH="/usr/local/cargo/bin:$PATH"; export PATH ;;' \
+      'esac' \
+      > /etc/profile.d/rust.sh \
+ && chmod 0644 /etc/profile.d/rust.sh
+
+# ---------------------------------------------------------------------------
+# Favro-CLI
+# ---------------------------------------------------------------------------
+# Bygges inn i /usr/local/bin, som ligger på PATH i både login-shell og
+# `docker compose exec`. Da er `favro` tilgjengelig med én gang og også etter at
+# containeren gjenopprettes; ~/.cargo/bin ville forsvunnet ved recreate.
+# --locked bruker Cargo.lock som ligger i skillen. Endres CLI-kilden uten ny
+# verts-rebuild, kan agenten bygge lokalt:
+#   cargo install --path /workspace/.agents/skills/favro/favro-cli \
+#     --locked --root "$HOME/.local"
+# og legge $HOME/.local/bin først på PATH.
+COPY .agents/skills/favro/favro-cli /usr/local/src/favro-cli
+RUN cargo install --path /usr/local/src/favro-cli --locked --root /usr/local \
+ && rm -rf /usr/local/src/favro-cli "${CARGO_HOME}/registry" "${CARGO_HOME}/git" \
+ && favro --version
+
+# Credentials hører ikke hjemme i imaget eller i Compose: Favro-CLI leser
+# /infra-runtime/infrastructure/favro.env via .favro/project.toml, og Terraform
+# leser .credentials.tfvars fra samme private volum.

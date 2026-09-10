@@ -1,0 +1,29 @@
+[package]
+name = "favro-cli"
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.82"
+description = "Project-configured Favro CLI for human and agent collaboration."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/MrGaribaldi/favro-agent-skill"
+
+# The published crate is `favro-cli`; the installed command stays `favro`, which
+# is what SKILL.md, the references and every runtime allow-rule invoke.
+[[bin]]
+name = "favro"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json", "tls"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

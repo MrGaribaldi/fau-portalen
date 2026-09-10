@@ -1,0 +1,5 @@
+# Build output only. The favro-cli SOURCE is committed on purpose: Dockerfile.agent
+# does COPY .agents/skills/favro/favro-cli followed by cargo install --path --locked,
+# so a clone without this source cannot build the agent image. .dockerignore draws the
+# same line - source in, target out.
+target/

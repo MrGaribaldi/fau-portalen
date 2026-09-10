@@ -1,0 +1,20 @@
+# Local environment. .env holds TTYD_PASSWORD and host paths; the .env* rule also
+# catches editor backups like .env~, which the earlier .env/*.env pair did not.
+.env*
+*.env
+!.env.example
+
+# Terraform never runs here (it runs in /infra-runtime/infrastructure), but state,
+# variables and plans are excluded anyway so they cannot be committed by accident.
+*.tfvars
+*.tfstate*
+*.tfplan
+.terraform/
+.config/
+
+__pycache__/
+
+# Claude Code per-machine state. settings.local.json is machine-local permission
+# state, not project configuration; shared skills or settings under .claude/ are
+# still committed, so only this file is excluded.
+.claude/settings.local.json

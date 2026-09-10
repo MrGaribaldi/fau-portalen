@@ -1,0 +1,10 @@
+# Terraform never runs in the workspace; it runs in /infra-runtime/infrastructure.
+# These patterns exist so state or secrets can never be committed if that ever changes.
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+*.lock.info
+.terraform/
+.terraform.lock.hcl
+.config/

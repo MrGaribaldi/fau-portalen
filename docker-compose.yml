@@ -1,0 +1,43 @@
+name: fau-mvp
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: fau/agent-box:v1.4.2-fau
+    init: true
+    ports:
+      - "127.0.0.1:8112:8090"
+      - "127.0.0.1:8113:8091"
+    environment:
+      AGENT_NAME: fau-mvp
+      REMOTE_CONTROL_NAME: fau-mvp
+      SESSION_LIST_PUBLIC_PORT: 8112
+      AGENT_TABS_PUBLIC_PORT: 8113
+      TTYD_USER: "${TTYD_USER:-admin}"
+      TTYD_PASSWORD: "${TTYD_PASSWORD:?Set local terminal password}"
+      CLAUDE_MODEL: opus
+      ALLOW_TERRAFORM_MODIFY: Ask
+    # WireGuard mot privatnettet 10.0.0.0/14 fra steg 1. kubeconfig.yaml peker på
+    # https://10.0.1.250:6443, som bare er nåbar gjennom tunnelen eller via
+    # vpn-router som SSH-bastion. wireguard-tools ligger allerede i imaget;
+    # uten disse to linjene finnes ikke /dev/net/tun og CapEff er null, så
+    # wg-quick er installert men ubrukelig. Dockerfile.agent legger til en smal
+    # sudo-regel for wg-quick/wg, fordi cap_add bare treffer root-prosesser og
+    # sesjonen kjører som claude. Reis tunnelen med:
+    #   sudo wg-quick up /infra-runtime/infrastructure/.config/fau.conf
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "${FAU_HOST_PATH:?Set absolute FAU host path}:/workspace:z"
+      - "${INFRA_TOOLS_HOST_PATH:?Set absolute infra-tools host path}:/opt/infra-tools:ro"
+      - claude-data:/home/claude/.claude
+      - codex-data:/home/claude/.codex
+      - infra-runtime:/infra-runtime
+volumes:
+  claude-data:
+  codex-data:
+  infra-runtime:

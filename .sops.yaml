@@ -1,0 +1,5 @@
+# This file is a template for the sops configuration file. It should be commmited to the repository.
+creation_rules:
+  - path_regex: '.*gitops[\\/].*\.yaml$'
+    encrypted_regex: '^(data|stringData)$'
+    age: age135aql83qcmr2n4haspdmwwq6vlw35rm083jgr3scwdk7hnt5xuvq2y0ytl

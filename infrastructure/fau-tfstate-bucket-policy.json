@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Id": "fau-tfstate-no-accidental-destruction",
+  "Statement": [
+    {
+      "Sid": "DenyPermanentVersionDeletion",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:DeleteObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::fau-tfstate/*"
+    },
+    {
+      "Sid": "DenyBucketDestructionAndVersioningChange",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:DeleteBucket",
+        "s3:PutBucketVersioning"
+      ],
+      "Resource": "arn:aws:s3:::fau-tfstate"
+    }
+  ]
+}

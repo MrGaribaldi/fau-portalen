@@ -11,7 +11,7 @@ Godkjente premisser er Rust-backend, TypeScript med et lett frontendrammeverk, P
 
 Ny føring: Erik ønsker å undersøke eksisterende dedikert server som rimelig start, med senere flytting til andre noder. Det åpner for en annen fysisk topologi enn tre cloud-servere; endelig valg er uavklart. [Vurderingen](existing-server-assessment.md) beskriver VM-alternativ, hybridalternativ og nødvendig lagringstilpasning. Appimage, HTTP-kontrakt og separate migreringer beholdes i forslaget uansett fysisk plassering.
 
-Nye forslag til godkjenning er ett applikasjonsrepo, én produksjonsimage med ferdigbygd frontend, en modulær Rust-applikasjon, eget migreringssteg og driftskontrakten nedenfor. Frontendrammeverk velges i #3415. Rust HTTP-/databasebibliotek og eksakte verktøyversjoner spesifiseres ved implementasjon og dokumenteres med lockfiler; denne ADR-en velger ingen uavklart leverandør eller identitetstjeneste.
+Nye forslag til godkjenning er ett applikasjonsrepo, én produksjonsimage med ferdigbygd frontend, en modulær Rust-applikasjon, eget migreringssteg og driftskontrakten nedenfor. Frontendvalget i #3415/#3493 er Rust-renderet HTML/htmx, med Lexical i en isolert React-side for redigering. Rust HTTP-/databasebibliotek og eksakte verktøyversjoner spesifiseres ved implementasjon og dokumenteres med lockfiler; denne ADR-en velger ingen uavklart leverandør eller identitetstjeneste.
 
 ## Repository og bygg
 

@@ -1,6 +1,8 @@
 # ADR-002: URL scheme and public addressing
 
-Status: proposed, 9 September 2026. Amends ADR-001 (docs/repo-container-contract.md), which
+Status: **accepted 10 September 2026** (#3446), with the three open questions answered: UUIDv7,
+manual review of the unverified-school queue at about a week's turnaround, and a malware scanner in
+the ingest pipeline. Amends ADR-001 (docs/repo-container-contract.md), which
 reserves `/`, `/app/`, `/api/v1/`, `/assets/` and `/health/` but does not define public
 addressing. Decisions recorded here were taken with Erik in conversation on 9 September 2026 and
 are logged in docs/planning-decisions.md.
@@ -34,6 +36,7 @@ the register, never keys. This is the only assumption the cases above do not bre
 
 Document IDs are UUIDs specifically so that a shared link is unambiguous: per-tenant sequential
 IDs would make `/app/dokumenter/1001` valid in two different FAU-er for a member of both.
+**Accepted 10 September 2026: UUIDv7**, with the creation-time leak explicitly accepted by Erik.
 Recommended UUIDv7 rather than v4 — same uniqueness, time-ordered so it does not fragment the
 Postgres index on a growing table. The tradeoff is that v7 embeds a creation timestamp, which
 leaks nothing meaningful to someone who can already open the resource. #3412's composite
@@ -199,7 +202,10 @@ tenant and an outbound email.
 must not wait on our review — but receives **only** its `/s/<uuid>` address. The pretty slug is
 issued on verification. Nobody can squat a real school's readable URL by inventing it first, and
 legitimate users are never blocked. The referat link is the evidence in the resulting review
-queue.
+queue. **Who reviews it, decided 10 September 2026:** Erik does, manually, possibly with agent
+assistance, aiming at about a week's turnaround. A week is a deliberate service level rather than a
+guess, and it is what makes the `/s/<uuid>`-only address a real answer rather than a placeholder:
+an unverified school works fully for that week, it just has no pretty slug and stays `noindex`.
 
 ## Document ingest and sanitisation
 
@@ -249,8 +255,19 @@ fails, is quarantined and flagged for review rather than stored as servable. For
 submission the school is still created — a real FAU must not be blocked — and the reviewer sees
 the failure.
 
-Malware scanning is a separate concern from active-content stripping and is not covered by it;
-whether to add a scanner to the pipeline is an open item rather than a decision here.
+Malware scanning is a separate concern from active-content stripping and is not covered by it.
+**Decided 10 September 2026: a scanner goes in the pipeline.** Erik's reason widens the scope
+beyond school submissions - FAU-er will upload their own existing document archives, which is
+exactly the material most likely to carry something old and infected, and it arrives from people
+who are not attackers and cannot be expected to vet it.
+
+That forces one decision this document does not make, because it is a supplier question rather
+than a routing one: **an external scanning API would send member documents out of the cluster**,
+which makes the scanner a customer-facing supplier under the 9 September ownership policy - European
+ownership required, and a new entry on #3409. A scanner running in-cluster, ClamAV being the obvious
+candidate, keeps the documents inside the boundary and needs no supplier decision at all. The
+in-cluster route also costs memory: a ClamAV daemon holds its signature database resident, which is
+a real number to fold into the sizing on #3408 rather than an afterthought. Tracked on #3447.
 
 ## Resolution and redirect semantics
 

@@ -64,6 +64,11 @@ struct Inner {
     initialised: AtomicBool,
     shutting_down: AtomicBool,
     cache: Mutex<Option<CachedReady>>,
+    /// Whether the most recent real database/schema-contract check (`check`, below)
+    /// was `Ready`. Used only to rate-limit [`check`]'s own warning to a state
+    /// transition (ready -> not ready), per ruling 7 -- not part of the readiness
+    /// result itself, and never consulted by `probe_with`'s cache logic.
+    was_ready: AtomicBool,
 }
 
 /// Shared readiness state (design section 9). `Clone` because axum's `State`
@@ -78,6 +83,7 @@ impl ReadinessState {
             initialised: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             cache: Mutex::new(None),
+            was_ready: AtomicBool::new(true),
         }))
     }
 
@@ -111,7 +117,7 @@ impl ReadinessState {
     /// result is cached; `NotReady` is returned as-is and never stored, so the very
     /// next call re-checks for real.
     pub async fn probe(&self, pool: &PgPool) -> Readiness {
-        self.probe_with(|| check(pool)).await
+        self.probe_with(|| check(pool, &self.0.was_ready)).await
     }
 
     /// The shared implementation behind [`ReadinessState::probe`], parameterised
@@ -176,32 +182,84 @@ impl Default for ReadinessState {
 /// table) cannot hang a scrape past this bound. A timeout here is reported the same
 /// as any other database failure: [`NotReadyReason::Database`], never a distinct
 /// reason, since it says nothing about the schema contract's actual version.
-async fn check(pool: &PgPool) -> Readiness {
-    match tokio::time::timeout(READINESS_CHECK_TIMEOUT, run_checks(pool)).await {
+async fn check(pool: &PgPool, was_ready: &AtomicBool) -> Readiness {
+    match tokio::time::timeout(READINESS_CHECK_TIMEOUT, run_checks(pool, was_ready)).await {
         Ok(result) => result,
-        Err(_elapsed) => Readiness::NotReady(NotReadyReason::Database),
+        Err(_elapsed) => {
+            if should_warn(was_ready) {
+                tracing::warn!(
+                    reason = "database",
+                    kind = "timed out waiting for a response",
+                    "readiness probe failed"
+                );
+            }
+            Readiness::NotReady(NotReadyReason::Database)
+        }
     }
+}
+
+/// Whether a just-observed failure is worth a `WARN` line: true exactly once per
+/// transition from ready into not-ready (ruling 7), so a probe polled every few
+/// seconds during an extended outage produces one line, not one per scrape. Reset by
+/// [`note_ready`] the next time a check succeeds, so the next failure after a
+/// recovery logs again. The message itself stays at each call site so it can carry
+/// whatever safe, structured fields are relevant there (a fixed `kind` string for a
+/// database failure, `found`/`minimum` integers for a schema-contract one) rather
+/// than being forced through one generic shape -- never the DSN or a database error's
+/// own `Display` either way.
+fn should_warn(was_ready: &AtomicBool) -> bool {
+    was_ready.swap(false, Ordering::SeqCst)
+}
+
+/// The other half of [`should_warn`]'s state machine: marks the next failure as worth
+/// logging again.
+fn note_ready(was_ready: &AtomicBool) {
+    was_ready.store(true, Ordering::SeqCst);
 }
 
 /// The two queries `check` bounds together, run sequentially with no timeout of
 /// their own at this level (`db_check` has its own inner one-second bound as a
 /// defence in depth; `read_contract_version` has none until `check`'s outer timeout
 /// wraps it here).
-async fn run_checks(pool: &PgPool) -> Readiness {
-    if fau_persistence::db_check(pool).await.is_err() {
+async fn run_checks(pool: &PgPool, was_ready: &AtomicBool) -> Readiness {
+    if let Err(e) = fau_persistence::db_check(pool).await {
+        if should_warn(was_ready) {
+            tracing::warn!(reason = "database", kind = %e, "readiness probe failed");
+        }
         return Readiness::NotReady(NotReadyReason::Database);
     }
 
     match fau_persistence::read_contract_version(pool).await {
-        Ok(found) if fau_domain::is_compatible(found) => Readiness::Ready,
-        Ok(found) => Readiness::NotReady(NotReadyReason::SchemaContract {
-            found,
-            minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
-        }),
+        Ok(found) if fau_domain::is_compatible(found) => {
+            note_ready(was_ready);
+            Readiness::Ready
+        }
+        Ok(found) => {
+            if should_warn(was_ready) {
+                tracing::warn!(
+                    reason = "schema_contract",
+                    found,
+                    minimum = fau_domain::MINIMUM_CONTRACT_VERSION,
+                    "readiness probe failed"
+                );
+            }
+            Readiness::NotReady(NotReadyReason::SchemaContract {
+                found,
+                minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
+            })
+        }
         // A database that has never been migrated reads as contract version 0 --
         // below any real minimum, so it takes the same not-ready path as an
         // explicit low version (mirrors `main.rs`'s startup gate).
         Err(e) if fau_persistence::is_undefined_table(&e) => {
+            if should_warn(was_ready) {
+                tracing::warn!(
+                    reason = "schema_contract",
+                    found = 0,
+                    minimum = fau_domain::MINIMUM_CONTRACT_VERSION,
+                    "readiness probe failed"
+                );
+            }
             Readiness::NotReady(NotReadyReason::SchemaContract {
                 found: 0,
                 minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
@@ -212,7 +270,13 @@ async fn run_checks(pool: &PgPool) -> Readiness {
         // rather than a schema-contract one -- `db_check` just above already proved
         // the database itself was reachable a moment earlier, so this is a
         // transient or narrower issue, not evidence the schema is wrong.
-        Err(_) => Readiness::NotReady(NotReadyReason::Database),
+        Err(e) => {
+            if should_warn(was_ready) {
+                let kind = fau_persistence::safe_error_kind(&e);
+                tracing::warn!(reason = "database", kind, "readiness probe failed");
+            }
+            Readiness::NotReady(NotReadyReason::Database)
+        }
     }
 }
 

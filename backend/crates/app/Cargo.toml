@@ -10,7 +10,9 @@ name = "fau"
 path = "src/main.rs"
 
 [features]
-# Routes used only by the shutdown integration tests. Never enabled in the image.
+# Routes used only by integration tests exercising behaviour that is hard to trigger
+# through the ordinary HTTP surface -- a future graceful-shutdown test, and today
+# `/test/panic` for tests/panic_handling.rs. Never enabled in the built image.
 test-routes = []
 
 [dependencies]

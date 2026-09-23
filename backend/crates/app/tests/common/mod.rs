@@ -843,6 +843,42 @@ pub async fn spawn_serve_with_env(db: &TestDb, extra_env: &[(&str, &str)]) -> Se
     handle
 }
 
+/// As [`spawn_serve`], but with the runtime `DATABASE_URL`'s password replaced by
+/// `SENTINEL_DB_PASSWORD` -- a wrong password against the real, migrated test
+/// database, so a connection attempt genuinely fails (SQLSTATE 28P01) rather than
+/// merely going untried. Task 10's sentinel-secrets test uses this to prove a DSN's
+/// password never reaches log output even on the classic path a leak has
+/// historically come from: a failed connection's own error message. Hits
+/// `/health/ready` once before returning -- forcing that failure to actually happen
+/// here, rather than depending on the caller to trigger it.
+pub async fn spawn_serve_with_sentinels(db: &TestDb) -> ServeHandle {
+    let app = spawn_serve_with_sentinels_and_env(db, &[]).await;
+    app.get("/health/ready").await;
+    app
+}
+
+/// As [`spawn_serve_with_sentinels`], with `extra_env` layered on top -- e.g.
+/// `LOG_LEVEL=warn` -- and, unlike it, **no** internal `/health/ready` call: a
+/// caller that needs to know exactly which request produced a given log line (the
+/// fix-round-2 test proving a readiness `WARN` carries the *calling* request's own
+/// id) needs its own call to be the only one, since `readiness`'s own warning is
+/// itself rate-limited to one line per ready-to-not-ready transition -- a second
+/// probe against the same still-failing database would not log again at all.
+pub async fn spawn_serve_with_sentinels_and_env(
+    db: &TestDb,
+    extra_env: &[(&str, &str)],
+) -> ServeHandle {
+    let mut dsn = url::Url::parse(&db.url()).expect("TestDb::url is a valid postgres URL");
+    dsn.set_password(Some("SENTINEL_DB_PASSWORD"))
+        .expect("set a sentinel password on the DSN");
+    let sentinel_dsn = dsn.to_string();
+
+    let mut env: Vec<(&str, &str)> = vec![("DATABASE_URL", sentinel_dsn.as_str())];
+    env.extend_from_slice(extra_env);
+
+    spawn_serve_with_env(db, &env).await
+}
+
 /// Waits for `/health/live` to answer, bounded by `timeout`. Checks
 /// [`ServeHandle::is_running`] on every iteration and once more immediately after a
 /// successful response, panicking with the captured stderr rather than either

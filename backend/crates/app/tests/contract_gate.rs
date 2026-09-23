@@ -25,6 +25,17 @@ async fn refuses_to_serve_below_the_minimum() {
         !stderr.contains(&dsn),
         "DSN (with password) leaked: {stderr}"
     );
+
+    // Fix round 1, item 8: ruling 4 also requires a JSON ERROR event on stdout for
+    // this refusal, in addition to (not instead of) the plain stderr line above.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|v| v["level"] == "ERROR"),
+        "no JSON ERROR refusal event found on stdout: {stdout}"
+    );
 }
 
 #[tokio::test]

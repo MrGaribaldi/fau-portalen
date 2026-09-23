@@ -24,6 +24,9 @@
 pub mod error;
 pub mod health;
 pub mod placeholder;
+pub mod request_context;
+#[cfg(feature = "test-routes")]
+mod test_routes;
 
 use axum::routing::get;
 use axum::Router;
@@ -34,17 +37,39 @@ use crate::readiness::ReadinessState;
 /// Shared state for every handler. `Clone` because axum's `State` extractor
 /// requires it; cheap to clone -- `ReadinessState` is an `Arc` internally and
 /// `PgPool` is a handle around its own connection pool, not the pool itself.
+/// `service_version` used to live here too, read by `main.rs`'s startup event and
+/// this module's own access-log line -- both now get it from
+/// `telemetry::JsonLineLayer` unconditionally instead, which removed its only
+/// readers, so the field itself was removed rather than left dead.
 #[derive(Clone)]
 pub struct AppState {
     pub readiness: ReadinessState,
     pub pool: PgPool,
-    pub version: &'static str,
 }
 
 /// Builds the full router. See the module doc comment for why the registration
 /// order below is load-bearing, not incidental.
+///
+/// `test_routes` (only under the `test-routes` feature, never enabled in the built
+/// image) is merged in before the two `.layer(...)` calls below, so a deliberate
+/// panic from `/test/panic` is exercised by the same `CatchPanicLayer` and
+/// `request_context::middleware` as any real route.
+///
+/// Two `.layer(...)` calls, in this order, after every route, nest and fallback
+/// above:
+///
+/// 1. `CatchPanicLayer`, so a handler panic answers with the same JSON error
+///    contract as any other failure (design section 11), never the raw panic text.
+/// 2. `request_context::middleware`, added last so it is the *outermost* layer --
+///    `Router::layer` wraps each route (and fallback) already present at the time
+///    it is called, which is what gives the middleware `MatchedPath` for a matched
+///    route and lets it see -- and log -- a fallback too. Being outermost also
+///    means it wraps `CatchPanicLayer`: a panic is caught *inside* the request's
+///    tracing span and task-local request id (`http::request_context`'s module doc
+///    comment), so `http::error::handle_panic`'s log line and response both still
+///    carry them.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
         .route("/", get(placeholder::page))
@@ -53,6 +78,15 @@ pub fn router(state: AppState) -> Router {
         .route("/app", get(placeholder::page))
         .route("/app/", get(placeholder::page))
         .route("/app/{*rest}", get(placeholder::page))
-        .fallback(error::json_not_found)
+        .fallback(error::json_not_found);
+
+    #[cfg(feature = "test-routes")]
+    let router = router.merge(test_routes::routes());
+
+    router
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            error::handle_panic,
+        ))
+        .layer(axum::middleware::from_fn(request_context::middleware))
         .with_state(state)
 }

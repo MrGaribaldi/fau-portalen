@@ -20,6 +20,11 @@ use serde::Serialize;
 pub enum ErrorCode {
     /// The requested route, or resource, does not exist.
     NotFound,
+    /// An unhandled server-side failure, including a caught handler panic. Carries
+    /// no detail: whatever caused it is not known to be safe to describe to a
+    /// client, so the message is a fixed word and the diagnosis lives in the
+    /// server-side log line the same request id ties it to, never in the response.
+    InternalError,
 }
 
 /// A bounded parameter value for an error response. An error can carry context (an
@@ -42,6 +47,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::NotFound).unwrap(),
             "\"not_found\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::InternalError).unwrap(),
+            "\"internal_error\""
         );
     }
 

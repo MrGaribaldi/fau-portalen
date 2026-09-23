@@ -13,8 +13,8 @@ use super::AppState;
 /// Touches the process only -- no database, mail, RabbitMQ, S3 or OTLP -- so that a
 /// dependency outage can never turn into a restart loop. Unauthenticated, so this
 /// carries no information beyond "the process is alive" -- in particular no
-/// service-version header; `AppState.version` is read from the startup banner
-/// instead (`main.rs`), not exposed here.
+/// service-version header; the service version is a log field
+/// (`telemetry::JsonLineLayer`), not exposed here.
 pub async fn live() -> StatusCode {
     StatusCode::OK
 }

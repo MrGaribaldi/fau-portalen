@@ -13,6 +13,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use tracing::level_filters::LevelFilter;
 use url::Url;
 
 /// A value that must never be printed. `Debug` and `Display` both redact, so a
@@ -135,6 +136,21 @@ impl FromStr for AppEnv {
     }
 }
 
+impl fmt::Display for AppEnv {
+    /// The exact configured string, round-tripped through `FromStr`'s own match arms
+    /// -- so the JSON startup event logs `"development"`, not `Debug`'s
+    /// `"Development"`. `#[derive(Debug)]`'s casing is a Rust-ism a log consumer
+    /// (and design section 4's own vocabulary) has no reason to expect.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Development => "development",
+            Self::Test => "test",
+            Self::Production => "production",
+        };
+        f.write_str(text)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
     pub app_env: AppEnv,
@@ -187,7 +203,28 @@ impl ServeConfig {
             return Err(err("DB_POOL_MAX_CONNECTIONS", ConfigProblem::Invalid));
         }
 
-        let log_level = optional("LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
+        let log_level_raw = optional("LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
+        // Validated as a `LevelFilter` -- not the fuller `tracing_subscriber::EnvFilter`
+        // grammar `telemetry::init` builds from it -- because `EnvFilter` treats an
+        // unrecognised bare word as a *target* name (matching every level for it)
+        // rather than rejecting it, so a typo like this task's own sentinel value
+        // would silently be accepted as "log everything from a crate named
+        // banana-sentinel" instead of failing loudly. `LevelFilter::from_str` has no
+        // such fallback: it only accepts trace/debug/info/warn/error/off (or 0-5),
+        // which is all `LOG_LEVEL` is meant to carry. `parsed` (this module's helper)
+        // discards the parse error itself, since `EnvFilter`'s own parse errors quote
+        // the offending input -- exactly what ruling 3 forbids reaching the output.
+        parsed::<LevelFilter>("LOG_LEVEL", &log_level_raw)?;
+        // Stored *trimmed*, not the raw value `parsed` validated: `parsed` trims
+        // before parsing (`raw.trim().parse()`), so a value like `"info "` passes
+        // validation, but `EnvFilter`'s own grammar does not tolerate the same
+        // trailing whitespace the same way -- an untrimmed bare word that fails
+        // `LevelFilter::from_str` is read by `EnvFilter` as a *target name* enabling
+        // only that one bogus target, not as the global default level, which
+        // silently turns off ordinary application logging. Trimming here, once,
+        // keeps `telemetry::init` (which builds the actual `EnvFilter` from this
+        // field) working from the same value that was actually validated.
+        let log_level = log_level_raw.trim().to_owned();
 
         // Read but never validated, never used -- see ACCEPTED_BUT_UNUSED's doc
         // comment. A missing or garbage value here must not fail startup.

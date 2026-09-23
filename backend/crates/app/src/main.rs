@@ -9,6 +9,7 @@ use clap::Parser;
 mod config;
 mod http;
 mod readiness;
+mod telemetry;
 
 use config::{MigrateConfig, ServeConfig};
 
@@ -98,6 +99,11 @@ enum StartupError {
 fn serve() -> Result<(), StartupError> {
     let config = ServeConfig::from_env()?;
 
+    // Installed as early as possible after configuration succeeds: from this point
+    // on, JSON to stdout is the only log transport (design section 10) -- no more
+    // `eprintln!`, anywhere, on any path below this line.
+    telemetry::init(&config.log_level, SERVICE_VERSION);
+
     // A synchronous top-level `main` (see `migrate`'s comment above) keeps
     // `--version` free of a runtime; `serve` builds its own here instead.
     let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for `serve`");
@@ -169,24 +175,25 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
     let state = http::AppState {
         readiness: readiness::ReadinessState::new(),
         pool: pool.clone(),
-        version: SERVICE_VERSION,
     };
 
-    // A plain startup line, not the JSON logging Task 10 adds -- just enough that
-    // an operator watching a fresh container can see it got past configuration and
-    // what it decided to do, without ever printing a secret. `database_url` is
-    // deliberately absent: it is the one field here that carries a password. Reads
-    // `state.version` rather than `SERVICE_VERSION` directly so the field on
-    // `AppState` has a real use beyond being stored. Printed before the
-    // schema-contract check below, which does real network I/O and must not delay
-    // this line -- an operator watching startup should see it got past
-    // configuration immediately, whatever the gate decides next.
-    eprintln!(
-        "fau: starting {} ({:?} env) on {}, public base {}, log level {}",
-        state.version, config.app_env, config.http_bind, config.public_base_url, config.log_level,
+    // Ruling 2: one JSON startup event, replacing the old plain-text banner.
+    // `database_url` is deliberately absent -- it is the one field the old banner
+    // never carried either, since it is the one field here that carries a password.
+    // `service_version` is not passed explicitly -- `telemetry::JsonLineLayer`
+    // inserts it into every line unconditionally, this one included. Logged before
+    // the schema-contract check below, which does real network I/O and must not
+    // delay this event -- an operator (or a dashboard) watching startup should see
+    // it got past configuration immediately, whatever the gate decides next.
+    tracing::info!(
+        app_env = %config.app_env,
+        http_bind = %config.http_bind,
+        public_base_url = %config.public_base_url,
+        log_level = %config.log_level,
+        "fau starting"
     );
     for (name, _value) in &config.accepted_but_unused {
-        eprintln!("fau: accepted but not yet used: {name}");
+        tracing::warn!(variable = name, "accepted but not yet used");
     }
 
     // The gate runs once, here, right after the pool is built (design section 5),
@@ -194,30 +201,37 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
     // never repeats the DSN in any message it produces.
     match check_schema_contract(&pool).await {
         ContractCheck::Version(found) if !fau_domain::is_compatible(found) => {
-            return Err(StartupError::SchemaContractBelowMinimum {
+            let err = StartupError::SchemaContractBelowMinimum {
                 found,
                 minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
-            });
+            };
+            // Ruling 4: a JSON ERROR event on stdout, in addition to (not instead
+            // of) the final plain `fau: ...` line `run()` still prints to stderr.
+            tracing::error!(error = %err, "refusing to serve");
+            return Err(err);
         }
         ContractCheck::Version(_) => {
             state.readiness.set_initialised();
         }
         ContractCheck::Retry(kind) => {
-            // Plain stderr until Task 10's JSON logging. `kind` is a fixed, safe
-            // description (never the sqlx `Display`, never a DSN). Local
-            // initialisation is otherwise complete at this point, so readiness is
-            // marked initialised here too -- it then stays false only because
-            // `ReadinessState::probe`'s own database/contract check keeps failing,
-            // and recovers on its own the moment the database answers again, with
-            // no separate background reconnect loop.
-            eprintln!(
-                "fau: warning: could not verify the schema contract at startup \
-                 ({kind}); continuing, readiness will retry"
+            // Ruling 4: a JSON WARN event on stdout only -- this path does not
+            // refuse to start, so there is no final stderr exit line to pair it
+            // with. `kind` is a fixed, safe description (never the sqlx `Display`,
+            // never a DSN). Local initialisation is otherwise complete at this
+            // point, so readiness is marked initialised here too -- it then stays
+            // false only because `ReadinessState::probe`'s own database/contract
+            // check keeps failing, and recovers on its own the moment the database
+            // answers again, with no separate background reconnect loop.
+            tracing::warn!(
+                kind,
+                "could not verify the schema contract at startup; continuing, readiness will retry"
             );
             state.readiness.set_initialised();
         }
         ContractCheck::Refuse(kind) => {
-            return Err(StartupError::SchemaContractCheckFailed { kind });
+            let err = StartupError::SchemaContractCheckFailed { kind };
+            tracing::error!(error = %err, "refusing to serve");
+            return Err(err);
         }
     }
 
@@ -228,12 +242,23 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
         .map_err(|e| StartupError::Bind {
             addr: config.http_bind,
             kind: e.kind(),
-        })?;
+        });
+    let listener = match listener {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to bind");
+            return Err(err);
+        }
+    };
 
-    axum::serve(listener, router)
+    if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| StartupError::Serve(e.kind()))?;
+    {
+        let err = StartupError::Serve(e.kind());
+        tracing::error!(error = %err, "http server error");
+        return Err(err);
+    }
 
     Ok(())
 }

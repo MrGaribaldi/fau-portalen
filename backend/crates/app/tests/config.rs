@@ -128,6 +128,47 @@ fn unknown_app_env_is_rejected_without_echoing_it() {
 }
 
 #[test]
+fn log_level_rejects_an_invalid_value_without_echoing_it() {
+    // Ruling 3 (Task 10): an invalid LOG_LEVEL must fail at startup as a
+    // configuration error naming the variable, and `EnvFilter`'s own parse errors
+    // quote their input -- so this must never be let through to the output either.
+    let mut env = serve_env_without("LOG_LEVEL");
+    env.push(("LOG_LEVEL", "banana-sentinel"));
+    let out = fau_with(&env, "serve");
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(text.contains("LOG_LEVEL"), "output was: {text}");
+    assert!(!text.contains("banana-sentinel"), "value leaked: {text}");
+}
+
+#[tokio::test]
+async fn log_level_with_surrounding_whitespace_still_produces_info_output() {
+    // Fix round 1, item 2: `optional("LOG_LEVEL")` does not trim, and `parsed`
+    // validates by trimming internally -- so a value like "info " passed validation
+    // while the untrimmed string was still what got stored and handed to
+    // `EnvFilter`. `EnvFilter`'s grammar does not tolerate that the same way:
+    // "info " fails `LevelFilter::from_str` (exact string match), so it falls back
+    // to being read as a bogus *target* name enabling only that literal target,
+    // never as the global default level -- which silently turned off ordinary
+    // application logging. This proves the whole pipeline still logs at INFO with a
+    // trailing space in `LOG_LEVEL`, not just that config validation accepts it.
+    let db = TestDb::migrated().await;
+    let app = common::spawn_serve_with_env(&db, &[("LOG_LEVEL", "info ")]).await;
+    let lines = app.captured_stdout();
+
+    let startup_event = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v.get("http_bind").is_some())
+        .unwrap_or_else(|| panic!("no JSON startup event found in stdout: {:?}", lines));
+
+    assert_eq!(
+        startup_event["level"], "INFO",
+        "the startup event itself must still be logged: {startup_event}"
+    );
+}
+
+#[test]
 fn production_requires_an_https_public_base_url() {
     let mut env = serve_env_without("APP_ENV");
     env.retain(|(k, _)| *k != "PUBLIC_BASE_URL");
@@ -293,13 +334,24 @@ async fn http_bind_and_log_level_have_defaults() {
     );
     assert!(!text.contains("HTTP_BIND"), "output was: {text}");
     assert!(!text.contains("LOG_LEVEL"), "output was: {text}");
-    assert!(
-        text.contains("0.0.0.0:8000"),
-        "expected the startup banner to name the default bind address: {text}"
+
+    // Ruling 2 (Task 10): the plain-text banner is gone, replaced by one JSON
+    // startup event on stdout -- parse it out and check its fields directly, rather
+    // than substring-matching the raw output as before.
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let startup_event = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v.get("http_bind").is_some())
+        .unwrap_or_else(|| panic!("no JSON startup event found in stdout: {stdout}"));
+
+    assert_eq!(
+        startup_event["http_bind"], "0.0.0.0:8000",
+        "expected the startup event to name the default bind address: {startup_event}"
     );
-    assert!(
-        text.contains("info"),
-        "expected the startup banner to name the default log level: {text}"
+    assert_eq!(
+        startup_event["log_level"], "info",
+        "expected the startup event to name the default log level: {startup_event}"
     );
 }
 

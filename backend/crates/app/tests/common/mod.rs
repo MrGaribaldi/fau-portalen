@@ -662,6 +662,46 @@ where
     }
 }
 
+/// The fixed text `crate::http::test_routes::slow` logs, synchronously, as the very
+/// first thing it does -- before its 2-second sleep. Cannot be a `pub const` shared
+/// with `src/http/test_routes.rs`: `fau-app` is a binary-only crate (no `lib.rs`),
+/// so a test binary can only observe it as a subprocess's captured stdout, never by
+/// linking against its source. Kept identical to the literal in that handler by
+/// hand; if the two ever drift, [`wait_for_log`] simply never finds it and the test
+/// using it times out loudly rather than passing on a stale assumption.
+pub const SLOW_STARTED_MARKER: &str = "test_routes: /test/slow started";
+
+/// As [`SLOW_STARTED_MARKER`], for `crate::http::test_routes::slow_write` -- logged
+/// before it opens its transaction.
+pub const SLOW_WRITE_STARTED_MARKER: &str = "test_routes: /test/slow-write started";
+
+/// Polls `app`'s captured stdout (`ServeHandle::captured_stdout`) until some line
+/// contains `needle`, or `timeout` elapses.
+///
+/// A bare `tokio::time::sleep` before acting on "the request must have reached the
+/// server by now" is a guess, not a proof -- `get_async`'s returned future does not
+/// touch the wire until it is actually polled, so nothing is guaranteed to have
+/// started merely because some wall-clock time passed while an unrelated future sat
+/// unpolled. Waiting for the handler's own started-marker log line instead proves
+/// the request was received and dispatched, which is what a test claiming to
+/// exercise an *in-flight* request needs.
+pub async fn wait_for_log(app: &ServeHandle, needle: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if app
+            .captured_stdout()
+            .iter()
+            .any(|line| line.contains(needle))
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Reads `reader` line by line, appending each line to `sink`, until the pipe
 /// closes (the child exited). Spawned rather than awaited -- [`ServeHandle`] must
 /// be usable while its child is still running -- but the returned [`JoinHandle`]
@@ -799,6 +839,17 @@ impl ServeHandle {
 /// waits for `/health/live` to answer, bounded to about ten seconds.
 pub async fn spawn_serve(db: &TestDb) -> ServeHandle {
     spawn_serve_with_env(db, &[]).await
+}
+
+/// An alias for [`spawn_serve`], used by tests that exercise a `test-routes`-only
+/// endpoint (e.g. `/test/slow`, `/test/panic`). There is nothing different to set up:
+/// a Cargo feature applies to the whole compiled unit, so `cargo test --features
+/// test-routes ...` already builds the `fau` binary under test (`CARGO_BIN_EXE_fau`,
+/// spawned by [`fau_command`]) with the feature on, the same as the test binary
+/// itself. This name exists only to document that at the call site, not because the
+/// spawning differs.
+pub async fn spawn_serve_with_test_routes(db: &TestDb) -> ServeHandle {
+    spawn_serve(db).await
 }
 
 /// As [`spawn_serve`], with `extra_env` layered on top of the defaults -- a later

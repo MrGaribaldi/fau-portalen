@@ -110,3 +110,21 @@ async fn reserved_prefixes_exist_but_carry_no_routes() {
         );
     }
 }
+
+#[tokio::test]
+#[cfg(not(feature = "test-routes"))]
+async fn the_release_binary_has_no_test_routes() {
+    // The `test-routes` feature (Task 11's `/test/slow` and `/test/slow-write`,
+    // Task 8's `/test/panic`) is never enabled in the built image -- this proves it
+    // by compiling and running only when the feature is off, the same configuration
+    // the released binary ships with, and asserting the routes 404 like any other
+    // unknown path rather than being reachable.
+    let db = TestDb::migrated().await;
+    let app = common::spawn_serve(&db).await;
+    for path in ["/test/slow", "/test/slow-write", "/test/panic"] {
+        let res = app.get(path).await;
+        assert_eq!(res.status(), 404, "{path}");
+        let ct = res.headers()["content-type"].to_str().unwrap().to_string();
+        assert!(ct.starts_with("application/json"), "{path} returned {ct}");
+    }
+}

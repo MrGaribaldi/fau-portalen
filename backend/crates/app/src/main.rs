@@ -9,6 +9,7 @@ use clap::Parser;
 mod config;
 mod http;
 mod readiness;
+mod shutdown;
 mod telemetry;
 
 use config::{MigrateConfig, ServeConfig};
@@ -235,6 +236,10 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
         }
     }
 
+    // Cloned before `state` is moved into `http::router` below -- `shutdown::signal`
+    // needs its own handle on the same readiness state so SIGTERM can flip it.
+    let readiness_for_shutdown = state.readiness.clone();
+
     let router = http::router(state);
 
     let listener = tokio::net::TcpListener::bind(config.http_bind)
@@ -251,39 +256,24 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
         }
     };
 
-    if let Err(e) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+    match axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown::signal(readiness_for_shutdown))
         .await
     {
-        let err = StartupError::Serve(e.kind());
-        tracing::error!(error = %err, "http server error");
-        return Err(err);
-    }
-
-    Ok(())
-}
-
-/// Minimal shutdown trigger, just enough for a test to end the process: ctrl-c or
-/// SIGTERM. The 25-second in-flight budget, setting readiness false first and
-/// structured shutdown logging are Task 11's work -- this only makes `serve` exit
-/// instead of running forever.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install a SIGTERM handler");
-        sig.recv().await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
+        Ok(()) => {
+            // Ruling 6's second JSON INFO line, pairing with `shutdown::signal`'s
+            // "signal received" line. Only reached on a clean drain: the
+            // drain-bound timeout path exits the process directly from
+            // `shutdown::spawn_watchdog`, from a task independent of this `.await`,
+            // so a timed-out drain never reaches this line at all.
+            tracing::info!("shutdown: drain complete, exiting");
+            Ok(())
+        }
+        Err(e) => {
+            let err = StartupError::Serve(e.kind());
+            tracing::error!(error = %err, "http server error");
+            Err(err)
+        }
     }
 }
 

@@ -97,16 +97,12 @@ impl ReadinessState {
         self.0.initialised.store(true, Ordering::SeqCst);
     }
 
-    /// Makes readiness false immediately, bypassing the cache entirely -- Task 11
-    /// wires SIGTERM to this. Every probe from this call onward reports
-    /// [`NotReadyReason::ShuttingDown`], regardless of the database's state or
-    /// whatever `Ready` result was cached a moment ago.
-    ///
-    /// Not called anywhere yet outside this module's own unit test: `main.rs`'s
-    /// `shutdown_signal` stays exactly as Task 8 left it until Task 11 wires it up,
-    /// per this task's own ruling. `#[allow(dead_code)]` documents that gap rather
-    /// than hiding it.
-    #[allow(dead_code)]
+    /// Makes readiness false immediately, bypassing the cache entirely. Called by
+    /// `crate::shutdown::signal` as soon as SIGTERM or SIGINT arrives, before the
+    /// pre-drain sleep that gives a scrape already in flight -- or one landing
+    /// moments later -- a chance to observe it. Every probe from this call onward
+    /// reports [`NotReadyReason::ShuttingDown`], regardless of the database's state
+    /// or whatever `Ready` result was cached a moment ago.
     pub fn begin_shutdown(&self) {
         self.0.shutting_down.store(true, Ordering::SeqCst);
     }

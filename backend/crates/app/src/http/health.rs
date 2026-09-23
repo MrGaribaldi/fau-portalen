@@ -2,6 +2,11 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Serialize;
+
+use crate::readiness::{NotReadyReason, Readiness};
 
 use super::AppState;
 
@@ -14,13 +19,43 @@ pub async fn live() -> StatusCode {
     StatusCode::OK
 }
 
-/// Delegates to [`crate::readiness::ReadinessState`]. Today's stub is always
-/// ready; Task 9 adds the real database and schema-contract check behind the same
-/// interface.
-pub async fn ready(State(state): State<AppState>) -> StatusCode {
-    if state.readiness.is_ready().await {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+/// The `/health/ready` wire body. Minimal and leaks nothing internal (ADR-001): no
+/// database version, no address, no error text -- `reason` is one of a fixed,
+/// small set of words, never derived from anything the database or a caller
+/// supplied.
+#[derive(Serialize)]
+#[serde(tag = "status")]
+enum ReadyBody {
+    #[serde(rename = "ready")]
+    Ready,
+    #[serde(rename = "not_ready")]
+    NotReady { reason: &'static str },
+}
+
+/// The fixed, safe word for each [`NotReadyReason`] -- never the schema-contract
+/// version numbers that variant also carries internally, which stay out of the
+/// response body on purpose.
+fn reason_word(reason: NotReadyReason) -> &'static str {
+    match reason {
+        NotReadyReason::Initialising => "initialising",
+        NotReadyReason::Database => "database",
+        NotReadyReason::SchemaContract { .. } => "schema_contract",
+        NotReadyReason::ShuttingDown => "shutting_down",
+    }
+}
+
+/// Delegates to [`crate::readiness::ReadinessState::probe`]: local initialisation,
+/// a database check bounded to one second, and the schema contract, cached briefly
+/// on success and never on failure.
+pub async fn ready(State(state): State<AppState>) -> Response {
+    match state.readiness.probe(&state.pool).await {
+        Readiness::Ready => (StatusCode::OK, Json(ReadyBody::Ready)).into_response(),
+        Readiness::NotReady(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyBody::NotReady {
+                reason: reason_word(reason),
+            }),
+        )
+            .into_response(),
     }
 }

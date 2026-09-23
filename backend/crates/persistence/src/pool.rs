@@ -8,6 +8,8 @@
 //! included. This module never does that: a caller gets a fixed classification, not
 //! the underlying message.
 
+use std::time::Duration;
+
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
@@ -83,6 +85,14 @@ pub fn connect_options(
     Ok(opts.options(options))
 }
 
+/// Bounds how long a caller waits to *acquire* a connection from the pool --
+/// distinct from [`crate::health::DB_CHECK_TIMEOUT`], which bounds the query itself
+/// once a connection is in hand. Deliberately shorter than that one-second bound
+/// (design section 9): a saturated pool then surfaces as a clean `PoolTimedOut`
+/// failure well inside the probe's own timeout, rather than the two bounds racing
+/// each other and leaving it ambiguous which one actually fired.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(900);
+
 /// Builds `serve`'s runtime pool *lazily*: `connect_lazy_with` never dials the
 /// database, it only validates and stores the connect options, so a database that
 /// is merely unreachable at startup is not a startup failure (design section 4).
@@ -93,6 +103,7 @@ pub fn lazy_pool(url: &str, max_connections: u32) -> Result<PgPool, ConnectError
     let options = connect_options(url, [])?;
     Ok(PgPoolOptions::new()
         .max_connections(max_connections)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_lazy_with(options))
 }
 

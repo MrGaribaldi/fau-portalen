@@ -27,14 +27,17 @@ pub mod placeholder;
 
 use axum::routing::get;
 use axum::Router;
+use sqlx::PgPool;
 
 use crate::readiness::ReadinessState;
 
 /// Shared state for every handler. `Clone` because axum's `State` extractor
-/// requires it; cheap to clone (a unit-struct readiness stub and a `&'static str`).
+/// requires it; cheap to clone -- `ReadinessState` is an `Arc` internally and
+/// `PgPool` is a handle around its own connection pool, not the pool itself.
 #[derive(Clone)]
 pub struct AppState {
     pub readiness: ReadinessState,
+    pub pool: PgPool,
     pub version: &'static str,
 }
 

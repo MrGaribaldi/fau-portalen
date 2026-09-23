@@ -168,6 +168,7 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
 
     let state = http::AppState {
         readiness: readiness::ReadinessState::new(),
+        pool: pool.clone(),
         version: SERVICE_VERSION,
     };
 
@@ -198,16 +199,22 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
                 minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
             });
         }
-        ContractCheck::Version(_) => {}
+        ContractCheck::Version(_) => {
+            state.readiness.set_initialised();
+        }
         ContractCheck::Retry(kind) => {
-            // Plain stderr until Task 10's JSON logging (ruling 5). Readiness
-            // staying false for a retryable failure is Task 9's job; for now this
-            // only ensures `serve` does not exit. `kind` is a fixed, safe
-            // description (never the sqlx `Display`, never a DSN).
+            // Plain stderr until Task 10's JSON logging. `kind` is a fixed, safe
+            // description (never the sqlx `Display`, never a DSN). Local
+            // initialisation is otherwise complete at this point, so readiness is
+            // marked initialised here too -- it then stays false only because
+            // `ReadinessState::probe`'s own database/contract check keeps failing,
+            // and recovers on its own the moment the database answers again, with
+            // no separate background reconnect loop.
             eprintln!(
                 "fau: warning: could not verify the schema contract at startup \
                  ({kind}); continuing, readiness will retry"
             );
+            state.readiness.set_initialised();
         }
         ContractCheck::Refuse(kind) => {
             return Err(StartupError::SchemaContractCheckFailed { kind });

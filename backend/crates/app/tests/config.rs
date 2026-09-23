@@ -141,29 +141,43 @@ fn production_requires_an_https_public_base_url() {
     assert!(combined(&out).contains("PUBLIC_BASE_URL"));
 }
 
-#[test]
-fn database_url_password_never_appears_in_output() {
+#[tokio::test]
+async fn database_url_password_never_appears_in_output() {
     // A DSN in a log or error message is the classic way a password reaches an
-    // operator's screen. Ruling 7: with a fully valid configuration -- so `serve`
-    // gets past configuration and is actually running, not failing early on some
-    // other variable -- and `DATABASE_URL` pointed at an unreachable host, the lazy
-    // pool (design section 4) never even attempts to connect, so this sentinel
-    // password must never appear at all.
-    let mut env = serve_env_without("DATABASE_URL");
-    env.push((
-        "DATABASE_URL",
-        "postgres://u:sentinel-password-xyz@10.255.255.1:5/unreachable",
-    ));
-    let run = run_briefly(&env, "serve", Duration::from_secs(3));
+    // operator's screen. Ruling 6: this must now force a *real* connection attempt
+    // rather than merely prove the lazy pool never dials out -- Task 9's readiness
+    // probe (`db_check`) is exactly such a caller. `DATABASE_URL` here points at a
+    // real, reachable database with a wrong password (a "wrong-credential target"),
+    // which fails fast with SQLSTATE 28P01 rather than hanging on a black hole, so
+    // both the startup schema-contract check and every `/health/ready` probe
+    // actually attempt -- and fail -- a real connection, and the sentinel password
+    // must never surface in either stream regardless.
+    let db = TestDb::migrated().await;
+    let mut dsn = url::Url::parse(&db.url()).expect("TestDb::url is a valid postgres URL");
+    dsn.set_password(Some("sentinel-password-xyz"))
+        .expect("set a sentinel password on the DSN");
+    let bad_dsn = dsn.to_string();
+
+    let app = common::spawn_serve_with_env(&db, &[("DATABASE_URL", bad_dsn.as_str())]).await;
+    // Forces the real connection attempt: `db_check` runs against the pool built
+    // from `bad_dsn` on every `/health/ready` probe. Asserting the outcome -- 503,
+    // reason `database` -- rather than discarding the response proves a real
+    // attempt actually happened and failed for the expected reason, not merely that
+    // *some* response came back.
+    let response = app.get("/health/ready").await;
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value = response.json().await.expect("a JSON readiness body");
+    assert_eq!(body["reason"], "database");
+
+    let stdout = app.captured_stdout().join("\n");
+    let stderr = app.captured_stderr().join("\n");
     assert!(
-        run.still_running,
-        "fau serve exited unexpectedly: {}",
-        combined(&run.output)
+        !stdout.contains("sentinel-password-xyz"),
+        "password leaked in stdout: {stdout}"
     );
     assert!(
-        !combined(&run.output).contains("sentinel-password-xyz"),
-        "password leaked: {}",
-        combined(&run.output)
+        !stderr.contains("sentinel-password-xyz"),
+        "password leaked in stderr: {stderr}"
     );
 }
 

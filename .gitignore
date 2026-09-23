@@ -21,3 +21,6 @@ __pycache__/
 
 # Rust build output for the application backend.
 backend/target/
+
+# Favro CLI outbox: local working files written by the CLI, not project state.
+.favro/outbox/

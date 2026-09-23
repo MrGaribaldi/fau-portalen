@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "deny": [
+      "Bash(git push)",
+      "Bash(git push:*)",
+      "Bash(git remote add:*)",
+      "Bash(git remote remove:*)",
+      "Bash(git remote rename:*)",
+      "Bash(git remote set-url:*)",
+      "Bash(gh)",
+      "Bash(gh:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /workspace/.claude/hooks/no-github-push.js",
+            "timeout": 10,
+            "statusMessage": "Checking GitHub boundary"
+          }
+        ]
+      }
+    ]
+  }
+}

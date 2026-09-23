@@ -7,7 +7,7 @@ use common::TestDb;
 #[tokio::test]
 async fn refuses_to_serve_below_the_minimum() {
     let db = TestDb::migrated().await;
-    sqlx::query("delete from schema_contract where version = 2")
+    sqlx::query("delete from schema_contract where version >= 2")
         .execute(&db.admin_pool())
         .await
         .unwrap();
@@ -16,8 +16,8 @@ async fn refuses_to_serve_below_the_minimum() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     // The refusal text itself, not just the shared "schema contract" substring the
-    // unreachable-database warning also carries: version 1 (0002's row deleted,
-    // 0001's remains) is below this binary's minimum of 2.
+    // unreachable-database warning also carries: version 1 (every row from 0002 on
+    // deleted, 0001's remains) is below this binary's minimum of 2.
     assert!(stderr.contains("version 1"), "message was: {stderr}");
     assert!(stderr.contains("at least 2"), "message was: {stderr}");
     let dsn = db.url();

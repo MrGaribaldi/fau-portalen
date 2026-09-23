@@ -534,6 +534,7 @@ dependencies = [
  "clap",
  "fau-domain",
  "fau-persistence",
+ "jiff",
  "nix",
  "reqwest",
  "serde",
@@ -562,10 +563,15 @@ name = "fau-persistence"
 version = "0.1.0"
 dependencies = [
  "fau-domain",
+ "getrandom 0.4.3",
+ "jiff",
+ "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

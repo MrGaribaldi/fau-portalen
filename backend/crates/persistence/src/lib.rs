@@ -3,6 +3,7 @@
 
 mod contract;
 mod health;
+pub mod membership;
 mod migrate;
 mod pool;
 

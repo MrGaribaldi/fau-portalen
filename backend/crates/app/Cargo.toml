@@ -33,6 +33,8 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Test-only: dates for the membership fixtures.
+jiff = { workspace = true }
 # Test-only HTTP client for the integration-test harness (`ServeHandle`). rustls,
 # no default features: no reliance on the platform's native TLS stack, matching the
 # app's own `sqlx` TLS backend.

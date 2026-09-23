@@ -154,7 +154,7 @@ model (#3420). The authority is **part of the Rust backend** — no Hocuspocus, 
 never applies a ProseMirror step**: clients apply, rebase and materialise; the server orders,
 stores encrypted step batches, broadcasts and authorizes. Publication: the publishing client renders
 HTML/PDF, **the server sanitises with an allowlist** (never trusts the client), stores it and serves
-it static from a **separate origin**, no JS. Three things bind the first migration: **document
+it static from a **separate origin**, no JS. Three things bind the migration that creates documents: **document
 `type` + `model_version`** so spreadsheets and presentations reuse the substrate later; **tasks and
 anything else listed across documents are application rows** with an anchor into the document, since
 encrypted bodies cannot be queried; and **per-document keys** (ADR-003 decision 5) so purging one
@@ -181,9 +181,11 @@ around by writing `/root/.aws/` on master by hand; see the secrets list below an
 docs/infra-tools-backup-script-no-credentials-issue.md.
 
 **#3484 (ADR-003) and #3439 (localisation) were accepted 22 September, and #3490 and #3420 are
-Done — so nothing now blocks the first migration.** It must carry `account.locale`,
-`tenant.default_locale`, optional `document.language`, document `type` + `model_version`, tasks as
-anchored application rows, and no key material in any application table. Localisation: Nynorsk
+Done — so nothing now blocks the first migration.** The first schema migration (`0002`, #3416)
+carries `account.locale`, `tenant.default_locale` and no key material in any application table.
+Optional `document.language`, document `type` + `model_version` and tasks as anchored application
+rows bind **the migration that creates documents** (#3419/#3490), not `0002` — #3416's approved
+design keeps documents out of scope. Localisation: Nynorsk
 plumbing only at launch (no `nn-NO.json`, not even a stub), outer locale path prefix on public
 marketing pages with Bokmål unprefixed, cookie + `Accept-Language` inside the app, translator works
 from a spreadsheet, and plan for more than two locales (English or Sámi named) — so nothing may
@@ -245,8 +247,8 @@ The skill covers commands; these facts cost a session to rediscover.
 - **Verify every attachment claim before writing or trusting it.** `favro get` →
   `attachments[].name` is the only truth; card text saying "vedlagt på kortet" has been wrong on
   live cards and cost the user a review. Audit snippet in the skill's references/cli.md.
-  Inversely, `tenant-role-history-design-approved.md` (#3412) exists only as a card attachment,
-  not in docs/.
+  The #3412 attachment `tenant-role-history-design-approved.md` is byte-identical to the
+  committed docs/tenant-role-history-design.md (checked 23 September 2026).
 - Attachments survive description writes as of 0.2.1, which also fails loudly if it cannot
   preserve them; 0.2.0 destroyed them silently. The caveat that replaces it: whole-description
   writes are read/modify/write, so don't edit one card's description and its attachments

@@ -1,0 +1,24 @@
+# The FAU application stack. The agent-box stack is /workspace/docker-compose.yml and
+# always needs -f; Compose prefers this file, so a bare `docker compose down` cannot
+# take down the container the work is happening in. That is deliberate.
+name: fau-app
+
+services:
+  db:
+    image: postgres:17.5-bookworm@sha256:2088c1744625793a8a89118d2dee63fb121139141ff0ff53bd72e63bb6089d0d
+    environment:
+      POSTGRES_DB: fau
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d fau"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  db-data:

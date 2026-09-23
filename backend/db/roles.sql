@@ -1,0 +1,6 @@
+-- Database roles for FAU. Cluster-level objects, so not a migration.
+--
+-- Task 5 (#3416) fills this in: creates `fau_migrate` (the DDL owner) and `fau_app`
+-- (the runtime role, no DDL) and grants the privilege split described in the design's
+-- section 6. Empty for now, so Task 3's test harness has a file it can run without
+-- error while building the migrated template.

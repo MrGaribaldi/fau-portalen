@@ -1,0 +1,32 @@
+[package]
+name = "fau-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "fau"
+path = "src/main.rs"
+
+[features]
+# Routes used only by the shutdown integration tests. Never enabled in the image.
+test-routes = []
+
+[dependencies]
+fau-domain = { path = "../domain" }
+fau-persistence = { path = "../persistence" }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }

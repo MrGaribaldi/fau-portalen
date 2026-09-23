@@ -40,8 +40,8 @@ pub fn is_undefined_table(e: &sqlx::Error) -> bool {
 
 /// Whether a failure to read the schema contract (other than a missing table --
 /// handled separately by [`is_undefined_table`], which the caller folds into
-/// contract version 0) is worth retrying rather than refusing to start. Controller
-/// ruling on the classification:
+/// contract version 0) is worth retrying rather than refusing to start. The
+/// classification:
 ///
 /// - Retryable, so `fau serve` warns and keeps running: network/TLS trouble
 ///   (`Io`/`Tls`), a pool timeout, and three SQLSTATEs that are plausibly

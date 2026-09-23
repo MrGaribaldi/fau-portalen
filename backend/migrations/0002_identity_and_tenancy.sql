@@ -40,9 +40,12 @@ create table tenants (
   status         text        not null check (status in ('pending', 'active', 'closed')),
   -- No FK yet -- `school` (#3412) is out of scope for this migration, and it will
   -- itself carry tenant_id. When it lands, this must become a composite foreign key
-  -- (tenant_id, school_id) references schools (tenant_id, id), never a bare
+  -- (id, school_id) references schools (tenant_id, id), never a bare
   -- references schools (id): every reference between tenant tables uses the
-  -- composite key (property 1 above).
+  -- composite key (property 1 above). That is circular with schools.tenant_id
+  -- references tenants (id), so one of the two constraints will have to be
+  -- deferrable (initially deferred) for a tenant and its school to be inserted in
+  -- one transaction.
   school_id      uuid,
   -- #3439: what this FAU uses for anyone without a personal preference.
   default_locale text        not null default 'nb-NO',

@@ -114,8 +114,8 @@ async fn reserved_prefixes_exist_but_carry_no_routes() {
 #[tokio::test]
 #[cfg(not(feature = "test-routes"))]
 async fn the_release_binary_has_no_test_routes() {
-    // The `test-routes` feature (Task 11's `/test/slow` and `/test/slow-write`,
-    // Task 8's `/test/panic`) is never enabled in the built image -- this proves it
+    // The `test-routes` feature (`/test/slow`, `/test/slow-write` and
+    // `/test/panic`) is never enabled in the built image -- this proves it
     // by compiling and running only when the feature is off, the same configuration
     // the released binary ships with, and asserting the routes 404 like any other
     // unknown path rather than being reachable.

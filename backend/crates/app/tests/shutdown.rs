@@ -10,7 +10,7 @@
 //! `common::spawn_serve_with_test_routes` is `common::spawn_serve` under another
 //! name -- see its doc comment for why an alias is all that is needed.
 //!
-//! Fix round 1: `get_async`'s returned future is lazy -- nothing reaches the wire
+//! `get_async`'s returned future is lazy -- nothing reaches the wire
 //! until it is polled. A test that creates the future, `sleep`s, sends SIGTERM, and
 //! only *then* `.await`s it never actually issues the request until after the
 //! signal, so a bare sleep before signalling proves nothing about a request being
@@ -72,7 +72,7 @@ async fn an_in_flight_request_completes_after_sigterm() {
 
 #[tokio::test]
 async fn the_process_exits_within_the_drain_bound() {
-    // Fix round 1: the idle case (no in-flight request at all) has nothing to drain,
+    // The idle case (no in-flight request at all) has nothing to drain,
     // so it should finish in well under the 25s bound, not merely under some value
     // close to it -- asserting `< 30s` here would pass even if the drain bound were
     // being applied when it should not be.
@@ -95,9 +95,9 @@ async fn the_process_exits_within_the_drain_bound() {
 #[tokio::test]
 async fn an_aborted_transaction_is_never_acknowledged() {
     // Spec section 12. /test/slow-write opens a transaction, sleeps past the drain
-    // bound, then commits. The brief's original assertion (`!(acknowledged && rows
-    // == 0)`) is too weak -- it also passes if the write was acknowledged *and*
-    // committed, or (fix round 1) if the request was never actually sent at all.
+    // bound, then commits. Asserting only `!(acknowledged && rows == 0)` would be
+    // too weak -- it also passes if the write was acknowledged *and* committed, or
+    // if the request was never actually sent at all.
     // With delay_ms 40000, well past the 25s drain bound, the commit cannot happen,
     // so every part of "the timeout path actually ran and aborted this write" is
     // asserted directly: the client never sees success, the watchdog's own exit

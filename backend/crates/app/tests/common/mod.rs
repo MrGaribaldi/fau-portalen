@@ -10,8 +10,8 @@
 //! PostgreSQL advisory lock on the maintenance database rather than by anything
 //! process-local.
 //!
-//! Each test binary only exercises a subset of these helpers -- `harness_selftest`
-//! today, more from Task 4 onward -- so unused items are expected here, not a defect.
+//! Each test binary only exercises a subset of these helpers, so unused items are
+//! expected here, not a defect.
 #![allow(dead_code)]
 
 use std::collections::hash_map::DefaultHasher;
@@ -179,9 +179,8 @@ impl TestDb {
         // database-level ACL (pg_database.datacl, a shared/cluster catalog): the
         // clone gets a fresh, default ACL no matter what roles.sql set on the
         // template. Without reapplying it here, a cloned database would silently
-        // regain PUBLIC's default TEMPORARY privilege that roles.sql revokes --
-        // found by a schema-review test that expected `fau_app` to lack it and
-        // didn't.
+        // regain PUBLIC's default TEMPORARY privilege that roles.sql revokes, which
+        // `tests/schema_review.rs` checks `fau_app` lacks.
         apply_roles_sql(&with_database(&admin_url(), &name)).await;
 
         Self {
@@ -192,9 +191,8 @@ impl TestDb {
 
     /// A `DATABASE_URL` for the runtime role `fau_app`, pointed at this database.
     ///
-    /// `fau_app` does not exist until Task 5's `roles.sql` runs, and does not accept a
-    /// password until `apply_roles` grants it login -- this only builds the string,
-    /// present now so later tasks have the interface to build on.
+    /// `fau_app` does not exist until `db/roles.sql` runs, and does not accept a
+    /// password until `apply_roles` grants it login -- this only builds the string.
     pub fn url(&self) -> String {
         self.role_url("fau_app")
     }
@@ -227,7 +225,7 @@ impl TestDb {
             .expect("connect as fau_app")
     }
 
-    /// Simulates a database outage for readiness tests (Task 9): sets the
+    /// Simulates a database outage for readiness tests: sets the
     /// connection limit to zero, revokes `connect` from the runtime role and from
     /// `public`, then terminates every other backend already connected to this
     /// database. Superuser admin connections (used by [`TestDb::admin_pool`] and by
@@ -622,7 +620,7 @@ fn free_port() -> u16 {
 }
 
 /// The default environment `spawn_serve` starts `fau serve` with, keyed on `db` and
-/// a pre-chosen port. Ruling 5: `APP_ENV=development`, `DATABASE_URL` for the
+/// a pre-chosen port: `APP_ENV=development`, `DATABASE_URL` for the
 /// runtime role `fau_app`, `PUBLIC_BASE_URL` pointed at the chosen port.
 fn default_serve_env(db: &TestDb, port: u16) -> Vec<(&'static str, String)> {
     vec![
@@ -794,8 +792,8 @@ impl ServeHandle {
     /// pipes only reach once the child (the write end) has actually exited, so by
     /// the time this returns, [`ServeHandle::captured_stdout`] and
     /// [`ServeHandle::captured_stderr`] are guaranteed complete -- not racing
-    /// whatever had been read so far, which is what Task 10 and 11's logging tests
-    /// depend on.
+    /// whatever had been read so far, which the logging and shutdown tests depend
+    /// on.
     pub async fn wait(&self) -> std::process::ExitStatus {
         let status = {
             let mut child = self.child.lock().await;
@@ -817,8 +815,8 @@ impl ServeHandle {
         status
     }
 
-    /// Every stdout line captured so far, in order. Later logging tests (Task 10)
-    /// read this rather than re-spawning the process.
+    /// Every stdout line captured so far, in order. Logging tests read this rather
+    /// than re-spawning the process.
     pub fn captured_stdout(&self) -> Vec<String> {
         self.stdout_lines
             .lock()
@@ -835,7 +833,7 @@ impl ServeHandle {
     }
 }
 
-/// Starts `fau serve` against `db` with the default environment (ruling 5) and
+/// Starts `fau serve` against `db` with the default environment and
 /// waits for `/health/live` to answer, bounded to about ten seconds.
 pub async fn spawn_serve(db: &TestDb) -> ServeHandle {
     spawn_serve_with_env(db, &[]).await
@@ -897,7 +895,7 @@ pub async fn spawn_serve_with_env(db: &TestDb, extra_env: &[(&str, &str)]) -> Se
 /// As [`spawn_serve`], but with the runtime `DATABASE_URL`'s password replaced by
 /// `SENTINEL_DB_PASSWORD` -- a wrong password against the real, migrated test
 /// database, so a connection attempt genuinely fails (SQLSTATE 28P01) rather than
-/// merely going untried. Task 10's sentinel-secrets test uses this to prove a DSN's
+/// merely going untried. The sentinel-secrets logging tests use this to prove a DSN's
 /// password never reaches log output even on the classic path a leak has
 /// historically come from: a failed connection's own error message. Hits
 /// `/health/ready` once before returning -- forcing that failure to actually happen
@@ -911,8 +909,7 @@ pub async fn spawn_serve_with_sentinels(db: &TestDb) -> ServeHandle {
 /// As [`spawn_serve_with_sentinels`], with `extra_env` layered on top -- e.g.
 /// `LOG_LEVEL=warn` -- and, unlike it, **no** internal `/health/ready` call: a
 /// caller that needs to know exactly which request produced a given log line (the
-/// fix-round-2 test proving a readiness `WARN` carries the *calling* request's own
-/// id) needs its own call to be the only one, since `readiness`'s own warning is
+/// test proving a readiness `WARN` carries the *calling* request's own id) needs its own call to be the only one, since `readiness`'s own warning is
 /// itself rate-limited to one line per ready-to-not-ready transition -- a second
 /// probe against the same still-failing database would not log again at all.
 pub async fn spawn_serve_with_sentinels_and_env(

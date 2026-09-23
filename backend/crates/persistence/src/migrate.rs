@@ -109,11 +109,16 @@ fn map_migrate_error(e: sqlx::migrate::MigrateError) -> MigrateError {
             MigrateError::ChecksumMismatch { version }
         }
         sqlx::migrate::MigrateError::Execute(inner) => sql_error(inner),
+        // sqlx 0.8 reports a failure *inside* a migration file this way, with the
+        // version alongside -- both worth surfacing, neither caller-supplied.
+        sqlx::migrate::MigrateError::ExecuteMigration(inner, version) => MigrateError::Sql(
+            format!("migration {version}: {}", pool::safe_error_kind(&inner)),
+        ),
         other => MigrateError::Sql(migrate_error_kind(&other)),
     }
 }
 
-/// As [`sql_error_kind`], for the migrator's own errors: a fixed description that
+/// As [`pool::safe_error_kind`], for the migrator's own errors: a fixed description that
 /// includes the migration version wherever sqlx's error identifies one -- a number
 /// from our own filenames, not a value from the database or the caller.
 fn migrate_error_kind(e: &sqlx::migrate::MigrateError) -> String {
@@ -260,5 +265,17 @@ mod tests {
         // The non-secret fields are still useful for diagnostics.
         assert!(debug.contains("10000"));
         assert!(debug.contains("30000"));
+    }
+
+    #[test]
+    fn a_failure_inside_a_migration_keeps_its_version_and_sqlstate() {
+        let err = map_migrate_error(sqlx::migrate::MigrateError::ExecuteMigration(
+            crate::pool::test_support::database_error("55P03"),
+            3,
+        ));
+        assert_eq!(
+            err.to_string(),
+            "migration failed (migration 3: sqlstate 55P03)"
+        );
     }
 }

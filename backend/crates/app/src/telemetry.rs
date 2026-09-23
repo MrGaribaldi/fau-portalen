@@ -55,7 +55,7 @@ const SQLX_DEFAULT_DIRECTIVE: &str = "sqlx=warn";
 
 /// The dedicated `tracing` target `http::request_context::middleware` creates its
 /// per-request span under, given its own always-on directive below, independent of
-/// `LOG_LEVEL`. Fix round 2, item 1: `EnvFilter` disables *span creation itself*
+/// `LOG_LEVEL`. `EnvFilter` disables *span creation itself*
 /// when a span's own level does not pass the filter -- at `LOG_LEVEL=warn` or
 /// `error`, an ordinary `info_span!` is never created at all, so no event nested
 /// inside it, however loud, could ever pick up its `request_id` field (confirmed
@@ -90,7 +90,7 @@ pub fn init(log_level: &str, service_version: &'static str) {
     install_panic_hook();
 }
 
-/// Fix round 2, item 2: `tower_http::CatchPanicLayer` (`http::router`) stops a
+/// `tower_http::CatchPanicLayer` (`http::router`) stops a
 /// panic from crashing the process and answers the request with our own JSON error
 /// contract, but it does not touch Rust's *panic hook* -- the default hook still
 /// runs first, before any unwinding starts, and prints

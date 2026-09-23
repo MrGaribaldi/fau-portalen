@@ -99,8 +99,8 @@ fn container_id(service: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// `docker inspect --format '{{.State.Health.Status}}' <container>` -- ruling 5's
-/// readiness evidence. Returns an empty string if the container does not exist yet
+/// `docker inspect --format '{{.State.Health.Status}}' <container>` -- the
+/// readiness evidence Compose itself acts on. Returns an empty string if the container does not exist yet
 /// or carries no healthcheck.
 fn health_status(container: &str) -> String {
     let out = Command::new("docker")

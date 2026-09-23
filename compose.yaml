@@ -53,6 +53,11 @@ services:
     # `service_completed_successfully` dependency below is what gives that exit
     # meaning, not a restart policy.
     restart: "no"
+    # Same hardening as `app`: the runner only reads its embedded migrations and
+    # talks to the database, so it needs no writable filesystem beyond /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
 
   app:
     image: fau/app:dev

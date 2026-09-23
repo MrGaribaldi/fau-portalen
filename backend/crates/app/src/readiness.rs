@@ -43,7 +43,7 @@ pub enum NotReadyReason {
     Database,
     /// The database's schema contract is below this binary's minimum.
     SchemaContract { found: i32, minimum: i32 },
-    /// `begin_shutdown` has been called; SIGTERM is in flight (Task 11).
+    /// `begin_shutdown` has been called; SIGTERM is in flight.
     ShuttingDown,
 }
 
@@ -66,7 +66,8 @@ struct Inner {
     cache: Mutex<Option<CachedReady>>,
     /// Whether the most recent real database/schema-contract check (`check`, below)
     /// was `Ready`. Used only to rate-limit [`check`]'s own warning to a state
-    /// transition (ready -> not ready), per ruling 7 -- not part of the readiness
+    /// transition (ready -> not ready), so an outage logs once rather than once per
+    /// probe -- not part of the readiness
     /// result itself, and never consulted by `probe_with`'s cache logic.
     was_ready: AtomicBool,
 }
@@ -195,7 +196,7 @@ async fn check(pool: &PgPool, was_ready: &AtomicBool) -> Readiness {
 }
 
 /// Whether a just-observed failure is worth a `WARN` line: true exactly once per
-/// transition from ready into not-ready (ruling 7), so a probe polled every few
+/// transition from ready into not-ready, so a probe polled every few
 /// seconds during an extended outage produces one line, not one per scrape. Reset by
 /// [`note_ready`] the next time a check succeeds, so the next failure after a
 /// recovery logs again. The message itself stays at each call site so it can carry
@@ -321,7 +322,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 2: the cache's "a failure is never cached" property, made
+    /// The cache's "a failure is never cached" property, made
     /// deterministic via `probe_with`'s injectable check -- no real database, no
     /// timing window to race. A prior integration test could only prove this by
     /// polling within an arbitrary window, which cannot actually distinguish "never
@@ -369,7 +370,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 5: `shutting_down` is re-read after the check completes, so
+    /// `shutting_down` is re-read after the check completes, so
     /// a probe already in flight when shutdown begins cannot still report `Ready`.
     #[tokio::test]
     async fn shutdown_during_a_slow_check_overrides_its_ready_result() {

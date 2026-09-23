@@ -65,7 +65,7 @@ const PRE_DRAIN: Duration = Duration::from_millis(500);
 pub async fn signal(readiness: ReadinessState) {
     wait_for_signal().await;
 
-    // Ruling 6's first JSON INFO line, logged before readiness flips: a probe
+    // The first of two shutdown INFO lines, logged before readiness flips: a probe
     // already mid-flight when the signal arrives still reflects the state it
     // observed a moment ago, and this line marks the instant that stops being true.
     tracing::info!("shutdown: signal received, no longer accepting new work");
@@ -97,8 +97,7 @@ fn spawn_watchdog() {
     });
 }
 
-/// Waits for either signal. Unchanged from Task 8's original `shutdown_signal`,
-/// moved here as this module's inner building block.
+/// Waits for SIGINT (Ctrl-C) or SIGTERM, whichever comes first.
 async fn wait_for_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -120,8 +119,8 @@ async fn wait_for_signal() {
 }
 
 // No unit tests in this module: `DRAIN_BOUND` and `DRAIN_TIMEOUT_EXIT_CODE` are
-// plain constants, and a test that only compares one against itself proves nothing
-// (fix round 1). The real behaviour they gate is proved end to end by
+// plain constants, and a test that only compares one against itself proves nothing.
+// The real behaviour they gate is proved end to end by
 // `tests/shutdown.rs`: `the_process_exits_within_the_drain_bound` for a clean drain
 // finishing well inside the bound, and `an_aborted_transaction_is_never_acknowledged`
 // for the watchdog actually firing at the bound, with the right exit code and log

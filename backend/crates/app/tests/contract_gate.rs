@@ -26,8 +26,8 @@ async fn refuses_to_serve_below_the_minimum() {
         "DSN (with password) leaked: {stderr}"
     );
 
-    // Fix round 1, item 8: ruling 4 also requires a JSON ERROR event on stdout for
-    // this refusal, in addition to (not instead of) the plain stderr line above.
+    // The refusal is also a JSON ERROR event on stdout, so log collection sees it,
+    // in addition to (not instead of) the plain stderr line above.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout
@@ -76,11 +76,18 @@ async fn serves_above_the_minimum() {
         status, 200,
         "a database ahead of the binary must still be served"
     );
+    // Readiness must tolerate a higher version too, or a rollback to an older
+    // binary would never take traffic.
+    let ready = app.get("/health/ready").await.status();
+    assert_eq!(
+        ready, 200,
+        "readiness must accept a database ahead of the binary"
+    );
 }
 
 #[tokio::test]
 async fn stays_running_when_the_database_is_unreachable_at_startup() {
-    // Ruling 5 / design section 4: a merely unreachable database is not a contract
+    // Design section 4: a merely unreachable database is not a contract
     // failure. Port 1 refuses the underlying TCP connection immediately, but
     // sqlx's pool retries a failed `Io` connection attempt internally before
     // giving up on it, so this check actually runs close to its full 5s bound here

@@ -68,12 +68,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -499,7 +493,6 @@ dependencies = [
 name = "fau-app"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "axum",
  "clap",
  "fau-domain",
@@ -511,7 +504,6 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
- "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -525,8 +517,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror",
- "uuid",
 ]
 
 [[package]]

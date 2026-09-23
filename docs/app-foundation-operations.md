@@ -60,8 +60,9 @@ run against it. `fau_migrate` and `fau_app` end up missing, or exist without a l
 password; `migrate` fails authentication; `app` never starts, since it waits on
 `migrate`'s successful completion.
 
-This is exactly the state of the dev stack's own `fau-app-db-1` as of this task: its
-volume was created before either init script existed on it. Two ways out:
+The dev stack's own `fau-app-db-1` was in exactly this state when this stack was
+introduced on 23 September 2026, because its volume predates both init scripts. If
+`migrate` fails authentication against it, that is the likely cause. Two ways out:
 
 **(a) Keep the data.** Apply `roles.sql` by hand against the running database, then
 grant login exactly as `zz-compose-init.sh` would have on a fresh volume:
@@ -132,27 +133,33 @@ migration rather than added later.
 
 ## The two lock variables, and when to raise them
 
-`fau migrate` holds a PostgreSQL advisory lock for the whole run, per design §5, so
-two concurrent migration jobs cannot apply the same migration in parallel -- one
-applies, the other waits and then finds nothing pending. Two variables bound that
-wait, both accepted by `migrate` and passed through `MigrationSettings`:
+`fau migrate` serialises itself against other migrators (design §5), so two
+concurrent migration jobs never apply the same file twice: one applies, the other
+waits and then finds nothing pending. It needs two different bounds, which is why
+there are two variables (`backend/crates/persistence/src/migrate.rs` explains the
+mechanism in its module docs):
 
-- `MIGRATION_LOCK_TIMEOUT_MS` (default `10000`, i.e. 10s) -- `lock_timeout` on the
-  migration connection itself, so a lock held far longer than any real migration
-  should ever take fails loudly rather than hanging the job indefinitely.
-- `MIGRATION_LOCK_WAIT_MS` (default `30000`, i.e. 30s) -- how long a waiting
-  `migrate` process is willing to sit behind another one already holding the lock
-  before giving up.
+- `MIGRATION_LOCK_WAIT_MS` (default `30000`, 30s) -- how long `migrate` queues
+  behind another migrator that already holds the run-level lock before failing with
+  "migration lock unavailable". Queueing is normal when several runners start
+  together, as in a rolling deploy. Raise this when migrations are slow and several
+  runners may start at the same time, so the later ones outwait the first rather
+  than failing.
+- `MIGRATION_LOCK_TIMEOUT_MS` (default `10000`, 10s) -- PostgreSQL's `lock_timeout`
+  on the migration connection. It bounds how long each DDL statement may wait for a
+  table lock held by live traffic, so a migration cannot queue behind production
+  queries (and make every later query queue behind it) for long. It also backstops
+  sqlx's own advisory lock, which the run-level lock should already have made
+  uncontended. Raise it only knowingly: a higher value lets a migration stall live
+  traffic for longer.
 
-`compose.yaml`'s `migrate` service does not set either variable, so `migrate` always
-runs with these defaults today. Raising one means adding it to that service's
-`environment:` block in `compose.yaml` (optionally reading it from `.env` the same
-way the other variables do) -- not merely editing `.env.example`, which by itself
-changes nothing `migrate` reads. Raise either only if a specific, known-slow
-migration (a large backfill, an index built without `CONCURRENTLY`) is expected to
-legitimately hold the lock longer than the current bound -- never as a blanket
-workaround for an intermittent failure, which usually means something else is wrong
-(a stuck connection, a migration that should have been transactional and was not).
+`compose.yaml` does not pass either variable to the `migrate` service, so it always
+runs with the defaults. Raising one means adding it to that service's
+`environment:` block (optionally reading it from `.env` the same way the other
+variables do) -- editing `.env` or `.env.example` alone changes nothing `migrate`
+reads. Do not raise either as a blanket workaround for an intermittent failure; that
+usually means something else is wrong, such as a stuck connection or a long-running
+transaction holding a table lock.
 
 ## `compose.yaml` and `docker-compose.yml` are different stacks
 
@@ -197,54 +204,61 @@ removing it severs exactly what this section sets up.
 
 ## Running the test suites
 
-Ordinary unit and integration tests (real PostgreSQL, one database per test from a
-migrated template -- design §15):
+Every suite that touches PostgreSQL needs `TEST_DATABASE_URL`, a superuser URL for
+the cluster the harness creates its per-test databases in (one database per test,
+cloned from a migrated template -- design §15). This is the canonical set, and what
+CI should run, in this order:
 
 ```
-TEST_DATABASE_URL=postgres://postgres:postgres@db:5432/postgres \
-  cargo test --workspace
-```
+cd backend
+export TEST_DATABASE_URL=postgres://postgres:postgres@db:5432/postgres
 
-The `test-routes` feature (routes that exist only to give tests a handle on
-otherwise hard-to-trigger behaviour, e.g. `/test/panic`; never compiled into the
-shipped image):
+# Unit and integration tests.
+cargo test --workspace
 
-```
+# The shutdown and panic-handling tests exist only with the `test-routes` feature,
+# which adds routes that give tests a handle on hard-to-trigger behaviour
+# (`/test/slow`, `/test/slow-write`, `/test/panic`). Never compiled into the image.
 cargo test -p fau-app --features test-routes
-```
 
-The ignored image-contract test (`backend/crates/app/tests/image.rs`) builds the
-real `fau/app:dev` image with the real `Dockerfile` and inspects it -- non-root,
-read-only root filesystem, no build toolchain or secrets reaching the runtime
-stage:
-
-```
+# Ignored: build and inspect the real image, then drive the real compose.yaml.
 cargo test -p fau-app --test image -- --ignored --test-threads=1
-```
-
-The ignored acceptance test (`backend/crates/app/tests/acceptance.rs`) drives the
-real `compose.yaml` end to end: a clean start, a row written directly through the
-database, a restart (volume kept), and proof the row survived plus that `migrate`
-exits 0. It runs under its own Compose project, `fau-acceptance`, on its own fixed
-host ports -- **never** the developer's own `fau-app` project -- so it can run
-safely alongside a dev stack that is already up:
-
-```
 cargo test -p fau-app --test acceptance -- --ignored --test-threads=1
 ```
 
-This test's `up --build` rebuilds `fau/app:dev` from the working tree -- the same
-shared tag the dev stack's own `migrate`/`app` services use. Running it therefore
-replaces whatever `fau/app:dev` currently is with a build of whatever is on disk
-right now; that is normally what you want (it proves the working tree builds and
-runs), but it means the dev stack's `migrate`/`app`, if restarted afterwards without
-their own rebuild, will pick up that same image too.
+**The harness resets role passwords on the target cluster.** Roles are cluster-wide,
+and the harness runs `alter role fau_app login password 'fau_app'` and
+`alter role fau_migrate login password 'fau_migrate'` (each role's password is its
+own name) on whatever cluster `TEST_DATABASE_URL` points at. Pointing the suite at
+the dev Compose `db`, as above, therefore overwrites any custom `FAU_APP_PASSWORD` or
+`FAU_MIGRATE_PASSWORD` set in `.env` for that cluster: the dev stack's `migrate` and
+`app` then fail authentication until the roles are altered back (see "Keep the data"
+above for the commands). With the defaults the two agree and nothing changes. Never
+point `TEST_DATABASE_URL` at a cluster whose role passwords matter.
+
+The image-contract test (`backend/crates/app/tests/image.rs`) builds the real
+`fau/app:dev` image with the real `Dockerfile` and inspects it -- non-root,
+read-only root filesystem, no build toolchain or secrets reaching the runtime stage.
+
+The acceptance test (`backend/crates/app/tests/acceptance.rs`) drives the real
+`compose.yaml` end to end: a clean start, a row written directly through the
+database, a restart (volume kept), and proof the row survived plus that `migrate`
+exits 0. It runs under its own Compose project, `fau-acceptance`, on its own fixed
+host ports -- **never** the developer's own `fau-app` project -- so it can run
+safely alongside a dev stack that is already up.
+
+Both tests rebuild `fau/app:dev` from the working tree -- the same shared tag the dev
+stack's own `migrate`/`app` services use. Running them therefore replaces whatever
+`fau/app:dev` currently is with a build of whatever is on disk right now; that is
+normally what you want (it proves the working tree builds and runs), but it means
+the dev stack's `migrate`/`app`, if restarted afterwards without their own rebuild,
+will pick up that same image too.
 
 Both ignored suites mutate real Docker state (images, containers, volumes,
 networks) and are slow, which is why they are `#[ignore]`d rather than part of the
 default `cargo test` run; `--test-threads=1` matters for the acceptance test
-specifically, since its two test functions each drive the same `fau-acceptance`
-project and would otherwise race each other's `up`/`down`.
+specifically, since its test functions each drive the same `fau-acceptance` project
+and would otherwise race each other's `up`/`down`.
 
 ## Port variables
 

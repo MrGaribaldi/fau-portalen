@@ -19,9 +19,9 @@ async fn seed_two_tenants(db: &TestDb) -> (Uuid, Uuid, Uuid) {
 
 /// The Postgres SQLSTATE code, if the error is a database error at all. `is_err()`
 /// alone cannot distinguish the constraint under test from any other failure
-/// (e.g. `tenant_status_is_constrained` "passed" against a table that did not exist
-/// yet during this task's RED phase, for the wrong reason entirely) -- the code
-/// pins down which rule actually fired.
+/// (e.g. `tenant_status_is_constrained` would "pass" against a table that did not
+/// exist, for the wrong reason entirely) -- the code pins down which rule actually
+/// fired.
 fn sqlstate(err: &sqlx::Error) -> Option<String> {
     err.as_database_error()
         .and_then(|e| e.code())

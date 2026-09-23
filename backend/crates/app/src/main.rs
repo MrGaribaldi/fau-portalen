@@ -111,7 +111,7 @@ fn serve() -> Result<(), StartupError> {
     rt.block_on(run_server(config))
 }
 
-/// Bounds the startup schema-contract query (ruling 6) so a black-holed database
+/// Bounds the startup schema-contract query so a black-holed database
 /// cannot delay startup indefinitely -- distinct from, and much tighter than, any
 /// bound the pool itself applies once it is in regular use.
 const SCHEMA_CONTRACT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -140,7 +140,7 @@ const CONTRACT_CHECK_TIMED_OUT: &str = "timed out waiting for a response";
 /// Runs the startup schema-contract check under [`SCHEMA_CONTRACT_CHECK_TIMEOUT`]. A
 /// missing `schema_contract` table (SQLSTATE 42P01) means an unmigrated database and
 /// is reported as version 0 -- below any real minimum, so it takes the same refusal
-/// path as an explicit low version, per ruling 2. Any other failure is classified by
+/// path as an explicit low version. Any other failure is classified by
 /// `fau_persistence::is_retryable` into [`ContractCheck::Retry`] (the caller warns
 /// and lets `serve` continue) or [`ContractCheck::Refuse`] (the caller exits
 /// non-zero) -- see that function's doc comment for the exact SQLSTATE list. Reuses
@@ -178,9 +178,9 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
         pool: pool.clone(),
     };
 
-    // Ruling 2: one JSON startup event, replacing the old plain-text banner.
-    // `database_url` is deliberately absent -- it is the one field the old banner
-    // never carried either, since it is the one field here that carries a password.
+    // One JSON startup event, so log collection sees startup like any other line.
+    // `database_url` is deliberately absent: it is the one field here that carries
+    // a password.
     // `service_version` is not passed explicitly -- `telemetry::JsonLineLayer`
     // inserts it into every line unconditionally, this one included. Logged before
     // the schema-contract check below, which does real network I/O and must not
@@ -193,7 +193,7 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
         log_level = %config.log_level,
         "fau starting"
     );
-    for (name, _value) in &config.accepted_but_unused {
+    for name in &config.accepted_but_unused {
         tracing::warn!(variable = name, "accepted but not yet used");
     }
 
@@ -206,7 +206,7 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
                 found,
                 minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
             };
-            // Ruling 4: a JSON ERROR event on stdout, in addition to (not instead
+            // A JSON ERROR event on stdout for log collection, in addition to (not instead
             // of) the final plain `fau: ...` line `run()` still prints to stderr.
             tracing::error!(error = %err, "refusing to serve");
             return Err(err);
@@ -215,7 +215,7 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
             state.readiness.set_initialised();
         }
         ContractCheck::Retry(kind) => {
-            // Ruling 4: a JSON WARN event on stdout only -- this path does not
+            // A JSON WARN event on stdout only -- this path does not
             // refuse to start, so there is no final stderr exit line to pair it
             // with. `kind` is a fixed, safe description (never the sqlx `Display`,
             // never a DSN). Local initialisation is otherwise complete at this
@@ -261,7 +261,7 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
         .await
     {
         Ok(()) => {
-            // Ruling 6's second JSON INFO line, pairing with `shutdown::signal`'s
+            // The second shutdown INFO line, pairing with `shutdown::signal`'s
             // "signal received" line. Only reached on a clean drain: the
             // drain-bound timeout path exits the process directly from
             // `shutdown::spawn_watchdog`, from a task independent of this `.await`,

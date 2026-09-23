@@ -110,6 +110,20 @@ fn parsed<T: FromStr>(name: &'static str, raw: &str) -> Result<T, ConfigError> {
         .map_err(|_| err(name, ConfigProblem::Invalid))
 }
 
+/// Validates a PostgreSQL connection URL, failing by variable name alone. The scheme
+/// is checked separately because sqlx's own parser accepts any scheme, and the value
+/// is kept as a [`Secret`] string rather than the parsed options, whose `Debug`
+/// prints the password.
+fn postgres_url(name: &'static str, raw: String) -> Result<Secret<String>, ConfigError> {
+    let invalid = || err(name, ConfigProblem::Invalid);
+    let url = Url::parse(raw.trim()).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        return Err(invalid());
+    }
+    sqlx::postgres::PgConnectOptions::from_str(raw.trim()).map_err(|_| invalid())?;
+    Ok(Secret::new(raw))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEnv {
     Development,
@@ -159,11 +173,11 @@ pub struct ServeConfig {
     pub database_url: Secret<String>,
     pub db_pool_max_connections: u32,
     pub log_level: String,
-    /// Telemetry and mail variables that exist in ADR-001's table but have no
-    /// adapter yet. Present so a value never appears in this struct without
-    /// reason, but per spec §4 they are recognised and accepted, not validated
-    /// or used until then -- so this only records what was set, never rejects it.
-    pub accepted_but_unused: Vec<(&'static str, String)>,
+    /// Names of the telemetry and mail variables from ADR-001's table that were
+    /// set but have no adapter yet. Per spec §4 they are recognised and accepted,
+    /// not validated or used until then. Only the names are kept: a value such as
+    /// an OTLP endpoint can carry credentials.
+    pub accepted_but_unused: Vec<&'static str>,
 }
 
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:8000";
@@ -193,7 +207,7 @@ impl ServeConfig {
             .map_err(|_| err("PUBLIC_BASE_URL", ConfigProblem::Invalid))?;
         validate_public_base_url(&public_base_url, app_env)?;
 
-        let database_url = Secret::new(required("DATABASE_URL")?);
+        let database_url = postgres_url("DATABASE_URL", required("DATABASE_URL")?)?;
 
         let db_pool_max_connections: u32 = parsed(
             "DB_POOL_MAX_CONNECTIONS",
@@ -207,13 +221,13 @@ impl ServeConfig {
         // Validated as a `LevelFilter` -- not the fuller `tracing_subscriber::EnvFilter`
         // grammar `telemetry::init` builds from it -- because `EnvFilter` treats an
         // unrecognised bare word as a *target* name (matching every level for it)
-        // rather than rejecting it, so a typo like this task's own sentinel value
+        // rather than rejecting it, so a typo such as `banana-sentinel`
         // would silently be accepted as "log everything from a crate named
         // banana-sentinel" instead of failing loudly. `LevelFilter::from_str` has no
         // such fallback: it only accepts trace/debug/info/warn/error/off (or 0-5),
         // which is all `LOG_LEVEL` is meant to carry. `parsed` (this module's helper)
         // discards the parse error itself, since `EnvFilter`'s own parse errors quote
-        // the offending input -- exactly what ruling 3 forbids reaching the output.
+        // the offending input, and a configuration value must never reach the output.
         parsed::<LevelFilter>("LOG_LEVEL", &log_level_raw)?;
         // Stored *trimmed*, not the raw value `parsed` validated: `parsed` trims
         // before parsing (`raw.trim().parse()`), so a value like `"info "` passes
@@ -228,9 +242,10 @@ impl ServeConfig {
 
         // Read but never validated, never used -- see ACCEPTED_BUT_UNUSED's doc
         // comment. A missing or garbage value here must not fail startup.
-        let accepted_but_unused: Vec<(&'static str, String)> = ACCEPTED_BUT_UNUSED
+        let accepted_but_unused: Vec<&'static str> = ACCEPTED_BUT_UNUSED
             .iter()
-            .filter_map(|&name| optional(name).map(|value| (name, value)))
+            .copied()
+            .filter(|&name| optional(name).is_some())
             .collect();
 
         Ok(Self {
@@ -247,7 +262,9 @@ impl ServeConfig {
 
 fn validate_public_base_url(url: &Url, app_env: AppEnv) -> Result<(), ConfigError> {
     let host = url.host_str().unwrap_or_default();
-    if host.is_empty() {
+    // Userinfo in a base URL is a credential that would be logged with the
+    // startup event and repeated in every generated link.
+    if host.is_empty() || !url.username().is_empty() || url.password().is_some() {
         return Err(err("PUBLIC_BASE_URL", ConfigProblem::Invalid));
     }
 
@@ -284,7 +301,10 @@ const DEFAULT_LOCK_WAIT_MS: u64 = 30_000;
 
 impl MigrateConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let migration_database_url = Secret::new(required("MIGRATION_DATABASE_URL")?);
+        let migration_database_url = postgres_url(
+            "MIGRATION_DATABASE_URL",
+            required("MIGRATION_DATABASE_URL")?,
+        )?;
 
         let lock_timeout_ms = match optional("MIGRATION_LOCK_TIMEOUT_MS") {
             Some(raw) => parsed("MIGRATION_LOCK_TIMEOUT_MS", &raw)?,
@@ -370,6 +390,44 @@ mod tests {
         // never accept plaintext, not even to the loopback address.
         let url = Url::parse("http://localhost:8000").unwrap();
         assert!(validate_public_base_url(&url, AppEnv::Production).is_err());
+    }
+
+    #[test]
+    fn a_base_url_with_userinfo_is_invalid() {
+        for raw in [
+            "https://user:hunter2@fau.example",
+            "https://user@fau.example",
+        ] {
+            let url = Url::parse(raw).unwrap();
+            let e = validate_public_base_url(&url, AppEnv::Production).unwrap_err();
+            assert_eq!(e.problem, ConfigProblem::Invalid, "{raw}");
+            assert!(!e.to_string().contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn postgres_url_accepts_both_schemes() {
+        for raw in ["postgres://u:p@db:5432/fau", "postgresql://u:p@db/fau"] {
+            assert!(
+                postgres_url("DATABASE_URL", raw.to_owned()).is_ok(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_url_rejects_malformed_values_by_name_only() {
+        for raw in [
+            "banana-sentinel",
+            "http://u:banana-sentinel@db/fau",
+            "postgres://u:banana-sentinel@db:notaport/fau",
+        ] {
+            let e = postgres_url("DATABASE_URL", raw.to_owned()).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "configuration variable DATABASE_URL is not a valid value"
+            );
+        }
     }
 
     #[test]

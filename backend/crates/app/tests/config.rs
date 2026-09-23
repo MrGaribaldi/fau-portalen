@@ -54,11 +54,10 @@ struct BriefRun {
 }
 
 /// Spawns `fau <arg>` with `env`, waits `wait`, then kills it if it is still
-/// running and collects whatever it printed. Ruling 7: now that `serve` actually
-/// binds and runs instead of ending in `todo!()`, a config test that wants to
-/// observe "got past configuration" or "never leaked within a few seconds while
-/// actually serving" cannot use a blocking `.output()` -- that would hang forever
-/// against a process with no configuration error to exit on.
+/// running and collects whatever it printed. A config test that wants to observe
+/// "got past configuration" or "never leaked while actually serving" cannot use a
+/// blocking `.output()`: a correctly configured `serve` runs until signalled, so
+/// that would hang forever.
 fn run_briefly(env: &[(&str, &str)], arg: &str, wait: Duration) -> BriefRun {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fau"));
     cmd.arg(arg)
@@ -129,9 +128,9 @@ fn unknown_app_env_is_rejected_without_echoing_it() {
 
 #[test]
 fn log_level_rejects_an_invalid_value_without_echoing_it() {
-    // Ruling 3 (Task 10): an invalid LOG_LEVEL must fail at startup as a
-    // configuration error naming the variable, and `EnvFilter`'s own parse errors
-    // quote their input -- so this must never be let through to the output either.
+    // An invalid LOG_LEVEL must fail at startup as a configuration error naming the
+    // variable, and `EnvFilter`'s own parse errors quote their input -- so this must
+    // never be let through to the output either.
     let mut env = serve_env_without("LOG_LEVEL");
     env.push(("LOG_LEVEL", "banana-sentinel"));
     let out = fau_with(&env, "serve");
@@ -143,15 +142,12 @@ fn log_level_rejects_an_invalid_value_without_echoing_it() {
 
 #[tokio::test]
 async fn log_level_with_surrounding_whitespace_still_produces_info_output() {
-    // Fix round 1, item 2: `optional("LOG_LEVEL")` does not trim, and `parsed`
-    // validates by trimming internally -- so a value like "info " passed validation
-    // while the untrimmed string was still what got stored and handed to
-    // `EnvFilter`. `EnvFilter`'s grammar does not tolerate that the same way:
-    // "info " fails `LevelFilter::from_str` (exact string match), so it falls back
-    // to being read as a bogus *target* name enabling only that literal target,
-    // never as the global default level -- which silently turned off ordinary
-    // application logging. This proves the whole pipeline still logs at INFO with a
-    // trailing space in `LOG_LEVEL`, not just that config validation accepts it.
+    // `optional("LOG_LEVEL")` does not trim, while `parsed` validates by trimming
+    // internally -- so "info " passes validation. Handed to `EnvFilter` untrimmed,
+    // it would be read as a bogus *target* name enabling only that literal target,
+    // never as the global default level, silently turning off ordinary application
+    // logging. This proves the whole pipeline still logs at INFO with a trailing
+    // space in `LOG_LEVEL`, not just that config validation accepts it.
     let db = TestDb::migrated().await;
     let app = common::spawn_serve_with_env(&db, &[("LOG_LEVEL", "info ")]).await;
     let lines = app.captured_stdout();
@@ -185,9 +181,9 @@ fn production_requires_an_https_public_base_url() {
 #[tokio::test]
 async fn database_url_password_never_appears_in_output() {
     // A DSN in a log or error message is the classic way a password reaches an
-    // operator's screen. Ruling 6: this must now force a *real* connection attempt
-    // rather than merely prove the lazy pool never dials out -- Task 9's readiness
-    // probe (`db_check`) is exactly such a caller. `DATABASE_URL` here points at a
+    // operator's screen. This forces a *real* connection attempt rather than merely
+    // proving the lazy pool never dials out -- the readiness probe (`db_check`) is
+    // exactly such a caller. `DATABASE_URL` here points at a
     // real, reachable database with a wrong password (a "wrong-credential target"),
     // which fails fast with SQLSTATE 28P01 rather than hanging on a black hole, so
     // both the startup schema-contract check and every `/health/ready` probe
@@ -225,9 +221,8 @@ async fn database_url_password_never_appears_in_output() {
 #[test]
 fn migrate_does_not_require_serve_configuration() {
     // Section 4: migrate requires only MIGRATION_DATABASE_URL. With a syntactically
-    // valid one supplied, nothing here may fail on a *serve* variable -- today that
-    // shows up as `migrate`'s `todo!()`, later as a connection failure, but never as
-    // a configuration error naming APP_ENV, PUBLIC_BASE_URL, DATABASE_URL,
+    // valid but unreachable one supplied, `migrate` fails on the connection, never
+    // with a configuration error naming APP_ENV, PUBLIC_BASE_URL, DATABASE_URL,
     // DB_POOL_MAX_CONNECTIONS, HTTP_BIND or LOG_LEVEL.
     let out = fau_with(
         &[("MIGRATION_DATABASE_URL", "postgres://u:p@127.0.0.1:1/none")],
@@ -263,7 +258,11 @@ fn telemetry_and_mail_variables_are_accepted_without_validation() {
     // this test forever waiting for a process that no longer exits on its own.
     let mut env = SERVE_ENV.to_vec();
     env.push(("OTEL_SERVICE_NAME", "fau-app"));
-    env.push(("OTEL_EXPORTER_OTLP_ENDPOINT", "not-a-real-endpoint"));
+    // An OTLP endpoint can carry credentials, so its value must never be echoed.
+    env.push((
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "https://u:otlp-sentinel@collector.example",
+    ));
     env.push(("OTEL_EXPORTER_OTLP_PROTOCOL", "smoke-signal"));
     env.push(("MAIL_TRANSPORT", "carrier-pigeon"));
     env.push(("SIGNUP_NOTIFICATION_TO", "not-an-email-address"));
@@ -278,6 +277,55 @@ fn telemetry_and_mail_variables_are_accepted_without_validation() {
         !text.contains("configuration variable"),
         "output was: {text}"
     );
+    assert!(!text.contains("otlp-sentinel"), "value leaked: {text}");
+    assert!(
+        text.contains("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        "the unused variable should still be named: {text}"
+    );
+}
+
+#[test]
+fn malformed_database_url_is_invalid_without_echoing_it() {
+    for bad in ["banana-sentinel", "http://u:banana-sentinel@db/fau"] {
+        let mut env = serve_env_without("DATABASE_URL");
+        env.push(("DATABASE_URL", bad));
+        let out = fau_with(&env, "serve");
+        assert!(!out.status.success());
+        let text = combined(&out);
+        assert!(
+            text.contains("configuration variable DATABASE_URL is not a valid value"),
+            "output was: {text}"
+        );
+        assert!(!text.contains("banana-sentinel"), "value leaked: {text}");
+    }
+}
+
+#[test]
+fn malformed_migration_database_url_is_invalid_without_echoing_it() {
+    for bad in ["banana-sentinel", "http://u:banana-sentinel@db/fau"] {
+        let out = fau_with(&[("MIGRATION_DATABASE_URL", bad)], "migrate");
+        assert!(!out.status.success());
+        let text = combined(&out);
+        assert!(
+            text.contains("configuration variable MIGRATION_DATABASE_URL is not a valid value"),
+            "output was: {text}"
+        );
+        assert!(!text.contains("banana-sentinel"), "value leaked: {text}");
+    }
+}
+
+#[test]
+fn public_base_url_with_userinfo_is_invalid_without_echoing_it() {
+    let mut env = serve_env_without("PUBLIC_BASE_URL");
+    env.push(("PUBLIC_BASE_URL", "http://u:banana-sentinel@localhost:8000"));
+    let out = fau_with(&env, "serve");
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("configuration variable PUBLIC_BASE_URL is not a valid value"),
+        "output was: {text}"
+    );
+    assert!(!text.contains("banana-sentinel"), "value leaked: {text}");
 }
 
 #[test]
@@ -289,15 +337,12 @@ fn migrate_without_its_own_variable_names_it() {
 
 #[tokio::test]
 async fn http_bind_and_log_level_have_defaults() {
-    // Ruling 7: now that `serve` actually binds and runs, "the defaults were
-    // accepted" is best shown by the process still running past configuration
-    // (rather than exiting on a rejected variable), and by the startup banner
-    // actually naming the two default values -- a stronger check than the old one,
-    // which only ever proved these two variable *names* were absent from a
-    // `todo!()` panic's output.
+    // "The defaults were accepted" is shown by the process still running past
+    // configuration (rather than exiting on a rejected variable), and by the
+    // startup event actually naming the two default values.
     //
     // DATABASE_URL points at a real, migrated database rather than SERVE_ENV's
-    // deliberately-unreachable sentinel: Task 7's schema-contract gate runs before
+    // deliberately-unreachable sentinel: the schema-contract gate runs before
     // `serve` ever reaches `TcpListener::bind`, and against an unreachable address
     // it can retry for close to its full 5s bound (sqlx retries a failed `Io`
     // connection internally) -- comfortably longer than this test's 500ms window.
@@ -335,9 +380,8 @@ async fn http_bind_and_log_level_have_defaults() {
     assert!(!text.contains("HTTP_BIND"), "output was: {text}");
     assert!(!text.contains("LOG_LEVEL"), "output was: {text}");
 
-    // Ruling 2 (Task 10): the plain-text banner is gone, replaced by one JSON
-    // startup event on stdout -- parse it out and check its fields directly, rather
-    // than substring-matching the raw output as before.
+    // Startup is announced by one JSON event on stdout -- parse it out and check its
+    // fields directly rather than substring-matching the raw output.
     let stdout = String::from_utf8_lossy(&run.output.stdout);
     let startup_event = stdout
         .lines()
@@ -355,7 +399,7 @@ async fn http_bind_and_log_level_have_defaults() {
     );
 }
 
-// The migration lock's bounds, ruling 7: MIGRATION_LOCK_TIMEOUT_MS and
+// The migration lock's bounds: MIGRATION_LOCK_TIMEOUT_MS and
 // MIGRATION_LOCK_WAIT_MS default when absent, and an invalid value is rejected by
 // variable name only. The database in MIGRATION_DATABASE_URL is deliberately
 // unreachable (127.0.0.1:1) in all three: config validation happens before any

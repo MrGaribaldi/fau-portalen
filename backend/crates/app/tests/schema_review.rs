@@ -16,8 +16,6 @@ async fn runtime_role_cannot_perform_ddl() {
 
 #[tokio::test]
 async fn runtime_role_can_read_and_write_the_spine() {
-    // Expected to fail until Task 6 creates `accounts` -- that is this task's exit
-    // condition for Task 6, not a defect here.
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let n: i64 = sqlx::query_scalar("select count(*) from accounts")

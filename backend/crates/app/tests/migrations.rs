@@ -19,7 +19,7 @@ async fn migrate_applies_and_is_idempotent() {
         .fetch_one(&db.admin_pool())
         .await
         .unwrap();
-    // 0001 and 0002 both exist as of Task 6.
+    // 0001 and 0002 are the migrations that exist today.
     assert_eq!(version, 2, "contract version after all migrations");
 }
 
@@ -44,6 +44,72 @@ async fn altered_checksum_on_an_applied_migration_fails() {
     );
 }
 
+/// A database already at version 1 -- migrated by an older binary that shipped only
+/// 0001 -- is brought forward by applying just 0002, leaving 0001's record alone.
+#[tokio::test]
+async fn migrate_completes_a_partly_migrated_database() {
+    let db = TestDb::fresh().await;
+    common::apply_roles(&db).await;
+
+    // A migration source holding a byte-for-byte copy of 0001 only, so its checksum
+    // matches the one the binary embeds.
+    let dir = std::env::temp_dir().join(format!("fau-partial-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/0001_schema_contract.sql"
+    );
+    std::fs::copy(source, dir.join("0001_schema_contract.sql")).unwrap();
+
+    let migrator = sqlx::migrate::Migrator::new(dir.as_path())
+        .await
+        .expect("read the one-file migration source");
+    let migrate_pool = sqlx::PgPool::connect(&db.migration_url())
+        .await
+        .expect("connect as fau_migrate");
+    migrator.run(&migrate_pool).await.expect("apply 0001 alone");
+    migrate_pool.close().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let admin = db.admin_pool();
+    let rows_before: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(rows_before, 1, "the starting point must be version 1 only");
+    let row_before: (String, String) = sqlx::query_as(
+        "select c.applied_at::text, m.installed_on::text
+           from schema_contract c, _sqlx_migrations m
+          where c.version = 1 and m.version = 1",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+
+    let out = common::run_fau_migrate(&db).await;
+    assert!(out.status.success(), "{:?}", out);
+
+    let version: i32 = sqlx::query_scalar("select max(version) from schema_contract")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(version, 2);
+    let rows: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2);
+    let row_after: (String, String) = sqlx::query_as(
+        "select c.applied_at::text, m.installed_on::text
+           from schema_contract c, _sqlx_migrations m
+          where c.version = 1 and m.version = 1",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(row_after, row_before, "version 1 must not be re-applied");
+}
+
 #[tokio::test]
 async fn concurrent_migrate_processes_serialise() {
     let db = TestDb::fresh().await;
@@ -56,7 +122,7 @@ async fn concurrent_migrate_processes_serialise() {
     );
 
     // Exactly one row per migration proves neither applied the same file twice.
-    // 0001 and 0002 both exist as of Task 6.
+    // 0001 and 0002 are the migrations that exist today.
     let rows: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
         .fetch_one(&db.admin_pool())
         .await
@@ -97,10 +163,10 @@ async fn migrate_fails_rather_than_hanging_when_the_lock_is_held() {
 
 #[tokio::test]
 async fn serve_performs_no_ddl() {
-    // Spec section 3. The runtime role has no DDL rights (Task 5), so this is
+    // Spec section 3. The runtime role has no DDL rights (db/roles.sql), so this is
     // belt and braces: an empty database must stay empty when serve is started.
     //
-    // Task 7's schema-contract gate means serve now refuses an unmigrated database
+    // The schema-contract gate makes serve refuse an unmigrated database
     // outright -- the missing `schema_contract` table (SQLSTATE 42P01) is treated as
     // contract version 0, below the minimum -- rather than binding and answering
     // /health/live, so this proves "no DDL" via the process's exit instead of by

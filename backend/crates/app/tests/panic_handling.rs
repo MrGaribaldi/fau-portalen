@@ -1,6 +1,5 @@
 #![cfg(feature = "test-routes")]
-//! End-to-end proof of the panic-catching path (design section 11, fix round 2 item
-//! 3): a real `tower_http::CatchPanicLayer`, the process-wide panic hook
+//! End-to-end proof of the panic-catching path (design section 11): a real `tower_http::CatchPanicLayer`, the process-wide panic hook
 //! `telemetry::init` installs, and `http::error::handle_panic`, all wired together
 //! exactly as `fau serve` runs them -- not just `handle_panic` called directly, which
 //! `http::error`'s own unit test already covers in isolation.

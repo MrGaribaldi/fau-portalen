@@ -10,7 +10,7 @@ use common::TestDb;
 async fn every_line_is_json_with_a_conventional_level() {
     // Spec section 10: Alloy's stage.json extracts a top-level `level` and promotes
     // it to a Loki label. A non-JSON line or a renamed field breaks the dashboards.
-    // Fix round 1: `timestamp` and `service_version` must be present on *every*
+    // `timestamp` and `service_version` must be present on *every*
     // line too -- not just ones a call site remembers to pass them on -- so this
     // runs against a path that also emits a WARN with no `AppState` in scope at all
     // (`readiness`'s probe warning, forced by the sentinel-password setup), not just
@@ -83,7 +83,7 @@ async fn sentinel_secrets_never_appear_in_log_output() {
     .await;
     app.get("/api/v1/nope?q=SENTINEL_QUERY2").await;
 
-    // Fix round 1: prove the connection-failure path this sentinel is meant to
+    // Prove the connection-failure path this sentinel is meant to
     // exercise actually ran, rather than trusting that the harness helper's own
     // internal `/health/ready` call did -- a wrong DSN password must surface as a
     // database problem, not silently as "ready".
@@ -92,7 +92,7 @@ async fn sentinel_secrets_never_appear_in_log_output() {
     let body: serde_json::Value = ready.json().await.expect("a JSON readiness body");
     assert_eq!(body["reason"], "database");
 
-    // Fix round 1: check stdout *and* stderr -- a leak on either stream is a leak.
+    // Check stdout *and* stderr -- a leak on either stream is a leak.
     let stdout = app.captured_stdout().join("\n");
     let stderr = app.captured_stderr().join("\n");
     for sentinel in [
@@ -127,7 +127,7 @@ async fn the_request_id_is_echoed_and_logged() {
 
 #[tokio::test]
 async fn inbound_request_id_header_is_never_trusted() {
-    // Ruling 5 (Task 10) and fix round 1, item 3: a caller-supplied `x-request-id`
+    // A caller-supplied `x-request-id`
     // must never be echoed back, never appear in a log line, and never substitute
     // for the id this server mints -- only the id `middleware` generates may tie the
     // response, the error body and the access-log line together.
@@ -190,7 +190,7 @@ async fn inbound_request_id_header_is_never_trusted() {
 
 #[tokio::test]
 async fn the_warn_line_inside_a_request_carries_its_request_id_even_at_log_level_warn() {
-    // Fix round 2, item 1: an `info_span!`-level span is disabled outright by
+    // An `info_span!`-level span is disabled outright by
     // `EnvFilter` at `LOG_LEVEL=warn` (or stricter), so a `WARN` line nested inside
     // it -- like `readiness`'s probe failure below -- would lose `request_id`
     // entirely if the per-request span itself were ever filtered out along with it.
@@ -207,10 +207,9 @@ async fn the_warn_line_inside_a_request_carries_its_request_id_even_at_log_level
     let warn_line = lines
         .iter()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        // Matched by *this* request's id specifically, not just "any WARN with a
-        // request_id": the harness helper's own internal `/health/ready` call (and,
-        // at LOG_LEVEL=warn, the startup schema-contract retry warning with no
-        // request in flight at all) produce other WARN lines first.
+        // Matched by *this* request's id specifically, not just "any WARN": at
+        // LOG_LEVEL=warn the startup schema-contract warning, logged with no
+        // request in flight, comes first.
         .find(|v| {
             v["level"] == "WARN"
                 && v.get("request_id").and_then(|id| id.as_str()) == Some(request_id.as_str())
@@ -230,7 +229,7 @@ async fn the_warn_line_inside_a_request_carries_its_request_id_even_at_log_level
 #[tokio::test]
 async fn sqlx_query_text_never_appears_in_log_output_even_at_log_level_debug() {
     // Spec section 10: "never logged: ... SQL parameters" -- more basically, sqlx's
-    // own query logging must not leak SQL text at all. Fix round 2, item 5: at the
+    // own query logging must not leak SQL text at all. At the
     // *default* LOG_LEVEL=info, sqlx's own statement logging (DEBUG by default)
     // would already be suppressed by the global level alone, so this test could
     // pass even if the dedicated `sqlx=warn` directive in `telemetry::init` were

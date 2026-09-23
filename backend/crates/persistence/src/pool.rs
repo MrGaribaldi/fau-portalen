@@ -96,9 +96,9 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(900);
 /// Builds `serve`'s runtime pool *lazily*: `connect_lazy_with` never dials the
 /// database, it only validates and stores the connect options, so a database that
 /// is merely unreachable at startup is not a startup failure (design section 4).
-/// The first real connection attempt happens on first use -- Task 7's
-/// schema-contract startup check (`read_contract_version`) is that first caller;
-/// Task 9's readiness check reuses the same pool afterwards.
+/// The first real connection attempt happens on first use -- the schema-contract
+/// startup check (`read_contract_version`) is that first caller; the readiness
+/// check reuses the same pool afterwards.
 pub fn lazy_pool(url: &str, max_connections: u32) -> Result<PgPool, ConnectErrorKind> {
     let options = connect_options(url, [])?;
     Ok(PgPoolOptions::new()
@@ -130,13 +130,13 @@ pub fn safe_error_kind(e: &sqlx::Error) -> String {
     }
 }
 
+/// Test doubles shared by this crate's unit tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use std::borrow::Cow;
 
-    /// A minimal `DatabaseError` double so `classify_connect_error`'s SQLSTATE
-    /// branch can be exercised without a live server.
+    /// A minimal `DatabaseError` double so SQLSTATE branches -- here and in
+    /// `migrate.rs` -- can be exercised without a live server.
     #[derive(Debug)]
     struct FakeDbError {
         code: &'static str,
@@ -176,9 +176,15 @@ mod tests {
         }
     }
 
-    fn database_error(code: &'static str) -> sqlx::Error {
+    pub(crate) fn database_error(code: &'static str) -> sqlx::Error {
         sqlx::Error::Database(Box::new(FakeDbError { code }))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::database_error;
+    use super::*;
 
     #[test]
     fn invalid_url_is_reported_without_echoing_it() {

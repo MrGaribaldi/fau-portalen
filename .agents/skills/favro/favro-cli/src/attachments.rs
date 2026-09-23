@@ -22,7 +22,18 @@ fn names(card: &Value) -> Result<BTreeMap<String, usize>, String> {
 /// Markdown PUT rebuilds Favro's attachment list from image nodes, including
 /// non-image uploads. Preserve existing files in that same request using their
 /// remote URLs; neither attachments nor addAttachments body fields work.
-pub fn preserve_in_markdown(card: &Value, description: &str) -> Result<String, String> {
+///
+/// `omit` lists `fileURL`s to drop the node for instead of preserving -- since the
+/// attachment list is rebuilt from these nodes, leaving one out is how
+/// `attach --replace` and `detach` remove it. Every other attachment, including ones
+/// sharing the same name, round-trips unchanged. Every attachment is still validated,
+/// including omitted ones: refusing an unrepresentable attachment must not depend on
+/// whether this write happens to remove it. Pass an empty `omit` to preserve everything.
+pub fn preserve_in_markdown_except(
+    card: &Value,
+    description: &str,
+    omit: &[&str],
+) -> Result<String, String> {
     // Validate the metadata before any mutation, including unnamed attachments.
     names(card)?;
     let mut result = String::new();
@@ -37,6 +48,9 @@ pub fn preserve_in_markdown(card: &Value, description: &str) -> Result<String, S
                 || url.contains(['<', '>', '\\'])
             {
                 return Err(format!("Cannot safely represent attachment {name:?} in Markdown. Description was not changed."));
+            }
+            if omit.contains(&url) {
+                continue;
             }
             let mut label = String::new();
             for ch in name.chars() {
@@ -54,14 +68,26 @@ pub fn preserve_in_markdown(card: &Value, description: &str) -> Result<String, S
     Ok(result)
 }
 
-pub fn verify(before: &Value, after: &Value) -> Result<(), String> {
+/// `expected_removals` lists attachment names this write intentionally removed, one
+/// entry per removed attachment (names are not unique, so a name removed twice needs
+/// two entries). Those counts are subtracted from the pre-write baseline before
+/// comparing; anything missing beyond that still fails loudly -- the guard's value is
+/// catching *unintended* loss, not blessing every decrease an intentional removal
+/// happens to accompany.
+pub fn verify(before: &Value, after: &Value, expected_removals: &[String]) -> Result<(), String> {
     let expected = names(before)?;
     let actual = names(after)?;
+    let mut allowance: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in expected_removals {
+        *allowance.entry(name.as_str()).or_default() += 1;
+    }
     let missing: Vec<String> = expected
         .into_iter()
         .filter_map(|(name, count)| {
+            let allowed_gone = allowance.get(name.as_str()).copied().unwrap_or_default();
+            let floor = count.saturating_sub(allowed_gone);
             let remaining = actual.get(&name).copied().unwrap_or_default();
-            (remaining < count).then(|| format!("{name:?} ({} missing)", count - remaining))
+            (remaining < floor).then(|| format!("{name:?} ({} missing)", floor - remaining))
         })
         .collect();
     if missing.is_empty() {
@@ -82,9 +108,12 @@ mod tests {
     #[test]
     fn preserves_remote_files_with_markdown_safe_labels_and_urls() {
         let card = json!({"attachments": [{"name": "evidence [final].pdf", "fileURL": "https://example.com/file(1)?signature=abc&x=1"}]});
-        let result = preserve_in_markdown(&card, "- [x] reviewed").unwrap();
+        let result = preserve_in_markdown_except(&card, "- [x] reviewed", &[]).unwrap();
         assert_eq!(result, "![evidence \\[final\\]\\.pdf](<https://example.com/file(1)?signature=abc&x=1>)\n\n- [x] reviewed");
-        assert_eq!(preserve_in_markdown(&json!({}), "text").unwrap(), "text");
+        assert_eq!(
+            preserve_in_markdown_except(&json!({}), "text", &[]).unwrap(),
+            "text"
+        );
     }
 
     #[test]
@@ -95,7 +124,12 @@ mod tests {
             json!({"name": "evidence.pdf", "fileURL": "https://example.com/unsafe>"}),
             json!({"name": "evidence\n.pdf", "fileURL": "https://example.com/file"}),
         ] {
-            assert!(preserve_in_markdown(&json!({"attachments": [attachment]}), "text").is_err());
+            assert!(preserve_in_markdown_except(
+                &json!({"attachments": [attachment]}),
+                "text",
+                &[]
+            )
+            .is_err());
         }
     }
 
@@ -103,8 +137,10 @@ mod tests {
     fn detects_missing_names_and_duplicate_uploads() {
         let before = json!({"attachments": [{"name": "evidence.pdf"}, {"name": "evidence.pdf"}]});
         let after = json!({"attachments": [{"name": "evidence.pdf"}]});
-        assert!(verify(&before, &after).unwrap_err().contains("1 missing"));
-        assert!(verify(&before, &json!({})).is_err());
+        assert!(verify(&before, &after, &[])
+            .unwrap_err()
+            .contains("1 missing"));
+        assert!(verify(&before, &json!({}), &[]).is_err());
     }
 
     #[test]
@@ -113,13 +149,50 @@ mod tests {
         let after = json!({"attachments": [
             {"name": "extra.txt"}, {"name": "evidence.pdf", "fileURL": "new"}
         ]});
-        assert!(verify(&before, &after).is_ok());
-        assert!(verify(&json!({}), &json!({"attachments": []})).is_ok());
+        assert!(verify(&before, &after, &[]).is_ok());
+        assert!(verify(&json!({}), &json!({"attachments": []}), &[]).is_ok());
     }
 
     #[test]
     fn rejects_malformed_attachment_metadata() {
-        assert!(verify(&json!({"attachments": {}}), &json!({})).is_err());
-        assert!(verify(&json!({}), &json!({"attachments": [{}]})).is_err());
+        assert!(verify(&json!({"attachments": {}}), &json!({}), &[]).is_err());
+        assert!(verify(&json!({}), &json!({"attachments": [{}]}), &[]).is_err());
+    }
+
+    #[test]
+    fn permits_expected_removals_but_still_catches_extra_loss() {
+        let before = json!({"attachments": [
+            {"name": "evidence.pdf"}, {"name": "evidence.pdf"}, {"name": "extra.txt"}
+        ]});
+        // Removing one of the two "evidence.pdf" copies is expected and passes.
+        let after_intended =
+            json!({"attachments": [{"name": "evidence.pdf"}, {"name": "extra.txt"}]});
+        assert!(verify(&before, &after_intended, &["evidence.pdf".to_string()]).is_ok());
+        // The same expected removal must not mask an unrelated file also disappearing.
+        let after_extra_loss = json!({"attachments": [{"name": "evidence.pdf"}]});
+        let err = verify(&before, &after_extra_loss, &["evidence.pdf".to_string()]).unwrap_err();
+        assert!(err.contains("extra.txt"));
+        assert!(!err.contains("evidence.pdf"));
+    }
+
+    #[test]
+    fn omits_only_the_named_url_and_preserves_same_named_siblings() {
+        let card = json!({"attachments": [
+            {"name": "evidence.pdf", "fileURL": "https://example.com/old"},
+            {"name": "evidence.pdf", "fileURL": "https://example.com/new"},
+        ]});
+        let result =
+            preserve_in_markdown_except(&card, "body", &["https://example.com/old"]).unwrap();
+        assert_eq!(
+            result,
+            "![evidence\\.pdf](<https://example.com/new>)\n\nbody"
+        );
+    }
+
+    #[test]
+    fn still_validates_omitted_attachments_before_mutation() {
+        let card =
+            json!({"attachments": [{"name": "evidence.pdf", "fileURL": "javascript:alert(1)"}]});
+        assert!(preserve_in_markdown_except(&card, "body", &["javascript:alert(1)"]).is_err());
     }
 }

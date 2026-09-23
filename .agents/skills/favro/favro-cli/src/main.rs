@@ -162,6 +162,32 @@ enum Cmd {
         /// MIME type override (normally inferred from the filename).
         #[arg(long)]
         mime_type: Option<String>,
+        /// Upload first, then remove whichever pre-existing attachment(s) already
+        /// carried this filename, so the card ends up with exactly one. The old
+        /// copy stays on the card until the new one is confirmed uploaded.
+        #[arg(long)]
+        replace: bool,
+        /// Disambiguates --replace when several existing attachments already share
+        /// the new filename: the fileURL (from `get --card <id>`) of the one to
+        /// remove. Required in that case; refused otherwise.
+        #[arg(long)]
+        replace_url: Option<String>,
+    },
+    /// Remove one attachment from a card, leaving the rest of the description untouched.
+    ///
+    /// Names are not unique in Favro, so a name matching more than one attachment is
+    /// refused unless --url picks one. This unlinks the file from the card; whether
+    /// Favro also deletes the underlying storage is outside this command's knowledge.
+    Detach {
+        #[arg(long)]
+        card: String,
+        /// Attachment filename to remove.
+        #[arg(long)]
+        name: String,
+        /// Disambiguates when several attachments share --name: the fileURL (from
+        /// `get --card <id>`) of the one to remove.
+        #[arg(long)]
+        url: Option<String>,
     },
     /// Rewrite a comment authored by the selected role, or a legacy 🤖 comment, in place.
     ///
@@ -593,9 +619,26 @@ struct Api {
 
 impl Api {
     fn write_description(&self, before: &Value, description: &str) {
-        let description =
-            attachments::preserve_in_markdown(before, &checkboxes_to_markdown(description))
-                .unwrap_or_else(|error| die(error));
+        self.write_description_removing(before, description, &[], &[]);
+    }
+
+    /// Same as `write_description`, but omits the attachments whose `fileURL` is in
+    /// `omit_urls` when rebuilding the description, and tells the loss-guard that
+    /// `expected_removals` (attachment names, one entry per removed attachment) are
+    /// intentional rather than data loss. Used by `attach --replace` and `detach`.
+    fn write_description_removing(
+        &self,
+        before: &Value,
+        description: &str,
+        omit_urls: &[&str],
+        expected_removals: &[String],
+    ) {
+        let description = attachments::preserve_in_markdown_except(
+            before,
+            &checkboxes_to_markdown(description),
+            omit_urls,
+        )
+        .unwrap_or_else(|error| die(error));
         let card_id = before
             .get("cardId")
             .and_then(Value::as_str)
@@ -607,11 +650,13 @@ impl Api {
             Some(json!({"detailedDescription": description})),
             None,
         );
-        self.verify_attachments(before, card_id);
+        self.verify_attachments(before, card_id, expected_removals);
     }
 
     /// Re-read the exact instance, including archived cards, after a mutation.
-    fn verify_attachments(&self, before: &Value, card_id: &str) {
+    /// `expected_removals` lists attachment names this same mutation intentionally
+    /// removed (see `attachments::verify`); pass `&[]` when none were.
+    fn verify_attachments(&self, before: &Value, card_id: &str, expected_removals: &[String]) {
         let (after, _) = self
             .try_request("GET", &format!("/cards/{card_id}"), &[], None, None)
             .unwrap_or_else(|error| {
@@ -622,7 +667,7 @@ impl Api {
         if after.get("cardId").and_then(Value::as_str) != Some(card_id) {
             die(format!("Card {card_id} was updated, but attachment verification returned an invalid card response."));
         }
-        attachments::verify(before, &after)
+        attachments::verify(before, &after, expected_removals)
             .unwrap_or_else(|error| die(format!("Card {card_id}: {error}")));
     }
 
@@ -1957,7 +2002,7 @@ fn main() {
                         "FAILED: Favro did not return the updated card instance {card_id}."
                     ))
                 });
-            attachments::verify(&c, &after)
+            attachments::verify(&c, &after, &[])
                 .unwrap_or_else(|error| die(format!("Card {card_id}: {error}")));
             let now = after
                 .get("archived")
@@ -2021,7 +2066,7 @@ fn main() {
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| die("Destination card has no cardId; nothing was archived."));
             // Verify the destination before retiring any source instance.
-            api.verify_attachments(&c, target_id);
+            api.verify_attachments(&c, target_id, &[]);
             let mut retired = 0usize;
             for inst in &instances {
                 let iw = inst
@@ -2041,11 +2086,11 @@ fn main() {
                         Some(json!({"archive": true})),
                         None,
                     );
-                    api.verify_attachments(inst, iid);
+                    api.verify_attachments(inst, iid, &[]);
                     retired += 1;
                 }
             }
-            api.verify_attachments(&c, target_id);
+            api.verify_attachments(&c, target_id, &[]);
             println!(
                 "Moved #{seq} [{card}] -> {board}/{lane}{}",
                 if retired > 0 {
@@ -2077,7 +2122,12 @@ fn main() {
             file,
             name,
             mime_type,
+            replace,
+            replace_url,
         } => {
+            if replace_url.is_some() && !replace {
+                die("--replace-url requires --replace.");
+            }
             const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
             let metadata = std::fs::metadata(&file)
                 .unwrap_or_else(|e| die(format!("Cannot inspect {}: {e}", file.display())));
@@ -2114,6 +2164,52 @@ fn main() {
                 .get("cardId")
                 .and_then(|value| value.as_str())
                 .unwrap_or_else(|| die(format!("Card {card} has no cardId.")));
+            // Resolve the attachment --replace will remove BEFORE uploading, so an
+            // ambiguous request refuses without ever touching the card.
+            let same_name: Vec<&Value> = existing
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map(|attachments| {
+                    attachments
+                        .iter()
+                        .filter(|attachment| {
+                            attachment.get("name").and_then(Value::as_str)
+                                == Some(filename.as_str())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let outgoing_url: Option<String> = if !replace {
+                None
+            } else {
+                match (same_name.as_slice(), &replace_url) {
+                    ([], _) => None,
+                    ([one], None) => Some(
+                        one.get("fileURL")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| {
+                                die(format!(
+                                    "Cannot replace {filename:?}: the existing attachment has no fileURL."
+                                ))
+                            })
+                            .to_string(),
+                    ),
+                    (_, Some(url)) => {
+                        if !same_name.iter().any(|attachment| {
+                            attachment.get("fileURL").and_then(Value::as_str) == Some(url.as_str())
+                        }) {
+                            die(format!(
+                                "Card {card} has no attachment named {filename:?} with fileURL {url:?}."
+                            ));
+                        }
+                        Some(url.clone())
+                    }
+                    (_, None) => die(format!(
+                        "Card {card} already has {} attachments named {filename:?}; pass --replace-url <fileURL> to pick one (see `favro get --card {card}`).",
+                        same_name.len()
+                    )),
+                }
+            };
             let response = api.upload(card_id, &filename, &mime_type, &bytes);
             if response.get("name").and_then(|value| value.as_str()) != Some(&filename) {
                 die(format!(
@@ -2134,9 +2230,128 @@ fn main() {
                     "Uploaded {filename}, but it did not appear when card {card} was re-read."
                 ));
             }
+            match &outgoing_url {
+                None => {
+                    println!(
+                        "Attached {filename} ({} bytes, {mime_type}) to card {card}{}",
+                        bytes.len(),
+                        if replace {
+                            " (no prior attachment shared this name; nothing was replaced)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                Some(outgoing_url) => {
+                    // The card never goes without the file: the old copy is only removed
+                    // now, after the new upload is confirmed present.
+                    let base = find_description_card(&api, &collection, &card);
+                    let desc = base
+                        .get("detailedDescription")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    api.write_description_removing(
+                        &base,
+                        desc,
+                        &[outgoing_url.as_str()],
+                        std::slice::from_ref(&filename),
+                    );
+                    let after = find_card(&api, &collection, &card);
+                    let remaining: Vec<Option<&str>> = after
+                        .get("attachments")
+                        .and_then(Value::as_array)
+                        .map(|attachments| {
+                            attachments
+                                .iter()
+                                .filter(|attachment| {
+                                    attachment.get("name").and_then(Value::as_str)
+                                        == Some(filename.as_str())
+                                })
+                                .map(|attachment| attachment.get("fileURL").and_then(Value::as_str))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if remaining.len() != 1 || remaining[0] == Some(outgoing_url.as_str()) {
+                        die(format!(
+                            "Replace did not leave exactly one {filename:?} on card {card}; inspect the card before continuing."
+                        ));
+                    }
+                    println!(
+                        "Attached {filename} ({} bytes, {mime_type}) to card {card}, replacing the prior copy (unlinked from the card; Favro's storage may still retain the old file).",
+                        bytes.len()
+                    );
+                }
+            }
+        }
+        Cmd::Detach { card, name, url } => {
+            let api = api_handle();
+            let c = find_description_card(&api, &collection, &card);
+            let same_name: Vec<&Value> = c
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map(|attachments| {
+                    attachments
+                        .iter()
+                        .filter(|attachment| {
+                            attachment.get("name").and_then(Value::as_str) == Some(name.as_str())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let outgoing: &Value = match (same_name.as_slice(), &url) {
+                ([], _) => die(format!("Card {card} has no attachment named {name:?}.")),
+                ([one], None) => one,
+                (_, Some(target)) => same_name
+                    .iter()
+                    .find(|attachment| {
+                        attachment.get("fileURL").and_then(Value::as_str) == Some(target.as_str())
+                    })
+                    .unwrap_or_else(|| {
+                        die(format!(
+                            "Card {card} has no attachment named {name:?} with fileURL {target:?}."
+                        ))
+                    }),
+                (_, None) => die(format!(
+                    "Card {card} has {} attachments named {name:?}; pass --url <fileURL> to pick one (see `favro get --card {card}`).",
+                    same_name.len()
+                )),
+            };
+            let outgoing_url = outgoing
+                .get("fileURL")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "Attachment {name:?} has no fileURL; cannot detach it safely."
+                    ))
+                })
+                .to_string();
+            let desc = c
+                .get("detailedDescription")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            api.write_description_removing(
+                &c,
+                desc,
+                &[outgoing_url.as_str()],
+                std::slice::from_ref(&name),
+            );
+            let after = find_card(&api, &collection, &card);
+            let remaining = after
+                .get("attachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| {
+                    attachments.iter().any(|attachment| {
+                        attachment.get("fileURL").and_then(Value::as_str)
+                            == Some(outgoing_url.as_str())
+                    })
+                });
+            if remaining {
+                die(format!(
+                    "Detach did not take effect: {name:?} is still on card {card} after the update."
+                ));
+            }
             println!(
-                "Attached {filename} ({} bytes, {mime_type}) to card {card}",
-                bytes.len()
+                "Detached {name:?} from card {card} (unlinked from the card; Favro's storage may still retain the file)."
             );
         }
         // Both commands refuse to touch a human-authored comment. A comment is especially risky: there is no block marker to aim at and no copy anywhere else. The
@@ -2324,7 +2539,7 @@ fn main() {
                         Some(Value::Object(handoff)),
                         None,
                     );
-                    api.verify_attachments(&c, &card_id);
+                    api.verify_attachments(&c, &card_id, &[]);
                 }
             }
             if clear {

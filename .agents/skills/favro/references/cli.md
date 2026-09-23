@@ -71,14 +71,30 @@ Prefer retargeting when the requirement remains valid. Archive only when its sub
 
 ```bash
 favro attach --card <id> --file docs/report.md
+favro attach --card <id> --file docs/report.md --replace          # revise a file under the same name
+favro attach --card <id> --file docs/report.md --name report.md --replace --replace-url <fileURL>  # ambiguous name
+favro detach --card <id> --name report.md                         # remove an attachment outright
+favro detach --card <id> --name report.md --url <fileURL>          # ambiguous name
 ```
 
 The CLI enforces Favro's 10 MiB attachment limit, infers common MIME types, percent-encodes filenames, and verifies the uploaded attachment.
 
+Plain `attach` only ever adds -- re-uploading a revised file under the same name
+leaves two attachments with identical names and no way to tell which is current.
+`--replace` uploads the new bytes first (the card is never without the file), then
+removes whichever pre-existing attachment(s) shared that filename, leaving exactly
+one. `detach` removes an attachment outright without uploading anything. Both
+identify the outgoing attachment by `fileURL`, not by name (names are not unique in
+Favro), and refuse -- without mutating the card -- when `--name` matches more than
+one attachment and `--replace-url`/`--url` doesn't pick one. This unlinks the file
+from the card; whether Favro's storage also deletes the underlying bytes is not
+established (see the favro-cli README's issue #2 note).
+
 Version 0.2.1 preserves uploaded files when `set-desc`, `set-notes`, `set-result`,
 or `set-todo` writes a description. It reads current attachment metadata, includes
 the files in the same Markdown update, then re-reads the card and fails loudly if
-any attachment name/count is missing. No local originals or re-upload are needed.
+any attachment name/count is missing beyond what a `--replace`/`detach` in the same
+command intentionally removed. No local originals or re-upload are needed.
 Malformed attachment metadata stops the write before mutation. Archive and
 move-board also verify attachments; move-board checks the destination before
 archiving the source instances. Whole-description writes are read/modify/write,

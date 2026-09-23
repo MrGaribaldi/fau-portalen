@@ -333,12 +333,56 @@ async fn build_template(conn: &mut PgConnection, name: &str) {
 
     apply_roles_and_migrations(&admin_url(), &building).await;
 
+    assert_migrations_are_current(&building).await;
+
     sqlx::query(&format!(
         r#"alter database "{building}" rename to "{name}""#
     ))
     .execute(&mut *conn)
     .await
     .expect("rename the completed template into place");
+}
+
+/// Defence in depth against `sqlx::migrate!`'s inability to notice a *new*
+/// migration file on stable Rust (see `persistence/build.rs`'s doc comment for the
+/// full mechanism): before a freshly built template is renamed into place, confirms
+/// the `fau` binary that just ran actually applied one row per `.sql` file present
+/// in `migrations/` right now. Without `build.rs` forcing a rebuild, a binary built
+/// before a migration file was added would compile as `Fresh`, run against the new
+/// template-build database, and apply only the migrations it was actually compiled
+/// with -- silently producing a template missing the newest migration's schema, and
+/// every test built from it would then fail downstream with a confusing "relation
+/// does not exist" instead of pointing at the real, stale-binary cause. This assert
+/// makes that impossible to miss: a stale template can never be renamed into place.
+async fn assert_migrations_are_current(db_name: &str) {
+    let url = with_database(&admin_url(), db_name);
+    let mut conn = PgConnection::connect(&url)
+        .await
+        .expect("connect to the freshly built template to verify its migrations");
+
+    let applied: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count applied migrations on the freshly built template");
+
+    let on_disk = std::fs::read_dir(migrations_dir())
+        .expect("read the migrations directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("sql"))
+        .count() as i64;
+
+    assert_eq!(
+        applied, on_disk,
+        "the fau binary's embedded migrations are stale: it applied {applied} \
+         migration(s) but {on_disk} *.sql file(s) exist in migrations/ right now. \
+         `sqlx::migrate!` embeds each file via `include_str!` at compile time and \
+         does not notice a newly added file on stable Rust, so a binary built before \
+         this file appeared silently keeps running the old, smaller migration set. \
+         Rebuild the fau binary (`cargo build -p fau-app`) and re-run -- \
+         persistence/build.rs's `cargo:rerun-if-changed` on migrations/ should force \
+         this automatically; if this assertion still fires, that mechanism itself is \
+         broken."
+    );
 }
 
 /// Opportunistically drops older `fau_test_tpl_*` databases (a previous content hash,

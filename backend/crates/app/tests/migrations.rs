@@ -19,8 +19,8 @@ async fn migrate_applies_and_is_idempotent() {
         .fetch_one(&db.admin_pool())
         .await
         .unwrap();
-    // Only 0001 exists after this task; Task 6 adds 0002 and bumps this to 2.
-    assert_eq!(version, 1, "contract version after all migrations");
+    // 0001 and 0002 both exist as of Task 6.
+    assert_eq!(version, 2, "contract version after all migrations");
 }
 
 #[tokio::test]
@@ -56,12 +56,12 @@ async fn concurrent_migrate_processes_serialise() {
     );
 
     // Exactly one row per migration proves neither applied the same file twice.
-    // Only 0001 exists after this task; Task 6 adds 0002 and bumps this to 2.
+    // 0001 and 0002 both exist as of Task 6.
     let rows: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
         .fetch_one(&db.admin_pool())
         .await
         .unwrap();
-    assert_eq!(rows, 1);
+    assert_eq!(rows, 2);
 }
 
 #[tokio::test]

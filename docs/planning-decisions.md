@@ -2283,3 +2283,16 @@ New decisions in the same session:
 - **The named leader is taken on trust** in the MVP.
 - **Migration 0003** brings forward minimal append-only `audit_events` and `outbox` tables, so
   activation does not wait for #3421.
+
+## #3416, #3413 and #3485 accepted — 23 September 2026
+
+- **#3416:** Erik accepted the backend skeleton and merged it to main via PR #1.
+- **#3413:** Erik approved docs/fau-creation-and-membership-flow.md as written.
+- **#3485:** Erik turned on delete protection for `lb-fau` in the Hetzner Console. The API
+  confirms it, and a read-only stage 1 plan shows only the expected
+  `delete_protection true -> false` drift. It must not be applied (#3497).
+
+All three cards are Done. Erik then authorised overnight work, with his review in the morning:
+- research the #3441 school register;
+- plan migration 0003 and the membership domain that does not depend on the register, and build it
+  test-first on a feature branch.

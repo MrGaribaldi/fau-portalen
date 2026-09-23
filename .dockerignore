@@ -19,3 +19,19 @@
 # Byggeinstruksjonene selv.
 !Dockerfile.agent
 !.dockerignore
+
+# Application image (Dockerfile at the repository root). The context is the project
+# root, which holds .env, so the exclude-everything rule above stays and only the
+# paths the build actually reads are added back -- not the whole of `backend`, so a
+# stray secret or build artifact anywhere under it cannot reach the daemon by
+# accident. .env, .env.*, docs/, infrastructure/ and .favro/ are never re-included,
+# so they stay excluded by the leading `*`.
+!backend
+backend/*
+!backend/Cargo.toml
+!backend/Cargo.lock
+!backend/rust-toolchain.toml
+!backend/crates
+!backend/migrations
+backend/**/.env*
+backend/**/target

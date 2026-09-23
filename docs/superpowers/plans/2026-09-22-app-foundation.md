@@ -33,7 +33,7 @@ reverse.
 
 | Open item | Decision | Reason |
 | --- | --- | --- |
-| Base image digests | `rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec`, `debian:bookworm-slim@sha256:f3034a6ec3c1205360777c4aae76234998866ad18806ae62b63a3f84ccad782b` | Resolved from the registry 22 September 2026. Rust 1.98.1 matches the toolchain already in the agent box, so local `cargo test` and the image build agree. |
+| Base image digests | `rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e`, `debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251` (multi-arch index digests; the amd64 manifests first written here, `c49256cb…` and `f3034a6e…`, are children of these indexes — changed 23 September 2026 so the image also builds on arm64) | Resolved from the registry 22 September 2026. Rust 1.98.1 matches the toolchain already in the agent box, so local `cargo test` and the image build agree. |
 | PostgreSQL patch version | `postgres:17.5-bookworm@sha256:2088c1744625793a8a89118d2dee63fb121139141ff0ff53bd72e63bb6089d0d` | Exactly the version infra-tools' `psql-cluster` module runs (`ghcr.io/cloudnative-pg/postgresql:17.5`). Matching the patch, not just the major, removes a class of "works locally" surprise. |
 | Static placeholder: binary or file | Embedded in the binary with `include_str!` | The runtime stage has a read-only root filesystem and readiness must not depend on the filesystem. One less failure mode, and #3422 replaces it wholesale anyway. |
 | `lock_timeout` value | 10 000 ms, overridable with `MIGRATION_LOCK_TIMEOUT_MS` | See "The advisory-lock nuance" below (corrected 23 September 2026). |

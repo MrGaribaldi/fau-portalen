@@ -8,17 +8,37 @@
 # fordi Favro-CLI-kilden i .agents/skills/favro/favro-cli bygges inn. .dockerignore
 # holder .env og resten av prosjektet utenfor byggekonteksten.
 #
-# Kontrollert i basisimaget 8. september 2026, derfor IKKE reinstallert her:
-#   terraform 1.16.1 (infra-tools krever >= 1.15.0), docker compose v5.5.1,
-#   node 22.23.2, npm 10.9.8, python 3.13.5, kubectl 1.37.0, git 2.47.3, ssh, ttyd.
-# Basisimaget mangler derimot C-kompilator/linker (ingen cc/gcc/make/pkg-config),
-# som Rust-bygg krever. Entrypoint /ep.sh og Claude-funksjonene beholdes uendret.
+# Verified in base image v1.4.2 on 8 September 2026, and therefore NOT reinstalled
+# here: terraform 1.16.1 (infra-tools requires >= 1.15.0), docker compose v5.5.1,
+# node 22.23.2, npm 10.9.8, python 3.13.5, kubectl 1.37.0, git 2.47.3, ssh, ttyd.
+# Those numbers have NOT been re-verified against v1.6.0 - do that in the first
+# session after the rebuild (see "After the rebuild" below). The base image lacks a
+# C compiler/linker (no cc/gcc/make/pkg-config), which Rust builds need. Entrypoint
+# /ep.sh and the Claude session machinery are kept unchanged.
 #
-# Observert lokal digest 8. september 2026:
-#   sha256:9c7d39007dfd4b219916caa8c34cb0d561bea6697db597d90739ae960c081d5b
-# Taggen beholdes i FROM slik at bygget også virker når verten henter imaget på
-# nytt fra GHCR; digesten står her som kontrollpunkt.
-FROM ghcr.io/akantodevs/agent-box:v1.4.2
+# Base bumped v1.4.2 -> v1.6.0 on 23 September 2026 for two reasons:
+#   1. Claude Code is installed unpinned in the base (`npm install -g
+#      @anthropic-ai/claude-code`) and that layer is cached, so rebuilding FAU's
+#      image alone never moves it. v1.6.0 was built 2026-09-22 17:13Z, after
+#      2.1.280 was published at 15:44Z, so it carries 2.1.280 - the version this
+#      rebuild was asked to deliver. The base tag is what pins Claude Code; bump it
+#      again to move that version, or add an explicit npm layer here if FAU ever
+#      needs a version the base does not carry.
+#   2. v1.6.0 adds the ALLOW_GIT_WRITE guard rail (scripts/git-guard.js) and the gh
+#      CLI, replacing v1.4.2's blanket "do not run git operations" rule. See
+#      docker-compose.yml and .claude/settings.json for how FAU sets that.
+#
+# Registry index digest for v1.6.0, read from GHCR 23 September 2026:
+#   sha256:767ecb2af87803c59584d6562c6f17f6c0d8dacdf677d5df9a0a8d67b68fa24b
+#   (built from agent-box revision c6b403bcffb43d640b6ddb16a8646345dc835039)
+# The tag is kept in FROM so the build also works when the host pulls the image
+# fresh from GHCR; the digest stands here as a checkpoint.
+#
+# After the rebuild, verify in a new session:
+#   claude --version          # expect 2.1.280 or newer
+#   favro --version           # expect favro-cli 0.2.2
+#   terraform version && kubectl version --client && node --version
+FROM ghcr.io/akantodevs/agent-box:v1.6.0
 
 # Basisimaget har ingen USER (kjører /ep.sh som root, som dropper til claude).
 USER root
@@ -138,8 +158,10 @@ RUN printf '%s\n' \
 # Bygges inn i /usr/local/bin, som ligger på PATH i både login-shell og
 # `docker compose exec`. Da er `favro` tilgjengelig med én gang og også etter at
 # containeren gjenopprettes; ~/.cargo/bin ville forsvunnet ved recreate.
-# --locked bruker Cargo.lock som ligger i skillen. Endres CLI-kilden uten ny
-# verts-rebuild, kan agenten bygge lokalt:
+# --locked uses the Cargo.lock that ships in the skill. Vendored source is
+# favro-cli 0.2.2 at upstream commit 4beaee2 (see .agents/skills/favro/UPSTREAM.md);
+# it adds `attach --replace` and `detach`. If the CLI source changes without a new
+# host rebuild, the agent can build locally:
 #   cargo install --path /workspace/.agents/skills/favro/favro-cli \
 #     --locked --root "$HOME/.local"
 # og legge $HOME/.local/bin først på PATH.

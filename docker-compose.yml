@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.agent
-    image: fau/agent-box:v1.4.2-fau
+    image: fau/agent-box:v1.6.0-fau
     init: true
     ports:
       - "127.0.0.1:8112:8090"
@@ -18,6 +18,19 @@ services:
       TTYD_PASSWORD: "${TTYD_PASSWORD:?Set local terminal password}"
       CLAUDE_MODEL: opus
       ALLOW_TERRAFORM_MODIFY: Ask
+      # Lets the agent commit in the working tree instead of leaving every change
+      # uncommitted. The base image's git-guard.js is binary: "Yes" permits every
+      # git and gh write, push included, and there is no value that means
+      # "commit but never reach GitHub". So the boundary the user asked for is
+      # drawn twice over, and neither half is this variable:
+      #   - no GH_TOKEN is set here and no SSH private key exists in the image or
+      #     the claude-data volume, so nothing can authenticate to
+      #     git@github.com:MrGaribaldi/fau-portalen.git;
+      #   - .claude/settings.json denies push, gh and remote changes outright, so
+      #     the block is a rule rather than a missing credential.
+      # Adding a GitHub credential to this container therefore silently widens
+      # what the agent may do - treat it as its own decision, not a config tweak.
+      ALLOW_GIT_WRITE: Yes
     # WireGuard mot privatnettet 10.0.0.0/14 fra steg 1. kubeconfig.yaml peker på
     # https://10.0.1.250:6443, som bare er nåbar gjennom tunnelen eller via
     # vpn-router som SSH-bastion. wireguard-tools ligger allerede i imaget;

@@ -33,8 +33,12 @@ and db services come later.
 ## Where the project stands (10 September 2026)
 
 Planning is largely reviewed; application implementation has not started. The workspace went under
-git on 10 September, one repo per ADR-001 (`git init` run by Erik on the host; the agent leaves
-changes in the working tree). `.gitignore` excludes `.env*` except `.env.example`, Terraform state
+git on 10 September, one repo per ADR-001 (`git init` run by Erik on the host). **From the
+23 September image rebuild the agent may commit locally** — `ALLOW_GIT_WRITE: Yes` in
+docker-compose.yml — but it has no path to GitHub: no `GH_TOKEN`, no SSH key, and
+`.claude/hooks/no-github-push.js` denies `git push`, `gh` and remote changes. Pushing to
+`git@github.com:MrGaribaldi/fau-portalen.git` stays Erik's, from the host. Adding a GitHub
+credential to this container is a decision, not a config tweak. `.gitignore` excludes `.env*` except `.env.example`, Terraform state
 and plans, and `favro-cli/target/` - but the favro-cli **source** is committed deliberately, because
 `Dockerfile.agent` builds the CLI from it. Details in docs/planning-decisions.md. Stages 0 and 1 are
 applied. Stage 0: Cloud SSH key `fau-admin` and the private hel1 buckets
@@ -227,14 +231,16 @@ rotation, not deletion.
 
 The skill covers commands; these facts cost a session to rediscover.
 
-- CLI is on PATH (`favro 0.2.1`), config at `/workspace/.favro/project.toml`, credentials in
+- CLI is on PATH, config at `/workspace/.favro/project.toml`, credentials in
   `/infra-runtime/infrastructure/favro.env`. Collection `FAU-plattform`, 12 role boards, one
-  emoji per role. Verify with `favro check`. 0.2.1 is baked into the image at
-  `/usr/local/bin/favro` as of the 9 September rebuild, so it survives container recreation and
-  the 0.2.0 attachment defect is gone. Source is vendored at `.agents/skills/favro/favro-cli`,
-  pinned to upstream commit `e0965df` — provenance, the no-hand-editing rule and the re-vendor
-  procedure are in `.agents/skills/favro/UPSTREAM.md`. `SKILL.md` and `references/` are upstream's
-  files too, so project-specific Favro facts belong in this file, not in them.
+  emoji per role. Verify with `favro check`. The binary is baked into the image at
+  `/usr/local/bin/favro`, so it survives container recreation — which also means **the vendored
+  source and the running binary can differ until the host rebuilds**. Vendored source is 0.2.2 at
+  upstream commit `4beaee2` (re-vendored 23 September 2026); the image built 9 September carries
+  0.2.1, so check `favro --version` before relying on anything newer. Provenance, the
+  no-hand-editing rule and the re-vendor procedure are in `.agents/skills/favro/UPSTREAM.md`.
+  `SKILL.md` and `references/` are upstream's files too, so project-specific Favro facts belong in
+  this file, not in them.
 - Card IDs: `get`, `comments`, `move`, `set-*` take the 24-hex **cardCommonId**, not `#3438`.
   `favro overview` prints both; it lists live cards only, and there is no archived listing.
 - **Agents post with the user's own token, so every comment is attributed to "Erik W.
@@ -265,8 +271,10 @@ The skill covers commands; these facts cost a session to rediscover.
 - **A card that asks for a decision must carry the evidence.** Erik reads Favro, not the repo, so
   citing `docs/…` gives him nothing to decide from — attach the document with `favro attach` and
   state the options, the recommendation and the consequence in the comment itself. Said on
-  #3485, 10 September 2026. There is no detach or replace: re-attaching an edited file adds a
-  second attachment, so finish the document before attaching it, and use `--name` with a date when
-  a newer version must supersede an older one.
+  #3485, 10 September 2026. Up to 0.2.1 there was no detach or replace, so re-attaching an edited
+  file added a second attachment; 0.2.2 adds `attach --replace` (uploads first, then unlinks the
+  old one) and `detach`, both needing `--replace-url`/`--url` when a name is ambiguous. Until the
+  rebuilt image is running, keep the old discipline: finish the document before attaching it, and
+  use `--name` with a date when a newer version must supersede an older one.
 - Never edit or delete the user's comments; record decisions they make on cards into
   docs/planning-decisions.md.

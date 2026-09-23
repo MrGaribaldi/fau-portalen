@@ -2246,3 +2246,40 @@ through the API, which ends in the same drift and adds a live change made from t
 because applying it silently removes the protection. When the variable exists, set
 `load_balancer_delete_protection = true` in `infrastructure/1-bootstrap`; stage 1 then plans
 clean again.
+
+## FAU creation and membership flow designed (#3413) — 23 September 2026
+
+The flow that creates an FAU and brings people into it was designed with Erik on 23 September and
+is written up in docs/fau-creation-and-membership-flow.md. The spec lists every decision. The ones
+that change or clarify earlier entries:
+
+- **ADR-003 decision 8, clarified.** In an FAU with no admin (no admin role valid and no handover
+  grant valid), the recovery contact's single power, initiating the addition of a member, may grant
+  an admin role. Outside that state it remains a plain member addition. All of decision 10's
+  notifications apply.
+- **Replacement proposals are in the MVP.** A member may propose a successor for their own role,
+  and an admin approves it, which issues a normal invitation. This supersedes the 7 September
+  "Confirmed simplifications" deferral for this one case. It shares one request model with the
+  access request below. Other member-initiated invitations, and substitute invitations, stay
+  deferred.
+- **Passkeys are not in the MVP**; passcode only. This settles the inconsistency between ADR-003's
+  "Closed" section and its decision 4a.
+- **The leader invitation is exempt from #3414's TOTP gate.** It is issued in the activation
+  transaction, because it completes the signup form rather than being a new admin action. Every
+  later invitation is gated.
+
+New decisions in the same session:
+- **School selection.** The school is picked from the register (#3441), with the "Mangler skolen
+  din?" fallback. The dependency on the register import is accepted.
+- **One FAU per school**, enforced, counting pending FAUs. A duplicate attempt is copied to Erik.
+  - If the existing FAU is active, the registrant is told to contact its admins, and the portal
+    relays a passcode-verified access request without revealing who they are.
+  - If it is pending, they are told it is being registered.
+  - An unverified pending FAU expires after 7 days.
+- **The first admin end date** is asked at signup. It defaults to the next 1 October at least three
+  months away, within a range of 1–24 months.
+- **A single admin is allowed**, with a banner while there is only one.
+- **Invitations** are valid for 14 days, and opening a link never accepts it.
+- **The named leader is taken on trust** in the MVP.
+- **Migration 0003** brings forward minimal append-only `audit_events` and `outbox` tables, so
+  activation does not wait for #3421.

@@ -97,23 +97,10 @@ pub enum MigrateError {
 }
 
 fn sql_error(e: sqlx::Error) -> MigrateError {
-    MigrateError::Sql(sql_error_kind(&e))
-}
-
-/// A diagnosable but safe description of a `sqlx::Error`: the SQLSTATE when the
-/// database gave one, otherwise a fixed word for the kind of failure. Never the
-/// error's own `Display`, which can quote the failing statement or a bound value.
-fn sql_error_kind(e: &sqlx::Error) -> String {
-    match e {
-        sqlx::Error::Database(db_err) => match db_err.code() {
-            Some(code) => format!("sqlstate {code}"),
-            None => "database error".to_owned(),
-        },
-        sqlx::Error::Io(_) => "io error".to_owned(),
-        sqlx::Error::PoolTimedOut => "pool timed out".to_owned(),
-        sqlx::Error::PoolClosed => "pool closed".to_owned(),
-        _ => "query failed".to_owned(),
-    }
+    // `pool::safe_error_kind` is the one place that decides what is safe to print
+    // about a `sqlx::Error` -- shared with the schema-contract startup gate
+    // (`contract.rs`, `fau-app`'s `main.rs`) rather than duplicated here.
+    MigrateError::Sql(pool::safe_error_kind(&e))
 }
 
 fn map_migrate_error(e: sqlx::migrate::MigrateError) -> MigrateError {

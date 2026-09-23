@@ -6,6 +6,9 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+mod common;
+use common::TestDb;
+
 const SERVE_ENV: &[(&str, &str)] = &[
     ("APP_ENV", "test"),
     ("HTTP_BIND", "127.0.0.1:0"),
@@ -229,8 +232,8 @@ fn migrate_without_its_own_variable_names_it() {
     assert!(combined(&out).contains("MIGRATION_DATABASE_URL"));
 }
 
-#[test]
-fn http_bind_and_log_level_have_defaults() {
+#[tokio::test]
+async fn http_bind_and_log_level_have_defaults() {
     // Ruling 7: now that `serve` actually binds and runs, "the defaults were
     // accepted" is best shown by the process still running past configuration
     // (rather than exiting on a rejected variable), and by the startup banner
@@ -238,13 +241,25 @@ fn http_bind_and_log_level_have_defaults() {
     // which only ever proved these two variable *names* were absent from a
     // `todo!()` panic's output.
     //
+    // DATABASE_URL points at a real, migrated database rather than SERVE_ENV's
+    // deliberately-unreachable sentinel: Task 7's schema-contract gate runs before
+    // `serve` ever reaches `TcpListener::bind`, and against an unreachable address
+    // it can retry for close to its full 5s bound (sqlx retries a failed `Io`
+    // connection internally) -- comfortably longer than this test's 500ms window.
+    // Against a real, reachable, migrated database the check resolves almost
+    // immediately, so `serve` actually reaches the bind attempt within that window
+    // and the AddrInUse branch below stays meaningful.
+    //
     // With `HTTP_BIND` absent this binds the real `0.0.0.0:8000` (the documented
     // default), which this environment does not otherwise use -- but a shared CI
     // host might. If the bind itself fails with "address in use", that is an
     // environment conflict, not a rejected default, so it is reported and skipped
     // rather than failed.
-    let mut env = serve_env_without("HTTP_BIND");
-    env.retain(|(k, _)| *k != "LOG_LEVEL");
+    let db = TestDb::migrated().await;
+    let database_url = db.url();
+    let mut env: Vec<(&str, &str)> = serve_env_without("HTTP_BIND");
+    env.retain(|(k, _)| *k != "LOG_LEVEL" && *k != "DATABASE_URL");
+    env.push(("DATABASE_URL", database_url.as_str()));
     let run = run_briefly(&env, "serve", Duration::from_millis(500));
     let text = combined(&run.output);
 

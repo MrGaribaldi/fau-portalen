@@ -99,12 +99,33 @@ async fn migrate_fails_rather_than_hanging_when_the_lock_is_held() {
 async fn serve_performs_no_ddl() {
     // Spec section 3. The runtime role has no DDL rights (Task 5), so this is
     // belt and braces: an empty database must stay empty when serve is started.
+    //
+    // Task 7's schema-contract gate means serve now refuses an unmigrated database
+    // outright -- the missing `schema_contract` table (SQLSTATE 42P01) is treated as
+    // contract version 0, below the minimum -- rather than binding and answering
+    // /health/live, so this proves "no DDL" via the process's exit instead of by
+    // sending it SIGTERM.
     let db = TestDb::fresh().await;
     common::apply_roles(&db).await;
 
-    let app = common::spawn_serve(&db).await; // waits for /health/live
-    app.send_sigterm().await;
-    app.wait().await;
+    let out = common::run_fau_serve_until_exit(&db).await;
+    assert!(
+        !out.status.success(),
+        "serve must refuse an unmigrated database"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The refusal text itself, not just the shared "schema contract" substring the
+    // unreachable-database warning also carries: the missing table is folded into
+    // contract version 0.
+    assert!(
+        stderr.contains("version 0"),
+        "expected the schema-contract refusal message, got: {stderr}"
+    );
+    let dsn = db.url();
+    assert!(
+        !stderr.contains(&dsn),
+        "DSN (with password) leaked: {stderr}"
+    );
 
     let tables: i64 = sqlx::query_scalar(
         "select count(*) from information_schema.tables where table_schema = 'public'",

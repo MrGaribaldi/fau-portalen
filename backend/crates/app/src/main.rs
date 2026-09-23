@@ -2,6 +2,7 @@
 //! deploy -- which is what makes ADR-001's release barrier meaningful.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -79,6 +80,12 @@ enum StartupError {
     Migrate(#[from] fau_persistence::MigrateError),
     #[error("database pool configuration error: {0}")]
     Pool(fau_persistence::ConnectErrorKind),
+    #[error(
+        "schema contract: database is at version {found}, this binary requires at least {minimum}"
+    )]
+    SchemaContractBelowMinimum { found: i32, minimum: i32 },
+    #[error("schema contract: could not verify it at startup ({kind})")]
+    SchemaContractCheckFailed { kind: String },
     #[error("failed to bind {addr}: {kind:?}")]
     Bind {
         addr: std::net::SocketAddr,
@@ -97,12 +104,65 @@ fn serve() -> Result<(), StartupError> {
     rt.block_on(run_server(config))
 }
 
+/// Bounds the startup schema-contract query (ruling 6) so a black-holed database
+/// cannot delay startup indefinitely -- distinct from, and much tighter than, any
+/// bound the pool itself applies once it is in regular use.
+const SCHEMA_CONTRACT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the startup schema-contract check found.
+enum ContractCheck {
+    /// The query completed and reported this version.
+    Version(i32),
+    /// The query did not complete, but the failure is plausibly transient --
+    /// `fau_persistence::is_retryable` -- or this check's own bound elapsed. Design
+    /// section 4: a merely unreachable database is not a contract failure, so this
+    /// is not a refusal. Carries a safe, fixed description of what happened (never
+    /// the sqlx `Display`) for the warning message.
+    Retry(String),
+    /// The query failed with something a retry will not fix (e.g. a privilege
+    /// problem, or an unexpected decode failure). Carries the same kind of safe
+    /// description as `Retry`, for the refusal message.
+    Refuse(String),
+}
+
+/// A fixed description for the check's own bound elapsing -- never constructed from
+/// any value the database or the caller supplied, so it is as safe to print as
+/// `fau_persistence::safe_error_kind`'s fixed words.
+const CONTRACT_CHECK_TIMED_OUT: &str = "timed out waiting for a response";
+
+/// Runs the startup schema-contract check under [`SCHEMA_CONTRACT_CHECK_TIMEOUT`]. A
+/// missing `schema_contract` table (SQLSTATE 42P01) means an unmigrated database and
+/// is reported as version 0 -- below any real minimum, so it takes the same refusal
+/// path as an explicit low version, per ruling 2. Any other failure is classified by
+/// `fau_persistence::is_retryable` into [`ContractCheck::Retry`] (the caller warns
+/// and lets `serve` continue) or [`ContractCheck::Refuse`] (the caller exits
+/// non-zero) -- see that function's doc comment for the exact SQLSTATE list. Reuses
+/// `fau_persistence::safe_error_kind` for the message in both cases rather than a
+/// second classification here.
+async fn check_schema_contract(pool: &sqlx::PgPool) -> ContractCheck {
+    match tokio::time::timeout(
+        SCHEMA_CONTRACT_CHECK_TIMEOUT,
+        fau_persistence::read_contract_version(pool),
+    )
+    .await
+    {
+        Ok(Ok(version)) => ContractCheck::Version(version),
+        Ok(Err(e)) if fau_persistence::is_undefined_table(&e) => ContractCheck::Version(0),
+        Ok(Err(e)) if fau_persistence::is_retryable(&e) => {
+            ContractCheck::Retry(fau_persistence::safe_error_kind(&e))
+        }
+        Ok(Err(e)) => ContractCheck::Refuse(fau_persistence::safe_error_kind(&e)),
+        Err(_elapsed) => ContractCheck::Retry(CONTRACT_CHECK_TIMED_OUT.to_owned()),
+    }
+}
+
 async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
     // Lazy: an unreachable database must not be a startup failure (design section
-    // 4). Nothing in this task uses the pool yet -- Task 9's readiness check is the
-    // first caller -- but it is built here, up front, so startup order does not
-    // change when that lands.
-    let _pool =
+    // 4). `connect_lazy_with` never dials the database itself, so building the pool
+    // here cannot fail on connectivity -- only the schema-contract check just below,
+    // which is bounded and treats a connection failure as "unreachable", not a
+    // startup error.
+    let pool =
         fau_persistence::lazy_pool(config.database_url.expose(), config.db_pool_max_connections)
             .map_err(StartupError::Pool)?;
 
@@ -116,13 +176,42 @@ async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
     // what it decided to do, without ever printing a secret. `database_url` is
     // deliberately absent: it is the one field here that carries a password. Reads
     // `state.version` rather than `SERVICE_VERSION` directly so the field on
-    // `AppState` has a real use beyond being stored.
+    // `AppState` has a real use beyond being stored. Printed before the
+    // schema-contract check below, which does real network I/O and must not delay
+    // this line -- an operator watching startup should see it got past
+    // configuration immediately, whatever the gate decides next.
     eprintln!(
         "fau: starting {} ({:?} env) on {}, public base {}, log level {}",
         state.version, config.app_env, config.http_bind, config.public_base_url, config.log_level,
     );
     for (name, _value) in &config.accepted_but_unused {
         eprintln!("fau: accepted but not yet used: {name}");
+    }
+
+    // The gate runs once, here, right after the pool is built (design section 5),
+    // before the router is built or anything is bound. It never performs DDL and
+    // never repeats the DSN in any message it produces.
+    match check_schema_contract(&pool).await {
+        ContractCheck::Version(found) if !fau_domain::is_compatible(found) => {
+            return Err(StartupError::SchemaContractBelowMinimum {
+                found,
+                minimum: fau_domain::MINIMUM_CONTRACT_VERSION,
+            });
+        }
+        ContractCheck::Version(_) => {}
+        ContractCheck::Retry(kind) => {
+            // Plain stderr until Task 10's JSON logging (ruling 5). Readiness
+            // staying false for a retryable failure is Task 9's job; for now this
+            // only ensures `serve` does not exit. `kind` is a fixed, safe
+            // description (never the sqlx `Display`, never a DSN).
+            eprintln!(
+                "fau: warning: could not verify the schema contract at startup \
+                 ({kind}); continuing, readiness will retry"
+            );
+        }
+        ContractCheck::Refuse(kind) => {
+            return Err(StartupError::SchemaContractCheckFailed { kind });
+        }
     }
 
     let router = http::router(state);

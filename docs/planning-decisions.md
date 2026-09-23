@@ -2219,3 +2219,30 @@ uploaded with `readyToUse=true` on both the local and the S3 copy, and stages 0 
 namespace, its ClusterIssuers, the empty Cloudflare token secret and the staging issuer - which is
 #3485's pending work sitting in the uncommitted 2-cluster source, not rotation drift. "Rerun
 everything" would have deployed cert-manager as a side effect. It remains unapplied.
+
+## Delete protection on lb-fau: turned on by hand, fixed upstream later — 23 September 2026
+
+`lb-fau` is the public entrypoint since the ingress-nginx pass: `fau-lab.bim.graphics` points at
+its addresses, and the Hetzner CCM now manages its services. Deleting it would lose those addresses.
+Deletion could come by hand, from a destroy of the wrong root, or from the CCM if the ingress
+Service is removed. Hetzner's delete protection guards against that. It was the one open item on
+#3485.
+
+The upstream `bootstrap/network` module creates the load balancer without `delete_protection` and
+has no variable for it. With hcloud provider 1.66.0 an unset value means `false`, so protection
+enabled outside Terraform becomes permanent stage 1 drift.
+
+**Decided by Erik:**
+- He enables delete protection on `lb-fau` in the Hetzner Console now.
+- The agent writes an upstream enhancement asking for a `load_balancer_delete_protection` variable:
+  docs/infra-tools-lb-delete-protection-issue.md.
+
+The alternatives were: wait for upstream with no protection meanwhile; or have the agent set it
+through the API, which ends in the same drift and adds a live change made from the container.
+
+**Consequence until upstream lands:** stage 1's plan shows one expected in-place change,
+`delete_protection: true -> false` on `module.bootstrap_network.hcloud_load_balancer.nginx[0]`.
+**Never apply that change.** Any stage 1 apply before the variable exists must be checked for it,
+because applying it silently removes the protection. When the variable exists, set
+`load_balancer_delete_protection = true` in `infrastructure/1-bootstrap`; stage 1 then plans
+clean again.

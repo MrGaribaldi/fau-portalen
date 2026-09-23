@@ -60,8 +60,11 @@ provider is now declared in FAU's root (token from `persistent_outputs`, not ups
 its default certificate. cert-manager is next and no longer waits for #3434: the placeholder
 `fau-lab.bim.graphics` resolves to the load balancer, `certificate_email` is
 `kontakt@ewb-solutions.as`, the empty Cloudflare token is accepted as harmless clutter, and a
-`letsencrypt-staging` ClusterIssuer is proposed before production ACME sees a placeholder. All
-stages plan clean with no drift. Two hygiene findings from inspecting the applied cluster are on
+`letsencrypt-staging` ClusterIssuer is proposed before production ACME sees a placeholder. Stages
+plan clean except one deliberate drift: `lb-fau` has delete protection turned on by hand (23
+September 2026) because the upstream module has no variable for it, so **stage 1 proposes
+`delete_protection: true -> false` on `module.bootstrap_network.hcloud_load_balancer.nginx[0]` —
+never apply that change**; the upstream fix is #3497. Two hygiene findings from inspecting the applied cluster are on
 #3488 (docs/cluster-hygiene-findings-2026-09-10.md): off-node etcd snapshot retention behaves as ~5
 hours rather than the configured 168, while local retention honours it; and there are **two default
 StorageClasses** — `hcloud-volumes` from the CSI install and k3s's `local-path` — so every PVC and
@@ -236,8 +239,8 @@ The skill covers commands; these facts cost a session to rediscover.
   emoji per role. Verify with `favro check`. The binary is baked into the image at
   `/usr/local/bin/favro`, so it survives container recreation — which also means **the vendored
   source and the running binary can differ until the host rebuilds**. Vendored source is 0.2.2 at
-  upstream commit `4beaee2` (re-vendored 23 September 2026); the image built 9 September carries
-  0.2.1, so check `favro --version` before relying on anything newer. Provenance, the
+  upstream commit `4beaee2` (re-vendored 23 September 2026); the rebuilt image carries the same
+  0.2.2 (checked 23 September 2026); still check `favro --version` after any future re-vendor. Provenance, the
   no-hand-editing rule and the re-vendor procedure are in `.agents/skills/favro/UPSTREAM.md`.
   `SKILL.md` and `references/` are upstream's files too, so project-specific Favro facts belong in
   this file, not in them.
@@ -273,8 +276,8 @@ The skill covers commands; these facts cost a session to rediscover.
   state the options, the recommendation and the consequence in the comment itself. Said on
   #3485, 10 September 2026. Up to 0.2.1 there was no detach or replace, so re-attaching an edited
   file added a second attachment; 0.2.2 adds `attach --replace` (uploads first, then unlinks the
-  old one) and `detach`, both needing `--replace-url`/`--url` when a name is ambiguous. Until the
-  rebuilt image is running, keep the old discipline: finish the document before attaching it, and
-  use `--name` with a date when a newer version must supersede an older one.
+  old one) and `detach`, both needing `--replace-url`/`--url` when a name is ambiguous. The running
+  binary is 0.2.2, so revise with `attach --replace`. There is still no command to remove a
+  card dependency; that takes Favro's UI.
 - Never edit or delete the user's comments; record decisions they make on cards into
   docs/planning-decisions.md.

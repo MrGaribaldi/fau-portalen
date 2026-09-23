@@ -30,3 +30,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Test-only HTTP client for the integration-test harness (`ServeHandle`). rustls,
+# no default features: no reliance on the platform's native TLS stack, matching the
+# app's own `sqlx` TLS backend.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# Test-only: sends SIGTERM to a spawned `fau serve` child, the same signal a
+# container runtime sends on shutdown (design section 12).
+nix = { version = "0.31", features = ["signal"] }
+# Extra tokio feature for the harness's stdout/stderr line capture
+# (`AsyncBufReadExt`), on top of the workspace's shared feature set.
+tokio = { workspace = true, features = ["io-util"] }

@@ -6,6 +6,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 mod config;
+mod http;
+mod readiness;
 
 use config::{MigrateConfig, ServeConfig};
 
@@ -75,11 +77,93 @@ enum StartupError {
     Config(#[from] config::ConfigError),
     #[error("{0}")]
     Migrate(#[from] fau_persistence::MigrateError),
+    #[error("database pool configuration error: {0}")]
+    Pool(fau_persistence::ConnectErrorKind),
+    #[error("failed to bind {addr}: {kind:?}")]
+    Bind {
+        addr: std::net::SocketAddr,
+        kind: std::io::ErrorKind,
+    },
+    #[error("http server error: {0:?}")]
+    Serve(std::io::ErrorKind),
 }
 
 fn serve() -> Result<(), StartupError> {
-    let _config = ServeConfig::from_env()?;
-    todo!("serve")
+    let config = ServeConfig::from_env()?;
+
+    // A synchronous top-level `main` (see `migrate`'s comment above) keeps
+    // `--version` free of a runtime; `serve` builds its own here instead.
+    let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for `serve`");
+    rt.block_on(run_server(config))
+}
+
+async fn run_server(config: ServeConfig) -> Result<(), StartupError> {
+    // Lazy: an unreachable database must not be a startup failure (design section
+    // 4). Nothing in this task uses the pool yet -- Task 9's readiness check is the
+    // first caller -- but it is built here, up front, so startup order does not
+    // change when that lands.
+    let _pool =
+        fau_persistence::lazy_pool(config.database_url.expose(), config.db_pool_max_connections)
+            .map_err(StartupError::Pool)?;
+
+    let state = http::AppState {
+        readiness: readiness::ReadinessState::new(),
+        version: SERVICE_VERSION,
+    };
+
+    // A plain startup line, not the JSON logging Task 10 adds -- just enough that
+    // an operator watching a fresh container can see it got past configuration and
+    // what it decided to do, without ever printing a secret. `database_url` is
+    // deliberately absent: it is the one field here that carries a password. Reads
+    // `state.version` rather than `SERVICE_VERSION` directly so the field on
+    // `AppState` has a real use beyond being stored.
+    eprintln!(
+        "fau: starting {} ({:?} env) on {}, public base {}, log level {}",
+        state.version, config.app_env, config.http_bind, config.public_base_url, config.log_level,
+    );
+    for (name, _value) in &config.accepted_but_unused {
+        eprintln!("fau: accepted but not yet used: {name}");
+    }
+
+    let router = http::router(state);
+
+    let listener = tokio::net::TcpListener::bind(config.http_bind)
+        .await
+        .map_err(|e| StartupError::Bind {
+            addr: config.http_bind,
+            kind: e.kind(),
+        })?;
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| StartupError::Serve(e.kind()))?;
+
+    Ok(())
+}
+
+/// Minimal shutdown trigger, just enough for a test to end the process: ctrl-c or
+/// SIGTERM. The 25-second in-flight budget, setting readiness false first and
+/// structured shutdown logging are Task 11's work -- this only makes `serve` exit
+/// instead of running forever.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install a SIGTERM handler");
+        sig.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
 }
 
 fn migrate() -> Result<(), StartupError> {

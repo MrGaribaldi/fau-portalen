@@ -17,8 +17,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use sqlx::{Connection, PgConnection, PgPool};
+use tokio::io::AsyncBufReadExt;
+use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 /// The database the harness talks to before any per-test database exists: superuser,
@@ -221,6 +225,71 @@ impl TestDb {
         PgPool::connect(&self.url())
             .await
             .expect("connect as fau_app")
+    }
+
+    /// Simulates a database outage for readiness tests (Task 9): sets the
+    /// connection limit to zero, revokes `connect` from the runtime role and from
+    /// `public`, then terminates every other backend already connected to this
+    /// database. Superuser admin connections (used by [`TestDb::admin_pool`] and by
+    /// this method itself) are unaffected -- PostgreSQL exempts superusers from both
+    /// the connection limit and `connect` privilege checks.
+    pub async fn sever_connections(&self) {
+        let pool = self.admin_pool();
+        sqlx::query(&format!(
+            r#"alter database "{}" connection limit 0"#,
+            self.name
+        ))
+        .execute(&pool)
+        .await
+        .expect("set connection limit to 0");
+        sqlx::query(&format!(
+            r#"revoke connect on database "{}" from fau_app"#,
+            self.name
+        ))
+        .execute(&pool)
+        .await
+        .expect("revoke connect from fau_app");
+        sqlx::query(&format!(
+            r#"revoke connect on database "{}" from public"#,
+            self.name
+        ))
+        .execute(&pool)
+        .await
+        .expect("revoke connect from public");
+        sqlx::query(
+            "select pg_terminate_backend(pid) from pg_stat_activity \
+             where datname = $1 and pid <> pg_backend_pid()",
+        )
+        .bind(&self.name)
+        .execute(&pool)
+        .await
+        .expect("terminate other backends on this database");
+    }
+
+    /// Reverses [`TestDb::sever_connections`].
+    pub async fn restore_connections(&self) {
+        let pool = self.admin_pool();
+        sqlx::query(&format!(
+            r#"alter database "{}" connection limit -1"#,
+            self.name
+        ))
+        .execute(&pool)
+        .await
+        .expect("restore connection limit");
+        sqlx::query(&format!(
+            r#"grant connect on database "{}" to fau_app"#,
+            self.name
+        ))
+        .execute(&pool)
+        .await
+        .expect("restore connect for fau_app");
+        sqlx::query(&format!(
+            r#"grant connect on database "{}" to public"#,
+            self.name
+        ))
+        .execute(&pool)
+        .await
+        .expect("restore connect for public");
     }
 }
 
@@ -538,28 +607,293 @@ pub async fn run_fau_migrate_with(db: &TestDb, extra_env: &[(&str, &str)]) -> st
     cmd.output().await.expect("run fau migrate")
 }
 
-/// Runs `fau serve` against `db`'s `fau_app` URL and waits for it to exit, bounded by
-/// a timeout. `serve` currently ends in `todo!()` right after loading its
-/// configuration, so this observes a failure today either way -- the point of the
-/// test that uses it is only that no schema object appears, not the exit code.
-pub async fn start_serve_expecting_failure(db: &TestDb) -> std::process::Output {
-    let database_url = db.url();
-    let mut cmd = fau_command(
-        "serve",
-        &[
-            ("APP_ENV", "test"),
-            ("HTTP_BIND", "127.0.0.1:0"),
-            ("PUBLIC_BASE_URL", "http://localhost:8000"),
-            ("DATABASE_URL", database_url.as_str()),
-            ("DB_POOL_MAX_CONNECTIONS", "5"),
-            ("LOG_LEVEL", "info"),
-        ],
-    );
-    // The `output()` future is wrapped in a timeout below and may be dropped before
-    // the child exits; without this, dropping it would orphan the process instead
-    // of killing it.
+/// Binds a fresh, unused TCP port: bind to `127.0.0.1:0`, read back the port the
+/// kernel picked, then drop the listener. `HTTP_BIND=127.0.0.1:0` is not usable
+/// directly for a test that needs to know the port up front (the bound address is
+/// not observable after `serve` binds it), so the harness picks the port itself
+/// instead.
+fn free_port() -> u16 {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for fau serve");
+    listener
+        .local_addr()
+        .expect("read the ephemeral port back")
+        .port()
+}
+
+/// The default environment `spawn_serve` starts `fau serve` with, keyed on `db` and
+/// a pre-chosen port. Ruling 5: `APP_ENV=development`, `DATABASE_URL` for the
+/// runtime role `fau_app`, `PUBLIC_BASE_URL` pointed at the chosen port.
+fn default_serve_env(db: &TestDb, port: u16) -> Vec<(&'static str, String)> {
+    vec![
+        ("APP_ENV", "development".to_owned()),
+        ("HTTP_BIND", format!("127.0.0.1:{port}")),
+        ("PUBLIC_BASE_URL", format!("http://localhost:{port}")),
+        ("DATABASE_URL", db.url()),
+        ("DB_POOL_MAX_CONNECTIONS", "5".to_owned()),
+        ("LOG_LEVEL", "info".to_owned()),
+    ]
+}
+
+/// Polls `make_request` until it returns a response satisfying `predicate`, or
+/// `timeout` elapses. A failed request (e.g. connection refused while the server is
+/// still starting) counts as "not yet", not as an error, so this can be used from
+/// the moment a process is spawned.
+pub async fn poll_until<F, Fut>(
+    mut make_request: F,
+    predicate: impl Fn(&reqwest::Response) -> bool,
+    timeout: Duration,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(response) = make_request().await {
+            if predicate(&response) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Reads `reader` line by line, appending each line to `sink`, until the pipe
+/// closes (the child exited). Spawned rather than awaited -- [`ServeHandle`] must
+/// be usable while its child is still running -- but the returned [`JoinHandle`]
+/// is what lets [`ServeHandle::wait`] prove the capture has actually reached EOF
+/// rather than merely read whatever happened to arrive before `child.wait()`
+/// returned.
+fn spawn_line_capture(
+    reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    sink: Arc<StdMutex<Vec<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            sink.lock().expect("captured-output lock").push(line);
+        }
+    })
+}
+
+/// A running `fau serve` process, bound to an ephemeral port and pointed at a
+/// [`TestDb`]. Kills the child on drop (`kill_on_drop`), so a panicking test never
+/// leaves a `fau` process behind.
+pub struct ServeHandle {
+    port: u16,
+    client: reqwest::Client,
+    child: TokioMutex<tokio::process::Child>,
+    stdout_lines: Arc<StdMutex<Vec<String>>>,
+    stderr_lines: Arc<StdMutex<Vec<String>>>,
+    /// The two [`spawn_line_capture`] tasks, taken and joined exactly once by
+    /// [`ServeHandle::wait`] -- see that method's doc comment for why this matters.
+    stdout_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    stderr_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl ServeHandle {
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// A bare `GET` against this server.
+    pub async fn get(&self, path: &str) -> reqwest::Response {
+        self.client
+            .get(self.url(path))
+            .send()
+            .await
+            .expect("request to fau serve")
+    }
+
+    /// A `GET` with extra request headers.
+    pub async fn get_with_headers(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut req = self.client.get(self.url(path));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.send().await.expect("request to fau serve")
+    }
+
+    /// A `GET` as a bare, un-awaited future -- for [`poll_until`], which needs to
+    /// issue a fresh request on every iteration.
+    pub fn get_async(
+        &self,
+        path: &str,
+    ) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + '_ {
+        self.client.get(self.url(path)).send()
+    }
+
+    /// Whether the child process is still running.
+    pub async fn is_running(&self) -> bool {
+        let mut child = self.child.lock().await;
+        matches!(child.try_wait(), Ok(None))
+    }
+
+    /// Sends `SIGTERM` to the child, the same signal a container runtime sends on
+    /// shutdown (design section 12).
+    pub async fn send_sigterm(&self) {
+        let child = self.child.lock().await;
+        let pid = child.id().expect("child has not already been waited on");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .expect("send SIGTERM to fau serve");
+    }
+
+    /// Waits for the child to exit and returns its status. Also joins both
+    /// stdout/stderr capture tasks before returning: they end at EOF, which the
+    /// pipes only reach once the child (the write end) has actually exited, so by
+    /// the time this returns, [`ServeHandle::captured_stdout`] and
+    /// [`ServeHandle::captured_stderr`] are guaranteed complete -- not racing
+    /// whatever had been read so far, which is what Task 10 and 11's logging tests
+    /// depend on.
+    pub async fn wait(&self) -> std::process::ExitStatus {
+        let status = {
+            let mut child = self.child.lock().await;
+            child.wait().await.expect("wait for fau serve to exit")
+        };
+
+        // The lock is taken, `take()`n and dropped in the `let` itself -- never held
+        // across the `.await` below, which a `std::sync::MutexGuard` cannot survive
+        // in an async fn without making the whole future non-`Send`.
+        let stdout_task = self.stdout_task.lock().expect("stdout-task lock").take();
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
+        let stderr_task = self.stderr_task.lock().expect("stderr-task lock").take();
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+
+        status
+    }
+
+    /// Every stdout line captured so far, in order. Later logging tests (Task 10)
+    /// read this rather than re-spawning the process.
+    pub fn captured_stdout(&self) -> Vec<String> {
+        self.stdout_lines
+            .lock()
+            .expect("captured-stdout lock")
+            .clone()
+    }
+
+    /// As [`ServeHandle::captured_stdout`], for stderr.
+    pub fn captured_stderr(&self) -> Vec<String> {
+        self.stderr_lines
+            .lock()
+            .expect("captured-stderr lock")
+            .clone()
+    }
+}
+
+/// Starts `fau serve` against `db` with the default environment (ruling 5) and
+/// waits for `/health/live` to answer, bounded to about ten seconds.
+pub async fn spawn_serve(db: &TestDb) -> ServeHandle {
+    spawn_serve_with_env(db, &[]).await
+}
+
+/// As [`spawn_serve`], with `extra_env` layered on top of the defaults -- a later
+/// duplicate key overrides the default, matching `std::process::Command::env`'s
+/// last-one-wins behaviour.
+pub async fn spawn_serve_with_env(db: &TestDb, extra_env: &[(&str, &str)]) -> ServeHandle {
+    let port = free_port();
+    let default_env = default_serve_env(db, port);
+    let mut env: Vec<(&str, &str)> = default_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    env.extend_from_slice(extra_env);
+
+    let mut cmd = fau_command("serve", &env);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
-    tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+
+    let mut child = cmd.spawn().expect("spawn fau serve");
+    let stdout = child.stdout.take().expect("fau serve stdout is piped");
+    let stderr = child.stderr.take().expect("fau serve stderr is piped");
+
+    let stdout_lines = Arc::new(StdMutex::new(Vec::new()));
+    let stderr_lines = Arc::new(StdMutex::new(Vec::new()));
+    let stdout_task = spawn_line_capture(stdout, stdout_lines.clone());
+    let stderr_task = spawn_line_capture(stderr, stderr_lines.clone());
+
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("build reqwest client");
+
+    let handle = ServeHandle {
+        port,
+        client,
+        child: TokioMutex::new(child),
+        stdout_lines,
+        stderr_lines,
+        stdout_task: StdMutex::new(Some(stdout_task)),
+        stderr_task: StdMutex::new(Some(stderr_task)),
+    };
+
+    wait_for_live(&handle, Duration::from_secs(10)).await;
+
+    handle
+}
+
+/// Waits for `/health/live` to answer, bounded by `timeout`. Checks
+/// [`ServeHandle::is_running`] on every iteration and once more immediately after a
+/// successful response, panicking with the captured stderr rather than either
+/// stalling for the full timeout or -- the more dangerous failure -- silently
+/// accepting a `200` from some *other* process that happens to already be listening
+/// on the same ephemeral port (a real risk: the port is chosen by binding, reading
+/// it back and dropping the listener, which leaves a window for a raced bind by
+/// another concurrently-starting `fau serve`).
+async fn wait_for_live(handle: &ServeHandle, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !handle.is_running().await {
+            panic!(
+                "fau serve exited before answering /health/live; captured stderr:\n{}",
+                handle.captured_stderr().join("\n")
+            );
+        }
+        if let Ok(res) = handle.get_async("/health/live").await {
+            if res.status().is_success() {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "fau serve did not answer /health/live within {timeout:?}; captured stderr:\n{}",
+                handle.captured_stderr().join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if !handle.is_running().await {
+        panic!(
+            "fau serve exited immediately after answering /health/live; captured stderr:\n{}",
+            handle.captured_stderr().join("\n")
+        );
+    }
+}
+
+/// Runs `fau serve` against `db` and waits for it to exit on its own, bounded by a
+/// timeout that also kills the process if it does not (`kill_on_drop`, same
+/// mechanism as [`run_fau_migrate`]). For a scenario where `serve` is expected to
+/// refuse to start (e.g. a schema contract below its minimum) rather than bind and
+/// run -- unlike [`spawn_serve`], this never waits for `/health/live`.
+pub async fn run_fau_serve_until_exit(db: &TestDb) -> std::process::Output {
+    let port = free_port();
+    let default_env = default_serve_env(db, port);
+    let env: Vec<(&str, &str)> = default_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut cmd = fau_command("serve", &env);
+    cmd.kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(10), cmd.output())
         .await
         .expect("fau serve did not exit within the timeout")
         .expect("run fau serve")

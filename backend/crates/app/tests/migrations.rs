@@ -101,7 +101,10 @@ async fn serve_performs_no_ddl() {
     // belt and braces: an empty database must stay empty when serve is started.
     let db = TestDb::fresh().await;
     common::apply_roles(&db).await;
-    let _ = common::start_serve_expecting_failure(&db).await;
+
+    let app = common::spawn_serve(&db).await; // waits for /health/live
+    app.send_sigterm().await;
+    app.wait().await;
 
     let tables: i64 = sqlx::query_scalar(
         "select count(*) from information_schema.tables where table_schema = 'public'",

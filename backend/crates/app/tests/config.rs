@@ -3,7 +3,8 @@
 //! The rule under test throughout: an invalid or missing required variable fails at
 //! startup with the *variable name, never its value*, and a non-zero exit.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const SERVE_ENV: &[(&str, &str)] = &[
     ("APP_ENV", "test"),
@@ -39,6 +40,43 @@ fn combined(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// The outcome of [`run_briefly`]: whether the process was still running when the
+/// wait elapsed (meaning it got past configuration and is now serving, rather than
+/// exiting early on a rejected variable), plus whatever it had printed by then.
+struct BriefRun {
+    still_running: bool,
+    output: std::process::Output,
+}
+
+/// Spawns `fau <arg>` with `env`, waits `wait`, then kills it if it is still
+/// running and collects whatever it printed. Ruling 7: now that `serve` actually
+/// binds and runs instead of ending in `todo!()`, a config test that wants to
+/// observe "got past configuration" or "never leaked within a few seconds while
+/// actually serving" cannot use a blocking `.output()` -- that would hang forever
+/// against a process with no configuration error to exit on.
+fn run_briefly(env: &[(&str, &str)], arg: &str, wait: Duration) -> BriefRun {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fau"));
+    cmd.arg(arg)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn fau");
+    std::thread::sleep(wait);
+    let still_running = matches!(child.try_wait(), Ok(None));
+    if still_running {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("wait for fau to exit");
+    BriefRun {
+        still_running,
+        output,
+    }
 }
 
 #[test]
@@ -102,9 +140,28 @@ fn production_requires_an_https_public_base_url() {
 
 #[test]
 fn database_url_password_never_appears_in_output() {
-    // A DSN in an error message is the classic way a password reaches a log.
-    let out = fau_with(&serve_env_without("PUBLIC_BASE_URL"), "serve");
-    assert!(!combined(&out).contains("hunter2"), "password leaked");
+    // A DSN in a log or error message is the classic way a password reaches an
+    // operator's screen. Ruling 7: with a fully valid configuration -- so `serve`
+    // gets past configuration and is actually running, not failing early on some
+    // other variable -- and `DATABASE_URL` pointed at an unreachable host, the lazy
+    // pool (design section 4) never even attempts to connect, so this sentinel
+    // password must never appear at all.
+    let mut env = serve_env_without("DATABASE_URL");
+    env.push((
+        "DATABASE_URL",
+        "postgres://u:sentinel-password-xyz@10.255.255.1:5/unreachable",
+    ));
+    let run = run_briefly(&env, "serve", Duration::from_secs(3));
+    assert!(
+        run.still_running,
+        "fau serve exited unexpectedly: {}",
+        combined(&run.output)
+    );
+    assert!(
+        !combined(&run.output).contains("sentinel-password-xyz"),
+        "password leaked: {}",
+        combined(&run.output)
+    );
 }
 
 #[test]
@@ -142,15 +199,23 @@ fn migrate_does_not_require_serve_configuration() {
 #[test]
 fn telemetry_and_mail_variables_are_accepted_without_validation() {
     // Spec section 4: these have no adapter yet, so any value -- even nonsense --
-    // must never produce a configuration error naming them.
+    // must never produce a configuration error naming them. `SERVE_ENV` is fully
+    // valid, so `serve` now gets past configuration and runs indefinitely --
+    // `run_briefly` is used rather than the blocking `fau_with`, which would hang
+    // this test forever waiting for a process that no longer exits on its own.
     let mut env = SERVE_ENV.to_vec();
     env.push(("OTEL_SERVICE_NAME", "fau-app"));
     env.push(("OTEL_EXPORTER_OTLP_ENDPOINT", "not-a-real-endpoint"));
     env.push(("OTEL_EXPORTER_OTLP_PROTOCOL", "smoke-signal"));
     env.push(("MAIL_TRANSPORT", "carrier-pigeon"));
     env.push(("SIGNUP_NOTIFICATION_TO", "not-an-email-address"));
-    let out = fau_with(&env, "serve");
-    let text = combined(&out);
+    let run = run_briefly(&env, "serve", Duration::from_millis(500));
+    assert!(
+        run.still_running,
+        "fau serve exited unexpectedly: {}",
+        combined(&run.output)
+    );
+    let text = combined(&run.output);
     assert!(
         !text.contains("configuration variable"),
         "output was: {text}"
@@ -166,12 +231,47 @@ fn migrate_without_its_own_variable_names_it() {
 
 #[test]
 fn http_bind_and_log_level_have_defaults() {
+    // Ruling 7: now that `serve` actually binds and runs, "the defaults were
+    // accepted" is best shown by the process still running past configuration
+    // (rather than exiting on a rejected variable), and by the startup banner
+    // actually naming the two default values -- a stronger check than the old one,
+    // which only ever proved these two variable *names* were absent from a
+    // `todo!()` panic's output.
+    //
+    // With `HTTP_BIND` absent this binds the real `0.0.0.0:8000` (the documented
+    // default), which this environment does not otherwise use -- but a shared CI
+    // host might. If the bind itself fails with "address in use", that is an
+    // environment conflict, not a rejected default, so it is reported and skipped
+    // rather than failed.
     let mut env = serve_env_without("HTTP_BIND");
     env.retain(|(k, _)| *k != "LOG_LEVEL");
-    let out = fau_with(&env, "serve");
-    let text = combined(&out);
+    let run = run_briefly(&env, "serve", Duration::from_millis(500));
+    let text = combined(&run.output);
+
+    if !run.still_running && text.contains("AddrInUse") {
+        eprintln!(
+            "skipping http_bind_and_log_level_have_defaults: 0.0.0.0:8000 was already \
+             in use in this environment, which is a conflict with something else \
+             listening, not a rejected default: {text}"
+        );
+        return;
+    }
+
+    assert!(
+        run.still_running,
+        "fau serve exited before the defaults could take effect -- configuration \
+         was rejected (this was not an address-in-use bind conflict): {text}"
+    );
     assert!(!text.contains("HTTP_BIND"), "output was: {text}");
     assert!(!text.contains("LOG_LEVEL"), "output was: {text}");
+    assert!(
+        text.contains("0.0.0.0:8000"),
+        "expected the startup banner to name the default bind address: {text}"
+    );
+    assert!(
+        text.contains("info"),
+        "expected the startup banner to name the default log level: {text}"
+    );
 }
 
 // The migration lock's bounds, ruling 7: MIGRATION_LOCK_TIMEOUT_MS and

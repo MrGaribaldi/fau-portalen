@@ -5,4 +5,4 @@ mod migrate;
 mod pool;
 
 pub use migrate::{run_migrations, Applied, MigrateError, MigrationSettings, MIGRATION_LOCK_ID};
-pub use pool::ConnectErrorKind;
+pub use pool::{lazy_pool, ConnectErrorKind};

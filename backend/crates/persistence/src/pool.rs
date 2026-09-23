@@ -8,7 +8,8 @@
 //! included. This module never does that: a caller gets a fixed classification, not
 //! the underlying message.
 
-use sqlx::postgres::PgConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::PgPool;
 
 /// PostgreSQL SQLSTATEs for a rejected login: `invalid_password` and
 /// `invalid_authorization_specification`. Fixed identifiers from PostgreSQL's own
@@ -78,6 +79,18 @@ pub fn connect_options(
 ) -> Result<PgConnectOptions, ConnectErrorKind> {
     let opts: PgConnectOptions = url.parse().map_err(|_| ConnectErrorKind::InvalidUrl)?;
     Ok(opts.options(options))
+}
+
+/// Builds `serve`'s runtime pool *lazily*: `connect_lazy_with` never dials the
+/// database, it only validates and stores the connect options, so a database that
+/// is merely unreachable at startup is not a startup failure (design section 4).
+/// The first real connection attempt happens on first use -- today, nothing in
+/// Task 8 uses the pool yet; Task 9's readiness check is the first caller.
+pub fn lazy_pool(url: &str, max_connections: u32) -> Result<PgPool, ConnectErrorKind> {
+    let options = connect_options(url, [])?;
+    Ok(PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect_lazy_with(options))
 }
 
 #[cfg(test)]

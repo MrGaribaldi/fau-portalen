@@ -1,0 +1,15 @@
+# The domain crate. ADR-001: the domain does not depend on HTTP or UI, and this
+# manifest is where that rule is enforced -- a test in tests/dependency_boundary.rs
+# reads this file and fails if an HTTP or SQL dependency is ever added.
+[package]
+name = "fau-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

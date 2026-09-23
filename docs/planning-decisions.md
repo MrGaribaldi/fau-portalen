@@ -1125,3 +1125,1097 @@ uninitialised; a git-URL dependency needs upstream reachable at build time. The 
 trap still stands: a `cargo install` run inside the container does not survive a container
 recreate, because `/usr/local/cargo` is not a mounted volume.
 
+## Agent topology: Terraform stays with one agent — 10 September 2026
+
+Erik settled the division of labour for the concurrent agents he is adding. The research and
+business agents get **their own container**, which already exists and is not built from agent-box,
+so it has none of this box's plumbing - no `/infra-runtime`, no WireGuard, no Docker socket. They
+need Favro access and nothing else from here. The remaining agents work on the application side.
+
+**Only this agent works on Terraform.** That is a deliberate single-writer rule, and it removes the
+worktree problem raised earlier the same day: `infrastructure/sync-to-runtime.sh` hardcodes
+`SRC_ROOT=/workspace/infrastructure`, so infrastructure edits made in a git worktree would never
+reach the runtime root, but with infrastructure work confined to the main checkout the script needs
+no change. The S3 backend's `use_lockfile = true` remains the backstop rather than the mechanism.
+
+Favro access from a container without `/infra-runtime` is a solved problem and does not need the
+credentials file to move: `.favro/project.toml` names `/infra-runtime/infrastructure/favro.env` as
+its credentials path, but `FAVRO_ENV_FILE` takes precedence over the configured files - verified on
+10 September by pointing it at a deliberately invalid env file and getting a 401 from the API, then
+succeeding again without it. So the second container needs only its own env file and that variable
+set. The authorship problem is unchanged and gets worse with more agents: every agent posts with
+Erik's own token and shows as "Erik W. Bjønnes", so the role emoji prefix is the only signal of who
+wrote a comment, and each agent needs its own `--role` key. A separate Favro account for agents was
+envisaged in the original coordination decision and would fix attribution at the cost of a seat.
+
+## Placeholder hostname for certificate work: fau-lab.bim.graphics — 10 September 2026
+
+The product name and domain are still open on #3434, and HTTP-01 needs a public hostname that
+resolves to the load balancer, so certificate work had no way to start. Erik supplied
+`bim.graphics`, a domain he already holds at Domeneshop - the same registrar as the eventual FAU
+domain - which serves only a parking notice. Its Microsoft 365 records, an MX, an SPF `-all` and an
+`MS=` verification TXT, are leftovers from a product renamed years ago and are not in use.
+
+The placeholder is a **subdomain**, `fau-lab.bim.graphics`, pointing at `lb-fau`'s public v4 and v6
+addresses. Using a subdomain rather than the apex was deliberate even after the records turned out
+dormant: the record is then purely additive and cannot disturb mail routing or the parked site, and
+the reasoning holds if the zone is ever put back into service. Verified before proposing it: the
+name is unused, and neither `bim.graphics` nor the `.graphics` TLD carries a CAA record, so Let's
+Encrypt may issue.
+
+**Erik creates the record himself in the Domeneshop panel.** No Domeneshop API token enters the
+agent container for a placeholder, and none is pasted into a transcript. The judgement was that a
+write token for a zone outside the FAU stack is a poor trade for one record created once; when the
+real domain exists and its records become infrastructure-as-code, a token in the private runtime
+volume is worth it. That is a boundary about blast radius, not about capability.
+
+Two limits recorded with it. The placeholder exercises the issuance path only - nothing a pilot
+school sees may live under another product's domain, so #3434 still gates anything user-facing. And
+the stale M365 records are best left partly alone: dropping the MX and the `MS=` TXT is tidy, but the
+SPF `-all` is the one record there still doing useful work, because it denies spoofing from a domain
+nobody is watching.
+
+**A staging ClusterIssuer comes with it.** Upstream's cert-manager module defines only the
+production ACME endpoint for both of its issuers. Production allows five duplicate certificates per
+week per hostname and a misconfigured challenge loop burns that in minutes, blocking issuance for
+days. FAU adds a `letsencrypt-staging` ClusterIssuer in its own root, through the same `raw` chart
+technique upstream uses so the issuer is created after cert-manager's CRDs exist - `kubernetes_manifest`
+cannot do that at plan time. Inherited and worth knowing rather than chosen: `charts.helm.sh/incubator`
+is a deprecated Helm repository that upstream's issuer release already depends on, so both issuer
+releases rest on an archived repo.
+
+Sequence, since it caused a false start in planning: ingress-nginx first, because the HTTP-01 solver
+hardcodes `ingressClassName = "nginx"` and nothing can validate before the controller exists. Then
+the DNS record, then cert-manager with `certificate_email`, issuing against staging before
+production. Proposed configuration is quoted in docs/stage-2-remaining-readiness.md and is not
+applied; #3485 carries the authorization.
+
+## ingress-nginx applied; the placeholder path works end to end — 10 September 2026
+
+Erik authorized the pass, answered its inputs on #3485 - `certificate_email` is
+`kontakt@ewb-solutions.as`, and the empty Cloudflare token is accepted as harmless - created
+`fau-lab.bim.graphics` in the Domeneshop panel, and approved the apply. Applied: 2 added, 0 changed,
+0 destroyed.
+
+The pass is worth recording for one lesson rather than for its size. **A Terraform plan can
+understate what an apply does.** This plan created two Kubernetes objects and no Hetzner resource,
+yet the effect was to hand `lb-fau` to the Hetzner CCM, which configured the load balancer's
+services and node targets from the controller Service's annotations. Terraform cannot show that,
+so "2 to add, 0 to change" was not evidence that nothing would happen to a live, billed resource.
+What made it safe was reading stage 1's state first and finding the load balancer **empty** - an
+`lb11` with round-robin, no services, no targets, billed since 9 September doing nothing - so the
+CCM's work was additive rather than a rewrite. The general rule: when a module's effect runs
+through an in-cluster controller, the plan is a statement about Terraform's intentions, not about
+the blast radius.
+
+Verified after applying: the controller Service carries the load balancer's v4, v6 and private
+addresses on ports 80 and 443; the `nginx` IngressClass exists and is default; both controller pods
+run on `master` and `cworker-1`, matching the pre-flight prediction from the nodeSelector
+(`cloud=true`, `node-role=worker`) and `vpn-router`'s taint; and nginx answers 404 over HTTP and
+HTTP/2 over TLS with its default certificate through the public address, which is the correct state
+with no Ingress resources defined. Stage 1 and stage 2 both report `No changes` afterwards - the
+CCM's load balancer services do not read as stage-1 drift, because services and targets are
+separate resource types stage 1 never declared.
+
+One operational note that will matter at the first certificate attempt: `bim.graphics` has a
+negative-answer TTL of 3600 seconds. A resolver that queries a name before it exists caches the
+miss for up to an hour, which happened in the agent container. Let's Encrypt resolves from its own
+side, so issuance is unaffected, but cert-manager's in-cluster self-check goes through coredns - so
+a name queried too early can make a first HTTP-01 attempt look broken when it is only cached.
+
+## Storage defaults and off-node etcd retention — 10 September 2026
+
+Two findings from inspecting the cluster after the CCM and ingress passes (#3488,
+docs/cluster-hygiene-findings-2026-09-10.md), both decided the same day.
+
+**StorageClass: the rule, not the re-provision.** The CCM pass left the cluster with **two default
+StorageClasses** - `hcloud-volumes` from the `hcloud-csi` release and k3s's packaged `local-path` -
+and which one an unqualified PVC receives is version-dependent. Erik chose option (a): every PVC and
+every stateful workload sets `storageClassName` explicitly, so the default never decides anything
+that matters. The alternatives were rejected on durability and cost: removing the annotation from
+`local-path` does not stick, because k3s's addon controller owns that object and reasserts it, and
+adding `local-storage` to the k3s `disable:` list would re-trigger the control-plane install through
+`config_hash`. The rule is recorded in /workspace/CLAUDE.md so it reaches #3416 and #3424 rather
+than being rediscovered when a database is already running. The concrete risk it prevents: a
+PostgreSQL volume landing on node-local storage that dies with the node, under a product whose
+premise is history that survives.
+
+**Off-node etcd retention: a second flag, not a bug.** Erik chose to check upstream first, and that
+settled it. S3 retention is a **separate setting with its own default of 5** - the node's own binary
+lists `--etcd-snapshot-retention (default: 5)` and `--etcd-s3-retention (default: 5)` - and FAU's
+config sets only the former, to 168. So the observed five hourly snapshots in
+`s3://fau-k3s-backup/etcd-backups` against fifteen on disk is the configuration behaving as
+written, not a defect. Upstream later added a fallback so an unset `etcd-s3-retention` inherits the
+general value (k3s-io/k3s#13770), and the release-1.35 backport of the related regression (#13783)
+carries milestone v1.35.3+k3s1; the cluster runs v1.35.2+k3s1, one patch short of the version where
+leaving it unset would have been safe.
+
+The fix is to set `etcd-s3-retention: 168` explicitly, which works on the running version and is
+preferable to relying on the fallback even after an upgrade, because the value is then declared
+rather than inherited. 168 snapshots at ~6.4 MB is about 1.1 GB, a fraction of a cent per month.
+Erik's stated preference was to control it in code, so the intended home is a drop-in written by
+FAU's own `1-bootstrap` root - k3s reads `/etc/rancher/k3s/config.yaml.d/*.yaml` - with an upstream
+request to add the flag to the shared template as the follow-up that lets the divergence retire.
+The drop-in restarts k3s on the single control-plane node, so it waits for authorization and a
+moment when a brief API outage is acceptable. Scheduling the module's `backup-k3s-server.sh` is no
+longer needed for retention, but stays on the table for a different reason: it archives the whole
+server directory, which an etcd snapshot does not cover.
+
+## ADR-002 accepted, with a malware scanner added — 10 September 2026
+
+Erik accepted ADR-002 (docs/url-scheme.md, attached to #3446) and answered all three of its open
+questions in one comment.
+
+**UUIDv7, and the creation-time leak is accepted.** Time-ordered ids keep index locality and avoid
+fragmenting the primary key, at the cost of exposing roughly when a record was created to anyone
+holding the id. Erik's judgement: "we can live with leaking creation times". The leak is bounded by
+the fact that an id only reaches someone who can already open the resource.
+
+**The unverified-school queue is reviewed manually by Erik, possibly with agent assistance, at
+about a week's turnaround.** That is a service level rather than an estimate, and it is what makes
+ADR-002's answer coherent: an unverified school is created immediately and works fully at its
+`/s/<uuid>` address, staying `noindex` and without a pretty slug, for about a week.
+
+**A malware scanner goes into the document ingest pipeline.** This is new scope rather than a
+confirmation - ADR-002 had left it as an open item deliberately. Erik's reason widens it beyond
+school submissions: FAU-er will upload their own existing document archives, which is exactly the
+material most likely to carry something old and infected, arriving from people who are not
+attackers and cannot be expected to vet it.
+
+The consequence to settle before anything is built is a supplier question, not a routing one.
+**An external scanning API would send member documents out of the cluster**, which makes the
+scanner a customer-facing supplier under the ownership policy of 9 September: European ownership
+required, and a new entry on #3409. A scanner running in-cluster - ClamAV being the obvious
+candidate - keeps documents inside the boundary and needs no supplier decision at all. The
+in-cluster route is not free either: a ClamAV daemon holds its signature database resident, which
+belongs in the sizing on #3408 rather than being discovered when a node starts swapping. Tracked
+on #3447 alongside the active-content stripping it does not replace - scanning and sanitisation
+answer different threats, and ADR-002 keeps them separate on purpose.
+
+## S3 credential rotation scheduled — 10 September 2026
+
+Erik decided to rotate the leaked S3 credentials tomorrow rather than immediately, on the reasoning
+that nothing indicates the transcript has been read by anyone else and the rotation touches five
+places including a control-plane decision. Recorded so the delay is a choice with a date rather
+than a thing that quietly does not happen. Procedure and the open question about step 4 - whether
+to let stage 1 re-run the control-plane install or patch `master` with a targeted drop-in and accept
+pending `config_hash` drift - are on #3489.
+
+## Malware scanning in-house, on a dedicated ingest worker — 10 September 2026
+
+Erik decided the scanner runs **in-house** rather than through an external scanning API, which
+closes the supplier question the ADR-002 acceptance opened: no member document leaves the cluster,
+so the scanner needs no entry on #3409 and no European-ownership decision. His proposed shape is a
+worker spun up when a user uploads files, doing both the scanning and the conversion of other
+formats into FAU's Markdown.
+
+**The dedicated worker is worth having, and the strongest argument for it is isolation rather than
+capacity.** Conversion means running LibreOffice, PDF tooling and image libraries over files
+supplied by strangers - the most CVE-dense components in any ingest pipeline. A worker holding no
+database credentials, reading only from the quarantine bucket and writing only results, means the
+parser can be compromised without reaching the API, the database or the servable bucket. Memory is
+the second argument: ClamAV keeps its signature database resident, on the order of a gigabyte before
+it scans anything, against `cx23` nodes with 4 GB that will also run the API and PostgreSQL.
+
+**Two corrections from querying the Hetzner API rather than the catalogue.** `cpx33` does not
+exist - the line is cpx11/12, 21/22, 31/32, 41/42, 51/52, 62 - and the nearest type to the intent is
+`cpx32`, 4 vCPU and 8 GB at EUR 35.49/month or EUR 0.0569/hour in hel1. More importantly, Erik's
+availability instinct was sharper than expected: in `hel1-dc2` on 10 September only the "2"
+generation of cpx is in stock, and **`cx33` cannot be created at all** - the type an earlier draft
+of the assessment had recommended running always-on at EUR 8.49. That is the same flicker Erik
+watched in the cx line on 8 and 9 September, and it becomes a design rule: **a node pool names an
+ordered list of acceptable types, not one type**, and provisioning checks availability rather than
+trusting the catalogue.
+
+**The economics therefore favour the on-demand shape.** An always-on `cpx32` at EUR 35.49 would more
+than double the current EUR 25.46 infrastructure bill; the same worker used an hour a day costs about
+EUR 1.70, and the monthly cap is only reached at roughly 623 hours. The recommendation recorded on
+#3447 is nonetheless to build the pipeline before the node: upload to a quarantine bucket, a queue
+entry, a Kubernetes Job that scans and converts, results written back, the API only reading status.
+That asynchrony is forced by provisioning latency anyway - server creation plus cloud-init plus k3s
+join is minutes, and nobody uploading a PDF waits - and once the pipeline is asynchronous the node
+can be always-on, on-demand or replaced later without touching the application. Upstream ships no
+cluster-autoscaler, so the on-demand machinery is real work with quiet failure modes: a node that
+fails to join is a billed server outside Terraform state, and a scale-down mid-scan loses the job.
+
+**Conversion to Markdown carries a product risk that is not an infrastructure question.** DOCX, ODT
+and PDF conversion is lossy exactly where FAU's documents matter - tables, footnotes, annexes - and
+these are minutes and records. The rule recorded to keep that safe, consistent with #3412 and
+ADR-002: the uploaded original is the authoritative artifact, stored immutably, and the Markdown is
+a derived working copy that can be regenerated when the converter improves. Converter choice and
+fidelity expectations belong with the Markdown and text-import work on #3419.
+
+Scanning does not replace the active-content stripping already specified on #3447: a stripped file
+can still be malware and a clean-scanning file can still carry active content, so both stay in the
+pipeline. The scanner's signature updates are the one new outbound dependency the worker adds.
+
+## Ingest worker: cpx32, created for the work and deleted after — 10 September 2026
+
+Erik's decision on the shape, following the in-house scanning decision the same day: a `cpx32`
+(4 vCPU, 8 GB, EUR 0.0569/hour in hel1, EUR 35.49/month if left running) is created to scan and
+convert an upload, then shut down, so the cost tracks actual use instead of an idle node 99% of the
+time. `cpx32` also answers the availability point: only the "2" generation of cpx is in stock in
+hel1, and `cx33` cannot be created there at all today.
+
+Four mechanics decide whether the saving is real, and they are recorded because each is a way the
+design quietly fails to save anything:
+
+1. **"Shut down" must mean delete.** Hetzner bills a server while it exists, powered off included.
+   So the lifecycle is create and destroy, which in turn means the worker holds no state worth
+   keeping. To be confirmed against the first invoice rather than assumed.
+2. **Assume the hour is the billing unit and batch accordingly.** A node takes minutes to create,
+   join and warm up. Two uploads ten minutes apart should share one worker, so the queue drains in
+   windows: a node comes up when work is waiting, drains, and is deleted after a short idle timeout.
+   One node per uploaded file would be both slow and, if partial hours round up, no cheaper.
+3. **No public IPv4 on the worker.** A primary IPv4 costs EUR 0.50/month and keeps billing if it
+   outlives the server. It is also unnecessary - the private network already routes `0.0.0.0/0` to
+   the vpn-router at `10.0.1.254` - and the security argument is stronger than the saving: the
+   machine that parses hostile files should not be reachable from the internet.
+4. **Stale Node cleanup is already handled** by the Hetzner CCM applied earlier the same day, which
+   removes Node objects whose servers no longer exist. A direct benefit of that pass.
+
+The mechanism is the Kubernetes cluster-autoscaler with the hcloud provider and a node pool that
+scales to zero: a pending scan Job brings a node up, an idle timeout takes it away. Infra-tools
+ships no autoscaler, so this is new work in FAU's own root, with an hcloud token secret in the
+cluster. The failure modes to test deliberately are a node that fails to join, which leaves a billed
+server outside Terraform state, and a scale-down during a scan, which loses the job unless the Job
+blocks eviction. The pool names `cpx32` first and `cx23` behind it, so a stock shortage degrades to a
+slower worker rather than a failed upload.
+
+The order is unchanged: the pipeline is built first on the existing cluster - quarantine bucket,
+queue entry, Kubernetes Job, results written back, API reads status only - because provisioning
+latency forces asynchrony regardless, and an asynchronous pipeline lets the node be ephemeral,
+permanent or a different type without touching the application. The invoice after the first month
+decides whether ephemeral was the right call: if uploads arrive all day the monthly cap applies and
+one always-on node is cheaper and simpler.
+
+## Ingest tiers and the quarantine rule — 10 September 2026
+
+Erik refined the ingest design the same afternoon, and the result is simpler than the per-batch node
+the assessment proposed. Four tiers, in order of what handles a given upload:
+
+1. **Single files scan inline on an existing node**, paying the cost in RAM.
+2. **Bulk uploads are processed once a day**, as one batch.
+3. **If that node is fast enough, it does the bulk batch as well.**
+4. **If the queue is large enough, a `cpx32` is created for the work and killed afterwards.**
+
+The ephemeral node therefore becomes an escalation rather than the default, which takes provisioning
+latency out of the common case entirely: a single upload never waits for a server to be created.
+
+**The RAM price, stated rather than waved at.** "An existing node" means `cworker-1` - `master` runs
+the control plane and etcd, `vpn-router` is tainted - and it is a `cx23` with 4 GB that will also
+host the API and PostgreSQL. A resident `clamd` holds roughly a gigabyte of signatures before it
+scans anything, which is the whole margin. Two cheaper ways to the same guarantee are recorded on
+#3447: `clamscan` per file, trading a permanent reservation for a 1 GB spike and several seconds of
+database loading per scan, which suits occasional single files and is clearly wrong for a bulk
+batch; or a second `cx23` at EUR 5.49/month dedicated to ingest at concurrency one, which is cheaper
+than an idle `cpx32` and keeps the parser off the node holding the database. The decision is to
+measure first - scan timings and what they do to `cworker-1`'s memory - and let that choose. The
+escalation threshold should likewise be expressed in estimated work rather than file count, since
+provisioning costs minutes; a first cut is fifteen minutes of estimated scanning, revised on real
+timings.
+
+**The scan has two outcomes: cleared, or quarantined.** Cleared files are converted to Markdown
+keeping formatting. For quarantined files Erik's rule is to check whether the problem is a macro or
+something else easily disabled, convert the text if so, and otherwise tell the user the file is
+infected and cannot be processed.
+
+The second half needed a safe formulation, because **a malware detection is not a description of
+what is wrong**: ClamAV returns a signature name, not "there is a macro you could remove", so
+deciding "this is only a macro" from that name would be guesswork on exactly the input where
+guessing is expensive. The formulation recorded instead does not ask the scanner what is wrong; it
+asks **whether the threat can survive our conversion**. A macro cannot cross the boundary into
+Markdown, so a document whose only malicious element is a macro is made harmless by the conversion
+itself. What does not survive that reasoning is the case where the conversion *is* the attack - a
+malformed PDF, image or font crafted against the parser that opens it. So the rule is file-type and
+category based, conservative by default:
+
+- Macro or script in an office document, including JavaScript in a PDF: convert **in isolation**, on
+  the ephemeral worker, never on the node holding the database; the original stays quarantined and
+  is never served.
+- Detection where the risk is the parser itself - malformed PDF, image, font: **refuse** and tell the
+  user.
+- Executables, scripts, or archives containing them: **refuse**; nothing in FAU's document model
+  needs them.
+- Anything we cannot categorise: **refuse** and log for review. The default is refuse, not convert.
+
+Two consequences fixed with it. The quarantine-retry path is the strongest argument yet for the
+ephemeral worker, because converting a file known to be infected is exactly the work that belongs on
+a machine with no database credentials, no public address and a short life. And both the user-facing
+message and the audit record matter: a refusal should say what to do next rather than only reporting
+failure, since a member uploading a ten-year-old archive is not the attacker and may have no clean
+copy; and a file converted despite a detection must leave that decision in the audit trail, because
+someone later asking why a document differs from its original needs an answer. Retention of
+quarantined originals belongs with #3426.
+
+**"Keeping formatting" has written limits.** Representable and expected to survive: headings, bold
+and italic, lists, links, footnotes, block quotes, code blocks and simple tables. Lost or
+approximated: page layout, columns, text boxes, fonts, tracked changes, comments, merged-cell
+tables, embedded spreadsheets and drawings. The rule that keeps this honest is the one already
+recorded - the uploaded original stays the authoritative artifact and the Markdown is a derived
+working copy - so a lost merged cell is a display limitation rather than a lost record. A conversion
+that meets something it cannot represent should say so on the document rather than dropping it
+silently.
+
+
+## Structured rich-text direction — 11 September 2026
+
+Erik authorized applying the coordinated rich-text Favro review. Schema-constrained
+Tiptap/ProseMirror JSON replaces Markdown as canonical editable content. Tiptap is
+preferred pending #3415 integration, accessibility and licence evidence; the frontend
+framework remains unselected. HTML is a sanitized derivative. Physical persistence
+must preserve #3484 encryption, including comments and private rendering caches;
+plaintext JSONB is not an approved shortcut.
+
+Preserve session-grouped full snapshots, durable autosaves, audit atomicity and
+#3420 exclusive leases/stale-write rejection. Originals remain unchanged private
+import provenance subject to quarantine and retention; JSON governs later edits.
+
+New deliverables: #3490 architecture/schema/Rust-compatible rendering amendment,
+#3491 private anchored comments, #3492 controlled publication snapshots. #3412
+remains Done with historical approval intact. Publication structurally excludes
+comments, editorial metadata and private blocks and releases only authorized assets.
+Define anchor mapping/orphans and imported authors separately from account identity.
+
+Updated cards: #3419, #3412, #3415, #3422, #3447, #3435, #3484, #3426,
+#3409, #3428, #3433 and #3425. Existing titles are retained. DOCX refusal is
+superseded when a validated DOCX import path is scheduled; other Office formats
+remain refused absent separate specification. Malware scanning remains required
+alongside active-content stripping. Richer conversion needs a new safety assessment;
+JSON alone is no safety guarantee. Converter-specific fidelity must be tested.
+
+DOCX/original retention, comments and publication remain separate scope decisions
+on #3433. Simultaneous editing/Yjs and commercial high-fidelity conversion remain
+deferred. No deployment, subscription or external data transfer is approved.
+Extensive SSD backup work remains deferred; eventual restore coverage is extended.
+Earlier Markdown-only assumptions are superseded by this direction.
+
+## Frontend preference and separate editor decision — 11 September 2026
+
+Erik confirmed Rust-rendered HTML with htmx and focused JavaScript/TypeScript as
+the preferred frontend direction. The editor remains an embedded interactive
+component; an application-wide component framework is not the preferred default.
+
+Erik requested that major decisions have a separate Favro card with an attachment
+comparing alternatives, pros and cons for each, and a recommendation at the bottom.
+This convention is preserved in AGENTS.md. Editor decision #3493 now owns review
+of docs/editor-alternatives.md, also attached to the card. #3415 links to it.
+The earlier Tiptap preference is reopened for comparison; no editor package or
+paid platform is selected by this update. The proposed shortlist and recommendation
+are research for review, not approval. Existing encrypted persistence and exclusive
+editing requirements remain inputs to the evaluation; a different document model
+requires explicit coordination with #3490.
+
+Erik subsequently identified Lexical as the leading candidate because its playground
+matches the desired editing experience. This preference supersedes the report's
+provisional ordering, not the requirement for integration evidence. Avoiding React
+and a Node production backend is motivated by lower security maintenance. The
+playground uses React; equivalent non-React feature coverage and porting effort
+remain to be established. Statically served editor JavaScript still needs updates.
+
+Erik then accepted compiled browser-only React as a possible editor integration:
+mostly Rust-rendered HTML/htmx, with a React/Lexical editor served as static assets
+by Rust. This qualifies the earlier no-React preference; no Node production backend
+or React Server Components are proposed. Evaluate desired playground feature reuse
+against vanilla-JavaScript integration effort on #3493 before final selection.
+
+## Live decision reconciliation — 11 September 2026
+
+Erik subsequently chose Lexical for the editor for now because its playground
+matches the desired editing experience, and accepted exploring compiled React for
+the editor. #3493 is therefore Done as the editor selection decision, with the
+attached alternatives comparison retained as its evidence. This is a provisional
+package choice pending the bounded integration and fidelity checks; it does not
+approve a paid Tiptap platform, a Node production backend, or React Server
+Components.
+
+#3415 is Done as the frontend direction decision: Rust-rendered HTML with htmx and
+focused JavaScript/TypeScript, with an isolated compiled browser-only
+React/Lexical editor served as static assets by Rust. The rest of the application stays HTML/htmx; React is scoped to the editor page.
+
+Remaining work is handed to #3490 and #3422. #3490 must explicitly compare the
+Lexical document model, schema validation and Rust rendering contract with the
+older Tiptap/ProseMirror assumption while retaining encryption, snapshots,
+autosave, audit atomicity and exclusive leases. #3422 must validate static asset
+serving, editor lifecycle around htmx, unsaved-change handling, accessibility,
+bundle/runtime impact and licence/package evidence. The completed decision cards
+retain their original comparison and accessibility/licence requirements; these
+checks are implementation acceptance work, not silently completed by the
+decision.
+
+## Conversion target is HTML, and the storage-format question it opens — 11 September 2026
+
+Erik proposed converting DOCX to **HTML** rather than Markdown, on two grounds: HTML imports easily
+into the editor, and the conversion itself may strip exploits. Both hold, the second conditionally.
+
+**HTML is the import intermediate.** The selected editor is Lexical in a React page;
+the rest of the app stays Rust-rendered HTML/htmx. The earlier Tiptap/ProseMirror
+assumption is superseded. Conversion must map sanitized HTML into the bounded
+Lexical profile defined through #3490 and report unsupported formatting.
+
+**Import and storage formats are distinct.** Schema-constrained structured JSON
+is canonical editable content, encrypted under #3484. HTML is a sanitized
+import/rendering derivative; Markdown-only storage is superseded. The exact
+Lexical wire profile, validation, snapshots and Rust renderer are specified in
+docs/structured-document-architecture.md and validated through #3490/#3422.
+
+**The security claim depends on the converter's architecture, and the two kinds are opposites.**
+Parse-and-rebuild converters - `mammoth` being the clearest - read the document model and emit HTML
+from a small set of elements they understand, driven by an explicit style map. Macros, OLE objects,
+embedded binaries, field codes and remote references are dropped because the converter has no code
+to emit them: sanitisation by construction, which is what makes Erik's point true. Render-and-export
+converters - LibreOffice `--convert-to html` - use the same full document engine an attacker targets
+and then serialise the result; the output is cleaner than the input but the process is the exposure,
+and the HTML is messy.
+
+The framing recorded to keep this honest: **conversion sanitises the output, never the input.** The
+parser still eats hostile bytes either way, which is precisely why the isolation boundary and the
+ephemeral worker remain necessary.
+
+Three hard requirements follow from DOCX itself:
+
+1. **The converter fetches nothing.** A DOCX can carry a remote template reference in
+   `settings.xml`, external relationship targets, `INCLUDEPICTURE` and DDE field codes; resolving
+   any of them turns an upload into an outbound request from inside our network, which is
+   server-side request forgery and, against SMB-style targets, a credential leak. Enforced rather
+   than trusted: the conversion Job runs under a NetworkPolicy denying egress. Since ClamAV needs
+   egress for signature updates, those are separate Jobs with separate policies.
+2. **Converter output is still untrusted** and passes an allowlist sanitiser before storage or
+   editor import - no script, event handlers, `javascript:`/`data:` URLs, iframes, objects or
+   embeds, and SVG refused or sanitised as its own format because it is script-capable. This is
+   #3447's active-content stripping, now applied to the converted HTML.
+3. **Images are re-encoded, never passed through**, because the reader's browser image parser is
+   where exploit risk lands; anything that fails to decode is dropped.
+
+Plus zip-level hygiene, since DOCX is a zip: entry-count and uncompressed-size caps against zip
+bombs, rejection of absolute or traversing paths, and refusal of encrypted documents, which cannot
+be scanned or converted meaningfully.
+
+Recommendation recorded on #3447: `mammoth` as the default DOCX converter, chosen for the
+parse-and-rebuild property rather than for fidelity, with an explicit reviewed style map;
+LibreOffice headless only as an opt-in fidelity fallback inside the isolated worker with egress
+denied. PDF is deliberately not folded in by analogy - PDF-to-HTML is lossy where records matter and
+PDF parsers are the CVE-heavy end of the field, so PDFs stay attachments with text extraction for
+search rather than becoming editable content.
+
+
+## Editor page boundary clarification — 11 September 2026
+
+The editor uses Lexical (lexical.dev) in an isolated React page. The rest of the application remains Rust-rendered HTML/HTMX with focused JavaScript/TypeScript. Rust serves the compiled browser assets. The earlier Tiptap/ProseMirror preference is superseded; editor integration and the exact versioned JSON profile still require validation on #3422/#3490.
+
+This reconciles the existing decisions on #3415/#3493, rather than reopening the frontend selection. HTML import must map into the validated Lexical profile; ProseMirror JSON is historical comparison material, not the selected storage format. Existing encryption, snapshots, audit, autosave, exclusive leases and scope decisions remain in force.
+
+## Identity provider changed to PropelAuth — 21 September 2026
+
+Erik replaced Zitadel Cloud with PropelAuth for authentication, accepting a US supplier for a
+customer-facing service. The reasoning he gave: PropelAuth is already in production on another
+EWB service, so it is known to work rather than merely evaluated; and the provider will hold only
+user email addresses and organisation membership, never document content.
+
+This is a deliberate exception to the European ownership rule rather than a case that satisfies
+it. Recorded plainly because the rule exists to stop unexamined drift, and an exception that is
+argued is not the same as one that is unnoticed. PropelAuth's primary processing is in the United
+States, it offers no EU data residency option, its DPA applies EU Standard Contractual Clauses
+(Module Two) under Irish law, and it names fourteen subprocessors, all US-based - AWS for hosting
+and Postmark for mail among them, with ten days' notice on changes.
+
+What the change supersedes: the Zitadel Cloud Swiss-region choice, the "time-boxed exception"
+framing around it, the open question about Zitadel's free-tier metric, and the search for a
+European replacement as a precondition for proceeding. What it does not change: the authorization
+boundary - the provider authenticates, our database authorizes, always - and the portability
+rules in ADR-003 decision 3, which now matter more rather than less, since they are no longer
+backed by an intention to leave.
+
+Commercially the change is favourable. PropelAuth's Free tier covers 10,000 monthly active users
+with unlimited organisations, which is above any realistic MVP or pilot scale, so the pricing
+metric no longer constrains session design the way Zitadel's daily-active-user counting did.
+Free includes a test environment; a separate staging environment requires the Growth plan at
+USD 150/month.
+
+Two questions the change opens are on #3484 rather than settled here: exactly what PropelAuth is
+allowed to hold, since mirroring FAU membership into its native organisations means a US
+processor knows that a named parent is attached to a named school; and who sends authentication
+email, since PropelAuth's hosted flow sends it through Postmark and thereby moves one
+customer-facing mail path outside the European email decision on #3410.
+
+## Administrative two-factor: TOTP at login plus a freshness gate — 21 September 2026
+
+Erik answered #3414. Privileged administrative actions are gated on two server-side checks rather
+than on true step-up MFA: the account must have TOTP enrolled, read from PropelAuth's
+`mfaEnabled` flag, and the session must be fresh, meaning a login within the last 30-60 minutes.
+A stale session is forced back through login, which re-triggers TOTP. PropelAuth's real step-up
+MFA requires the Growth plan at USD 150/month and was not judged worth the cost.
+
+Erik stated the limitation himself: this is not per-action step-up. There is no challenge bound
+to the specific operation and no action-scoped one-time grant, so it does not defend against an
+attacker already inside a fresh, MFA'd session. Accepted for this threat model - volunteer
+administrators on shared or forgotten devices - rather than enterprise-grade replay protection.
+
+This answers Codex's review finding of 10 September, which was correct that the earlier
+formulation did not establish two factors: repeating the email factor is one factor twice. TOTP
+is a genuinely independent second factor, so prosjektgrunnlag.md section 13's requirement for
+administrative roles is satisfied at login, and ordinary parents reading minutes are not asked
+for one.
+
+One correction to the plan as Erik wrote it on #3414. Its fourth step - enforcing "require MFA"
+at organisation level through a PropelAuth setting - is not available on the Free plan, where
+org-level 2FA enforcement is a Growth Plus feature. It is also unnecessary: the `mfaEnabled`
+check enforces the same property server-side, on our side of the authorization boundary, which is
+where ADR-003 decision 2 puts it anyway. TOTP itself is available to users on Free.
+
+Still to define before the guard ships: the explicit list of sensitive endpoints it covers, and
+the freshness threshold within the 30-60 minute range.
+
+## What PropelAuth is given, and who sends the login mail — 21 September 2026
+
+Erik answered the two questions the provider change opened on #3484.
+
+**Data minimisation, stated as a rule rather than a preference.** PropelAuth gets no more
+information than it needs, and specifically no names. It holds an email address and which
+organisations an account belongs to. It does not hold names, other user properties, roles,
+permissions, document content, titles or filenames. FAU membership is mirrored into PropelAuth
+organisations for login context only; every authorization decision is taken against our own
+database, per operation, which is the rule that keeps the provider replaceable.
+
+Two consequences survive minimisation and are recorded so they are not rediscovered later. A US
+processor still learns that an account is attached to a particular organisation, which is personal
+data whenever the organisation identifies a school. That makes organisation naming a privacy
+decision: PropelAuth organisations should carry our opaque tenant identifier rather than a
+readable school name, since our own application renders FAU switching and the hosted login page
+has no need for the name.
+
+**Login email goes through PropelAuth for now.** Its hosted flow sends authentication mail
+through Postmark, in the US. Accepted deliberately, with a stated trigger for revisiting it:
+move authentication mail to a European provider when the product is popular enough to fund the
+work. So the European transactional-mail decision on #3410 covers every customer-facing message
+except this one, and the gap is dated rather than overlooked. Recorded with its trigger because
+"for now" decisions that carry no condition tend to become permanent.
+
+**Clarification to the administrative-MFA decision.** Erik's fourth step on #3414 - "enforce
+org-level require MFA" - means our own server-side enforcement, checking TOTP enrolment and the
+age of the last MFA-backed login. It does not mean PropelAuth's organisation-level "require 2FA"
+setting, which is a Growth Plus feature unavailable on Free. Erik agreed the wording should not
+point at the provider setting. The better reason not to use it is that enforcement belongs on our
+side of the authorization boundary, where ADR-003 decision 2 puts every authorization decision.
+
+## Identity provider changed again, to Hanko — 22 September 2026
+
+PropelAuth is dropped one day after being chosen. The reason is disqualifying rather than a
+matter of preference: **it does not offer a DPA on the Free tier**, which is the tier the decision
+assumed. A processor handling personal data on our behalf without an Article 28 agreement is not
+a supplier we can lawfully use, whatever else it does well. That the gap surfaced through #3484's
+question 1 - "approve signing PropelAuth's DPA" - is the case for asking the paperwork question
+early rather than at contract time.
+
+The replacement is **Hanko** (Hanko GmbH, Kiel, Germany), found by Erik. It offers a Hanko Cloud
+DPA, operates under GDPR as its default rather than as a bolt-on, and states that ISO 27001 is in
+progress - recorded as Hanko's claim, not independently verified. Free to 10,000 monthly active
+users, then USD 0.01 per MAU, with a startup programme offering 1M MAU free that is worth
+applying for.
+
+**This closes more than it opens, and it is worth being explicit about what falls away.**
+
+- The European ownership rule is now **satisfied rather than excepted**. FAU no longer carries a
+  customer-facing exception for identity, and the exception paragraph added to CLAUDE.md on
+  21 September is reduced accordingly.
+- **Hanko has no organisation model.** Its multi-tenancy isolates whole user pools per deployment
+  rather than grouping members inside one, so there is no FAU membership to mirror. The provider
+  holds an email address and the authentication material the user creates, and nothing else. The
+  21 September minimisation rule now holds structurally instead of by discipline, and the question
+  of whether to give organisations opaque names is moot.
+- **Authentication mail no longer leaves the EU.** The 21 September decision to accept US-hosted
+  login mail through Postmark "for now, until revenue allows" is superseded and simply unnecessary.
+- **The exit stops being theoretical.** Hanko is open source and self-hostable, so ADR-003
+  decision 3's portability rules point at a route we could actually take rather than at a
+  destination that had not been found.
+- **The emailed-code question answers itself.** Hanko's native mechanism is a six-digit email
+  passcode, which is what ADR-003 section 4a argued for on its own merits - school and municipal
+  mail scanners consume single-use magic links before the recipient clicks them.
+
+**The qualification Erik raised, recorded as he framed it.** Hanko's infrastructure subprocessors
+include AWS, which is US-owned even when the region is in the EU, so the chain still reaches a US
+company. He accepted it on the grounds that Hanko documents the arrangement, and that it is "not
+a problem right now". The distinction that makes this different from PropelAuth is worth keeping
+precise rather than glossing: the controller is German, the data stays in the EU, and there is no
+transfer to the United States needing a legal basis. Hanko also lists Hetzner and adesso as a
+service as infrastructure, so AWS may not be the only path. Revisit if Hanko's hosting changes, or
+if US access to EU-resident data becomes a live issue rather than a theoretical one.
+
+**What survived the change untouched**, which is the useful signal: the authorization boundary
+(the provider authenticates, our database authorizes, per operation), the portability rules, and
+the administrative-MFA design. The MFA design maps directly onto Hanko, whose user object exposes
+`totp_enabled`, `auth_app_set_up` and `security_keys_enabled` - better than the single flag the
+design was written against, because it distinguishes a TOTP app from a FIDO security key. The
+reasoning for enforcing MFA server-side rather than through a provider setting was written for a
+different provider and needed no edit at all.
+
+One new question the change opens, now #3484's open item 3: Hanko is passkey-first, and a passkey
+is a stronger factor than a mailed code, but our users are parents on whatever device they own and
+a passkey living on one phone becomes a support call when that phone is replaced. Whether passkeys
+ship in the MVP alongside the passcode baseline is undecided. A related point for the admin gate:
+a passkey login already proves possession plus a local biometric or PIN, so it should satisfy the
+second-factor check rather than having TOTP demanded on top of it.
+
+## Deletion made provable: per-FAU key-encryption keys, and a key replica with queued deletion — 22 September 2026
+
+Erik accepted softening ADR-003 section 7's deletion claim now and implementing the design that
+makes it true, and added the requirement that produced the interesting part.
+
+**The flaw, and why it was a design problem rather than a wording problem.** Section 7 claimed
+that destroying an FAU's wrapped data key made its content unrecoverable "including in every
+backup already written". Decision 5 stored that wrapped key on the tenant row - inside the
+database, therefore inside every database backup - while the master key that unwraps it stayed
+alive in the key service. Restore last night's dump and the content returns. Codex's review of
+10 September found this; it was correct.
+
+**The fix is one tier.** The wrapping key becomes **per FAU** and lives only in the key service's
+own datastore, never in the application database. Destruction targets that key. A restored
+database backup then yields a wrapped data key that nothing can unwrap, because the key that
+unwraps it was never in the backup. This is ordinary crypto-shredding, and it costs an extra tier
+in a hierarchy the design already required.
+
+It also buys something the row-stored design could not: content ciphertext can sit in versioned or
+immutable storage indefinitely without defeating deletion, so the rest of the backup design gets
+to follow ordinary hygiene. Only the key store carries the special requirement.
+
+**Erik's requirement: the keys need a backup.** If ransomware reaches the key service and there is
+no key backup, every FAU's data is permanently gone - a worse failure than the one crypto-shredding
+defends against. So the KEK store is replicated. His resolution of the tension that creates is the
+design's centre: **the service queues a deletion against the replica that runs after a few hours.**
+
+Expanded into a shape that can be built:
+
+- The replica holds per-FAU key records, individually addressable, in a store with real deletes.
+  It is explicitly **not a generational snapshot history** - deleting from today's snapshot does
+  nothing about last week's - so there are no periodic snapshots of key material, only one live
+  replica that deletion propagates into.
+- The replica's records are encrypted under a **backup root key that is not on the cluster and not
+  in the replica**, so possession of the replica alone yields nothing. Without this the replica is
+  simply a second copy of the crown jewels, and durability would have been bought by doubling the
+  attack surface.
+- The replica uses different credentials from the key service, so one compromise does not reach
+  both, and the queue is executed by the replica side rather than driven from the live service -
+  otherwise compromising the key service also grants the power to cancel.
+- Destruction removes the key from the live service immediately and enqueues removal from the
+  replica after the window. During the window it can be cancelled, which is what saves us from an
+  accidental or unauthorised destruction.
+- **A queued deletion is a critical alert, not a log line.** An attacker who enqueues deletion for
+  every FAU and simply waits out the window defeats the design in silence. So the queue pages a
+  human through #3442's critical path, bulk enqueueing is rate-limited exactly as bulk unwrapping
+  is, and cancellation is itself audited and alerted - "the deletion you queued was cancelled" is
+  precisely what a successful attacker wants to happen quietly.
+
+**A second hiding place closed while writing this.** Key material must not live in a Kubernetes
+Secret either: a Secret lives in etcd, etcd is snapshotted to `fau-k3s-backup`, and a key destroyed
+in the live cluster would survive in every snapshot. The same hole one layer down. The key service
+needs its own datastore.
+
+**The claim now reads so it is provable.** Destroying an FAU's key-encryption key makes its content
+unrecoverable, in the live system and in every database backup, once the queued destruction has
+completed; until then it is recoverable and the recovery is audited. A cryptographic fact with a
+bounded window rather than an unbounded promise. The rehearsal extends #3425 rather than inventing
+a separate exercise, and includes the negative control - a restore for an FAU whose key was never
+destroyed must succeed, or a failed decryption proves nothing but a broken test.
+
+Two parameters remain open on #3484: the length of the window, where twelve hours is proposed on
+the argument that it must survive a night, and the custody of the backup root key, which points at
+#3481 and an offline password manager.
+
+## Deletion timings: freeze on request, confirm by role, destroy after seven days — 22 September 2026
+
+Erik set the deletion timings, and his answer describes two timers rather than one. They are kept
+separate in ADR-003 because they defend against different things.
+
+**The replica window is now seven days**, up from the twelve hours proposed. Erik's instruction was
+at least 48 hours and probably 72 or more, on the reasoning that a destruction scheduled late on a
+Friday evening must not complete before anyone is back at work. That argument is better than the
+overnight one it replaced. Seven days rather than 72 hours because 72 hours does not survive a
+Norwegian Easter: Skjærtorsdag through 2. påskedag is five days, so a destruction enqueued on the
+Wednesday evening would complete untouched. Seven days covers every weekend and holiday cluster in
+the school year with one number and no calendar logic, and lengthening it costs nothing but how
+long deletion takes to become final.
+
+**The delete request freezes the FAU immediately**, before any confirmation. Billing stops,
+invitations stop, and the FAU goes read-only - but **reads continue**, deliberately, because the
+freeze is exactly when members should be exporting what they need and a deletion flow that removes
+access before it removes data is hostile. The freeze is what makes a long wait cheap: the FAU is
+costing us nothing and costing them nothing irreversible, so there is no pressure to hurry.
+
+**Who confirms depends on what the FAU has been, not on who is asking.** An FAU that has only ever
+had one member may be deleted by that member alone - no shared history, nobody else harmed. Every
+other FAU needs confirmation, because the last remaining member of a council that once had ten is
+not entitled to destroy nine other people's record of it. The test is on membership *history*
+rather than current count, which is answerable precisely because #3412's approved model keeps
+date-ranged roles rather than a current-members list. Where the recovery contact is a school
+representative, confirmation is requested from them and we wait at least seven days; silence is
+not consent, and an unanswered request stays frozen and pending rather than proceeding by default.
+
+**School holidays extend the wait rather than defeating it.** An FAU is dormant through the summer,
+and a confirmation sent in mid-July may reach nobody until mid-August, which would make a
+seven-day clock a formality. The rule proposed: if the wait would expire inside a defined
+school-holiday period, the clock restarts at the end of it. Which periods count is still to be
+named - summer is the one that matters, and whether Christmas and Easter are included is a
+judgement rather than a fact.
+
+**A distinction recorded before it causes a compliance error.** Two different things are being
+called deletion. Closing an FAU account is a tenant-lifecycle event where a wind-down measured in
+weeks is normal. An individual exercising erasure under GDPR Article 17 is a different request,
+with a one-month statutory response time, and it concerns that person's own personal data - their
+address, their membership record - not the FAU's shared documents, which they neither own nor may
+unilaterally destroy. The flow above is the first. The second belongs on #3426 and must not
+inherit these waits.
+
+## ADR-003 closed out: key lifetime, search, retention and the remaining timings — 22 September 2026
+
+Erik answered the last questions on #3484. Two of his answers changed the architecture rather than
+merely selecting from what was offered.
+
+**Key lifetime: a session-scoped handle, not a fetch per operation.** This reverses the
+recommendation the ADR carried, and Erik's question is what exposed it. His scenario: someone
+editing minutes during a meeting writes a few lines, talks for several minutes, writes a few more.
+Autosaves are durable and frequent by requirement, so per-operation key fetching means a key-service
+round trip every few minutes per editor, for hours, across every FAU meeting on the same evening.
+
+The decisive argument turned out not to be performance. Decision 5 exists so that mass decryption
+looks like mass decryption in the logs; a log carrying one unwrap per session per FAU makes an
+unusual pattern obvious, while a log carrying one unwrap per autosave buries two hundred malicious
+entries inside tens of thousands of routine ones. Per-operation fetching dilutes the very signal
+the key service was built to produce. Nor does it buy protection: a compromised backend holds
+plaintext by construction - it must, to serve a document to its reader - and can ask per operation
+as easily as once. The controls that matter are the rate and the ceiling, not the interval.
+
+So the backend obtains a key once per user session per FAU and holds it in memory, with an idle
+timeout in the tens of minutes, refreshed by real user activity only - no background timer, no
+keep-alive on an idle tab, the same rule already applied to token refresh and for the same reason.
+Zeroised on logout, session end, idle expiry and lease release. Never on disk, never logged, never
+in a crash dump; swap disabled and core dumps off, since a key reaching disk by accident is the
+same class of mistake as putting it in a Kubernetes Secret. Replacing per-operation logging as the
+control, the key service gains a **concurrency ceiling** on how many distinct FAU keys one backend
+instance may hold at once, plus an alert on the rate of new acquisitions - a wall rather than a log
+entry.
+
+**Notifying an idle viewer needs no decryption**, which was the other half of Erik's question.
+Editing is exclusive by #3420, so the second person is a viewer or is waiting for the lease. Both
+need to know the document changed, and neither needs plaintext to be told: the notification carries
+a document identifier and a revision number, and both are already plaintext by decision 6. Only the
+subsequent fetch touches ciphertext, and by then the viewer is acting, which re-establishes the key
+handle under the activity rule. In practice a small server-sent-events stream per FAU, which htmx
+consumes natively and which therefore needs no React outside the editor page.
+
+Recorded alongside it, because Erik's question implied it and the document had never said it
+plainly: **encryption is server-side**. The React editor never holds an FAU key; it sends document
+JSON to the backend over TLS and the backend encrypts before storage. This is not end-to-end
+encryption, it follows from the trust model, and it is why "we cannot see your data" stays
+forbidden.
+
+**Search is filename search, and nothing leaves the encryption boundary.** Erik was explicit that
+we do not move data out of encryption to make a feature easier, and asked whether an index would be
+better than decrypting on demand. Decrypt-on-demand wins at this scale and it is not close: an FAU
+with 500 documents holds perhaps 30 KB of filename ciphertext, decrypted in under a millisecond
+inside a session whose key is already unwrapped, against an index that must stay consistent with
+every rename and deletion. An index is also not an escape - a plaintext filename index discloses
+precisely what encrypting filenames prevents, so it would need encrypting too, and searchable
+encryption trades that for frequency and access-pattern leakage. The filter sits behind an
+interface so a real index can replace it if a tenant ever grows into needing one.
+
+**Retention follows membership, not the account.** An email is kept while the person holds any
+active membership anywhere; the membership follows the role's own term, with mid-term updates
+extending to the new expiry, which #3412's date-ranged model already expresses. When the last
+membership ends the account lapses after three months - chosen so it survives the summer holiday,
+since a parent whose seat ends in June and who is re-elected in August should be recognised rather
+than start over. The correctness point: accounts are global across FAU-er, so the lapse test is "no
+active membership anywhere", never "no activity in this FAU".
+
+Erik raised member-elected retention from a real case - an FAU taking on helpers for a few weeks'
+project, some expecting to return next year. Letting the person choose is better data protection
+than a fixed rule imposed on them, but it turns retention into a per-person promise to store,
+honour, expire and allow withdrawal. So the first migration carries a per-account retention field
+with the default value and the MVP ships the fixed rule; election becomes a screen and a background
+job later rather than a migration on live data. When it ships, an elected retention must expire and
+be re-confirmed - otherwise "keep my data a year" drifts into indefinite - and withdrawal must take
+effect promptly, because consent that cannot be withdrawn is not consent.
+
+**The remaining timings.** Only the summer holiday restarts the confirmation clock; Christmas and
+Easter are covered well enough by seven days plus monitoring every other day. Cancelling a queued
+key destruction takes one operator, decided because there is currently only one person who could
+act.
+
+**Recovery contact.** Choosing neither is not permitted. Every FAU picks us or a school
+representative, and **we hold the seat until a nominated representative is confirmed**, so the
+transition has no gap. A nomination never confirmed leaves us in the seat, which is the safe
+failure.
+
+**The backup root key goes to Proton Pass**, a second trigger for #3481 alongside the SOPS age key.
+
+**A standing risk named rather than closed.** One operator can cancel a destruction, one person
+holds the Proton Pass credential, and the same person sits in the recovery seat for every FAU
+without a confirmed school representative. That is the right call while there is one person, and it
+is a concentration worth revisiting the day a second trusted operator exists rather than the day
+one is needed.
+
+## End-to-end encryption rejected, and FAU is not a reporting channel — 22 September 2026
+
+Erik asked whether end-to-end encryption was possible and what it would cost, then decided against
+it. Recorded with the reasoning rather than as a bare "no", because it is the obvious question and
+will be asked again by someone who has not seen the analysis.
+
+**Three reasons, in descending order of how decisive they are.**
+
+Continuity is the product and E2E is incompatible with it. FAU exists so an archive outlives every
+member leaving; under real end-to-end encryption, when the last key-holder goes the data is gone.
+ADR-003's recovery contact is an escrow mechanism, and escrow is exactly what makes a system not
+end-to-end. Continuity across total turnover or E2E, not both.
+
+It would remove protection against the likelier attacker. Server-side validation of the document
+JSON (#3490) and the whole ingest pipeline (#3447) require the server to read content; under E2E
+they move into the browser or disappear. That trades defence against a compromised or malicious
+member for defence against ourselves, and for a parents' council a bad upload reaching other
+parents' browsers is the more probable event.
+
+There is nothing to derive a key from. Passwordless login proves mailbox control and yields no
+secret. A password reverses a core product decision, a separate passphrase is the second secret the
+product was designed to avoid, and passkey PRF is ruled out for the MVP, unevenly supported, and
+warned against for encryption by the WebAuthn specification's own co-editors because the data dies
+with the passkey.
+
+There is also an honesty problem at the end of it: we serve the JavaScript and hold the member key
+directory, so it would be end-to-end against a passive server only. We would have built it and
+still been unable to write "we cannot see your data" - a phrase this project already forbids.
+
+**The partial version was dropped too, and that is a correction.** A "sensitive document" class,
+client encrypted to current members, was proposed as worth keeping the door open for, on the
+assumption that FAU would hold reports about named individuals. Erik's scope boundary below removes
+that assumption. What remains - internal discussion, draft positions, a matter involving a named
+child raised in a meeting - is already covered by encrypting bodies, titles and filenames. So the
+document envelope needs no encrypted-to-members variant and #3490 stays simpler. The earlier
+recommendation to reserve one is withdrawn.
+
+**Scope boundary: FAU will never carry a whistleblowing or reporting channel.** Erik's reasoning:
+an FAU should not be involved in reporting matters concerning the school, and a complaint against
+an FAU member belongs with the school rather than with us. This is a statement about what the
+organisation is for, not a feature deferred on cost. Nothing in the roadmap (#3433) should
+reintroduce varsling, intake of reports about named individuals, or a confidential channel between
+a parent and anyone outside the FAU. It is also what closes the end-to-end question rather than
+merely postponing it, since the protections such a channel would demand are the ones that would
+have justified the cost.
+
+## Collaboration model decided: ProseMirror central authority, not CRDT — 22 September 2026
+
+Erik and Sol produced an architecture brief proposing Tiptap OSS, ProseMirror, Yjs, y-prosemirror
+and self-hosted Hocuspocus, with Yjs updates persisted in PostgreSQL. It was reviewed rather than
+adopted, and the review changed four things. What survived is a better fit than either the brief or
+the architecture it was replacing.
+
+**The scope correction that drove everything else.** FAU-portalen is not a minutes archive. Erik
+corrected a reading that had quietly narrowed the product: documents are the working surface for
+everything an FAU does - an application for a new basketball court drafted by several parents over
+weeks, a plan for the annual event that generates a task list this year and a different one next
+year, with minutes as the simplest case rather than the typical one. Spreadsheets and presentations
+are wanted later so an FAU has one place for its work. On that reading collaboration is a
+requirement rather than a refinement, and #3420's exclusive-lease model was a compromise Erik
+accepted only because he believed proper collaboration was out of reach.
+
+**CRDT rejected in favour of a central authority.** Erik's instruction was to keep the existing
+change-set model if it could support collaboration. It can: ProseMirror's own `prosemirror-collab`
+uses a central authority that orders versioned step batches, with rebasing on the client. Three
+reasons it beats Yjs here. Offline editing is explicitly out of scope, and offline is the advantage
+a CRDT buys. History must be editable - Erik requires force-undo, removal from history and purging
+whole documents, and a CRDT keeps deleted content as tombstones that garbage collection does not
+retroactively purge from blobs already written. And a step batch is one blob with one author and
+one timestamp, which drops onto #3412's audit model and ADR-003's encryption without friction,
+where a CRDT update stream has neither an author nor a transaction boundary.
+
+**Hocuspocus dropped, no Node in production.** The brief made it the default "unless there is a
+strong architectural reason"; the standing decision of 11 September is that reason. The authority
+is part of the Rust backend, which also puts collaboration authorization in the same process as
+every other authorization decision.
+
+**The server does not apply steps.** This was the largest risk in the first review - a Rust
+reimplementation of ProseMirror's transform semantics that diverges from the JS produces silent
+disagreement between server and clients. Erik's question removed it: clients apply steps and
+materialise, the server orders, stores, broadcasts and authorizes. Server-side materialisation is
+needed only at checkpoints and publication, and his publication proposal removed even that - the
+publishing client renders to HTML and PDF, and the server sanitises what it receives with an
+allowlist rather than rendering from a document model. The correction to his proposal, accepted:
+the server sanitises rather than trusting the client's sanitisation, because under the threat
+boundary below the publisher is exactly the person whose paste may have carried something they
+never noticed. Published output is then served as a static file from a separate origin with no
+JavaScript.
+
+**Per-document keys.** Added to ADR-003 decision 5. Erik's requirement to purge whole documents
+was going to be met with a cleaner that deletes rows from backups - unreliable by construction, and
+the same mistake the original section 7 made. Instead each document has its own key, held in the
+key service and wrapped under the FAU key-encryption key, so purging a document is destroying one
+key and is provable everywhere including in existing backups. It also strengthens the granularity
+property: a compromised backend must now ask once per document rather than once per FAU, so reading
+an archive is loud in proportion to its size. In-document redaction remains a separate mechanism -
+rewriting the step log from a checkpoint - which makes step-log compaction a privacy control rather
+than only a performance one.
+
+**Tasks are rows that point into a document.** Erik's annual-event case settled the direction: a
+plan generates a task list for 2027 and a different one for 2028, so the document must not own
+either. The deeper reason is encryption - document bodies cannot be queried, by the same
+construction that rules out cross-FAU search, so anything the product must list across documents
+has to exist as an application row. Tasks carry an anchor into the passage they came from, using
+the same primitive as comment anchors: a position plus the version it was recorded at, mapped
+forward through the step log.
+
+**Document type and model version from the first migration.** The authority never interprets a
+step, so it is model-agnostic. Two columns now mean spreadsheets and presentations reuse the whole
+substrate - versioning, checkpoints, per-document keys, comments, anchors, permissions,
+publication, encryption - rather than forcing a second one. Erik confirmed ProseMirror was never
+intended to carry a spreadsheet; that will need its own editor and model, and is not being looked
+at yet.
+
+**Editor reversal recorded.** Tiptap OSS over ProseMirror replaces Lexical, superseding #3493 and
+the editor clause of #3415, both of which are Done. The deciding reason is collaboration:
+ProseMirror ships the model we are using with a decade of production behind it, where Lexical's
+collaboration story is Yjs-shaped. Supporting reasons, which did not decide it: ProseMirror's node
+extensibility is what decision blocks, action points and later document types need, and Erik
+prefers to avoid Meta-originated dependencies where a comparable alternative exists.
+
+**Import scope reduced.** MVP accepts HTML and pasted content; DOCX upload is deferred, which
+defers rather than drops the mammoth recommendation on #3447. Paste is the primary path and carries
+the same risk as upload, so normalisation runs on paste too. The normalisation layer sits inside
+#3447's pipeline rather than beside it, and one contradiction with the brief is resolved
+explicitly: images are re-encoded, never passed through.
+
+**Threat model boundary**, set by Erik and now in ADR-003: we defend against mistakes and casual
+misuse by people with legitimate access; we do not claim to withstand a determined attacker already
+inside, and we never describe the product as secure against one. It justifies server-side
+sanitisation of imported, pasted and published content, and scopes down adversarial hardening
+against authenticated members.
+
+**Consequences accepted and written down rather than discovered later.** Because the server does not
+replay steps, a client-submitted checkpoint could disagree with the step log; the checkpoint is
+authoritative for publication and recovery, the step log is history, and reconstructing history
+from scratch needs a browser. PDF export in the publisher's browser means the same document
+published by two people produces slightly different PDFs, so a published PDF is not a byte-stable
+archival record. And published output sits outside the encryption boundary by design, so
+crypto-shredding does not erase it - publication needs its own deletion path and its store must
+permit real deletes.
+
+Deferred: live presence and cursors, offline editing, track changes, DOCX and bulk import,
+spreadsheets and presentations, and the agent edit API. Full architecture in
+docs/structured-document-architecture.md, which replaces its 11 September version entirely.
+
+## #3490 accepted: the document and collaboration architecture is settled — 22 September 2026
+
+Erik accepted the architecture. docs/structured-document-architecture.md is the specification, and
+it replaces its 11 September version in full. The decisions are listed in the card's result block
+and in the section above; what matters for what happens next is which cards it unblocks and which
+constraints it imposes on the first line of code.
+
+**Binding on the first migration**, and expensive to change once data exists:
+
+- Documents carry a `type` and a `model_version`, so spreadsheets and presentations reuse the
+  substrate rather than forcing a second one.
+- Tasks - and anything else the product must list across documents - are application rows that
+  anchor into a document, never nodes buried inside an encrypted body. Encrypted bodies cannot be
+  queried, by the same construction that rules out cross-FAU search.
+- Each document has its own key, held in the key service and wrapped under the FAU
+  key-encryption key. No key material of any kind lands in an application table.
+
+**#3420 was closed the same day** and its surviving requirements moved into section 11 of the
+architecture. The one worth remembering is that authorization is re-evaluated on every accepted
+step batch rather than at connection establishment - the requirement that disappears silently when
+a lease model becomes a WebSocket model, because a socket authorized at handshake otherwise
+outlives the role that authorized it.
+
+**Implementation is now unblocked except for one thing.** #3416, #3419, #3421, #3422, #3491 and
+#3492 all have their architecture. The remaining gate on the first migration is #3439, still in
+Review with four unanswered questions: two of them add `account.locale` and `tenant.default_locale`
+to the schema, and a third - whether public pages carry a locale path prefix - binds routing. Those
+belong in the first migration rather than a follow-up.
+
+## Localisation settled, and ADR-003 accepted — 22 September 2026
+
+**ADR-003 accepted** on #3484 without further comment. Identity, encryption at rest, deletion and
+the recovery contact are now decided rather than proposed.
+
+**Localisation answered** on #3439, closing the last gate on the first migration. The mechanism
+proposed on 9 September was approved unchanged; what the answers settle is scope and two
+consequences.
+
+Nynorsk needs only the plumbing at MVP launch, so a translator is not on the critical path and no
+`nn-NO.json` ships, not even a stub. The URL strategy is the recommended split: an outer locale
+path prefix on public marketing pages, with the unprefixed path serving Bokmål so existing links
+never change, and cookie plus `Accept-Language` resolution inside the authenticated app. A third
+language is planned for - Erik named English or Sámi as possibilities. The translator round trip
+uses a spreadsheet rather than XLIFF, on the grounds that it needs no specialist tooling from
+whoever does the translation.
+
+**Two things recorded that the answers imply rather than state.**
+
+Per-school public pages (`example.no/kommune/skolenavn`) are neither marketing pages nor inside the
+app, so under this decision they resolve by cookie and `Accept-Language`. One URL then serves both
+languages and a Nynorsk school page is not separately indexable. Acceptable while Nynorsk does not
+exist, and reversible - but only if #3422 and #3423 keep an outer prefix cheap to add and #3441
+mints no municipality slug that collides with a locale code or ADR-001's reserved paths. Revisit
+when a real Nynorsk catalogue exists.
+
+Sámi is a separate language family rather than a written variety of Norwegian, and there are
+several - Northern, Lule and Southern among them. So the pipeline must not assume every target
+behaves like `nn-NO` does relative to `nb-NO`: plural rules, sorting and date formats differ more.
+The BCP 47 model and ICU MessageFormat already carry this; the constraint is that nothing
+downstream hard-codes two locales or assumes Latin-alphabet collation.
+
+**The first migration is now unblocked.** It carries `account.locale` (nullable, follows the person
+across FAU-er), `tenant.default_locale` (defaulting to `nb-NO`), and an optional
+`document.language` for the `lang` attribute when rendering - alongside the three items #3490
+binds: document `type` and `model_version`, tasks as anchored application rows, and no key material
+in any application table.
+
+## Clarification: "spreadsheets" meant the translator's file format — 22 September 2026
+
+Recorded because the ambiguity is preserved in this log and would otherwise be re-derived. Erik's
+"we start with spreadsheets" on #3439 answered that card's fourth question - whether the translator
+receives XLIFF or a spreadsheet - and not the document-type roadmap. Confirmed by him the same day:
+"since I was answering about translations to me spreadsheet could only mean that."
+
+**Spreadsheet documents are not in the MVP.** That is unchanged from the document architecture on
+#3490, which defers spreadsheets and presentations as document types needing their own editor and
+model while reusing the collaboration substrate. The two uses of the word met in the same
+conversation; they are unrelated.
+
+## S3 credentials rotated, and the upstream defect it exposed — 22 September 2026
+
+The leaked S3 credentials from #3489 are rotated. Erik created the new pair in the Hetzner Console,
+wrote it into `.credentials.tfvars` and `.backend.hcl` himself so the values never entered a
+transcript, and deleted the old pair. Stage 0 and stage 1 were re-initialised, planned and applied;
+all stages now plan clean.
+
+**What the out-of-order deletion actually cost.** Erik deleted the old pair before the node was
+updated, rather than after. The consequence was contained and dated: the 13:00 etcd snapshot upload
+failed - `readyToUse=false`, size 0 - while the local snapshot at the same minute succeeded. Off-node
+backup was down for roughly fifteen minutes. Nothing else was affected.
+
+**The deadlock this uncovered was not caused by the ordering**, and it is worth separating the two
+because the instinct was to assume otherwise. Replacing `null_resource.k3s_master_install` runs a
+destroy-time provisioner that calls `/root/backup-k3s-server.sh`, which begins `set -e` and runs
+`aws s3 cp`. The AWS CLI on master returned `NoCredentials` - not `InvalidAccessKeyId` - so it has
+never had credentials with any key pair. The module uploads three files and none of them configures
+the CLI; the S3 credentials it does place on the node go to the k3s service's `EnvironmentFile`,
+which a root shell never sees.
+
+So the script fails before `systemctl stop k3s`, the destroy provisioner fails, and Terraform cannot
+complete the replace - while the node's configuration is only rewritten by the *create* provisioner,
+which cannot run until destroy succeeds. Any replace of that resource would have deadlocked, in any
+order, with any keys, since the day the cluster was built. Written up in
+docs/infra-tools-backup-script-no-credentials-issue.md.
+
+**Resolution chosen by Erik: fix the credential availability rather than route around it.** The
+alternatives were removing the resource from state to skip the destroy provisioner, or hand-patching
+the node and accepting permanent `config_hash` drift. `/root/.aws/credentials` and `/root/.aws/config`
+were written on master, mode 0600, from `persistent_outputs.json`. The apply then completed normally
+and the destroy-time backup ran to completion - the first time it ever has. Those two files are
+outside Terraform's management and are now listed in CLAUDE.md's secret locations; they must be
+rewritten on any future rotation until the module is fixed.
+
+**Verified afterwards:** all three nodes Ready with zero pod restarts, a forced etcd snapshot
+uploaded with `readyToUse=true` on both the local and the S3 copy, and stages 0 and 1 plan clean.
+
+**Stage 2 was deliberately excluded.** Its plan shows five resources to add - cert-manager, its
+namespace, its ClusterIssuers, the empty Cloudflare token secret and the staging issuer - which is
+#3485's pending work sitting in the uncommitted 2-cluster source, not rotation drift. "Rerun
+everything" would have deployed cert-manager as a side effect. It remains unapplied.

@@ -33,4 +33,14 @@
 locals {
   # Hetzner CCM needs no DNS forwarding for FAU: there is no second cluster to reach.
   forward_dns_zones = {}
+
+  # ACME account address for Let's Encrypt registration. Erik's answer on #3485,
+  # 10 September 2026. Upstream sets its own address in this local; FAU sets ours.
+  certificate_email = "kontakt@ewb-solutions.as"
+
+  # Placeholder hostname for certificate work until the product domain is settled on
+  # #3434: a subdomain of a parked domain Erik holds at Domeneshop, pointing at lb-fau.
+  # Recorded here because the staging issuer exists for it; nothing user-facing may live
+  # under another product's domain.
+  placeholder_hostname = "fau-lab.bim.graphics"
 }

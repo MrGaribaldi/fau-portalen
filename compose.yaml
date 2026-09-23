@@ -1,0 +1,111 @@
+# The FAU application stack. The agent-box stack is /workspace/docker-compose.yml and
+# always needs -f; Compose prefers this file, so a bare `docker compose down` cannot
+# take down the container the work is happening in. That is deliberate.
+name: fau-app
+
+services:
+  db:
+    image: postgres:17.5-bookworm@sha256:2088c1744625793a8a89118d2dee63fb121139141ff0ff53bd72e63bb6089d0d
+    environment:
+      POSTGRES_DB: fau
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      # Passed through so the initdb scripts below (which run *inside* this
+      # container) can read the same local-development passwords the `migrate` and
+      # `app` services use to build their DATABASE_URLs, rather than a second,
+      # independently-drifting pair of defaults.
+      FAU_MIGRATE_PASSWORD: ${FAU_MIGRATE_PASSWORD:-fau_migrate}
+      FAU_APP_PASSWORD: ${FAU_APP_PASSWORD:-fau_app}
+    ports:
+      - "127.0.0.1:${FAU_DB_PORT:-5433}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # Bind mounts resolve on the HOST Docker daemon, not inside whatever container
+      # runs `docker compose` -- this agent container's own filesystem is irrelevant
+      # here. FAU_HOST_PATH is the repository's absolute path as the host sees it
+      # (set in .env on both the agent box and Erik's own machine); `.` is the
+      # fallback for a plain checkout where the compose command already runs with the
+      # repository root as its working directory. roles.sql and zz-compose-init.sh
+      # both run from here, in filename order -- see zz-compose-init.sh's own header
+      # for why it sorts after roles.sql.
+      - ${FAU_HOST_PATH:-.}/backend/db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d fau"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FAU_BUILD_REVISION: ${FAU_BUILD_REVISION:-dev}
+    image: fau/app:dev
+    command: ["migrate"]
+    environment:
+      MIGRATION_DATABASE_URL: postgres://fau_migrate:${FAU_MIGRATE_PASSWORD:-fau_migrate}@db:5432/fau
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      db:
+        condition: service_healthy
+    # A one-shot job: exits 0 on success and stays exited. `app`'s own
+    # `service_completed_successfully` dependency below is what gives that exit
+    # meaning, not a restart policy.
+    restart: "no"
+    # Same hardening as `app`: the runner only reads its embedded migrations and
+    # talks to the database, so it needs no writable filesystem beyond /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  app:
+    image: fau/app:dev
+    command: ["serve"]
+    environment:
+      APP_ENV: development
+      HTTP_BIND: 0.0.0.0:8000
+      PUBLIC_BASE_URL: http://localhost:${FAU_APP_PORT:-8000}
+      DATABASE_URL: postgres://fau_app:${FAU_APP_PASSWORD:-fau_app}@db:5432/fau
+      DB_POOL_MAX_CONNECTIONS: ${DB_POOL_MAX_CONNECTIONS:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MAIL_TRANSPORT: smtp://mail:1025
+      SIGNUP_NOTIFICATION_TO: fau-local@example.test
+    ports:
+      - "127.0.0.1:${FAU_APP_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      # No curl (and no other HTTP client) in the runtime stage -- `/dev/tcp` is a
+      # bash built-in, not a filesystem path, so this depends only on bash being
+      # present, which it is in debian:bookworm-slim (verified against the built
+      # image, 23 September 2026). `CMD-SHELL`'s default shell is `/bin/sh`, which on
+      # Debian is dash and does not understand `/dev/tcp` at all -- confirmed by
+      # running the redirection under `sh` in this exact image: dash tries to open a
+      # literal file named `/dev/tcp/127.0.0.1/8000` and fails with "cannot create
+      # /dev/tcp/127.0.0.1/8000: Directory nonexistent", rather than treating it as a
+      # socket -- so `bash -c` is invoked explicitly rather than relying on the
+      # image's default shell. Compose only needs to know the port answers 200, so
+      # the binary itself is never the probe's dependency.
+      test: ["CMD-SHELL", "bash -c \"exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '\""]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  mail:
+    # Local test adapter. No external delivery, by design (spec section 1).
+    image: axllent/mailpit:v1.20@sha256:7eef0f38dbc85e4e264f2edf5d70fbb694826791e05cb2cae4fc9e3282f968f5
+    ports:
+      - "127.0.0.1:${FAU_MAIL_PORT:-8025}:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+
+volumes:
+  db-data:

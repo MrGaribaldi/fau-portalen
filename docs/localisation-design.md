@@ -110,9 +110,12 @@ so it is displayed as stored.
 
 Agents must not write Nynorsk, and the translator will not have a checkout. Proposed round trip:
 
-1. A maintainer exports the Bokmål catalogue plus any existing target strings to one file
-   (XLIFF, or CSV if the translator prefers a spreadsheet), including the key, the Bokmål source,
-   a short context note per key, and a screen reference.
+1. A maintainer exports the Bokmål catalogue plus any existing target strings to **a spreadsheet**
+   - decided 22 September 2026 - including the key, the Bokmål source, a short context note per
+   key, and a screen reference. XLIFF was the alternative and was not chosen; a spreadsheet needs
+   no specialist tooling from the translator, which matters when the translator is a parent doing
+   this as a favour rather than a translation agency. The export format is an implementation
+   detail behind the same round trip, so XLIFF can be added later if an agency ever wants it.
 2. The translator fills in target strings and returns the file.
 3. A maintainer imports it, which regenerates `nn-NO.json`, and CI checks that every key parses
    as valid ICU and that no key is missing from `nb-NO`.
@@ -150,21 +153,45 @@ For the record, so the ADR can be updated in one pass:
   is therefore built and tested with the Bokmål catalogue as both source and target, so the
   pipeline is proven before a translator is engaged, without producing any Nynorsk text.
 
-## Decisions still needed
+## Decisions taken, 22 September 2026
 
-- **Nothing blocking.** The remaining questions are timing, not design:
-- **URL strategy for public pages**, decidable when the second locale actually arrives. A locale
-  path prefix (`/nn/`) is better for search visibility on the landing page (#3423); a cookie plus
-  `Accept-Language` is simpler for the authenticated app (#3422). Recommended: path prefix for
-  public marketing pages only, cookie inside the app. Nothing needs building now, but the
-  routing in #3422 and #3423 should not make a path prefix expensive to add later.
-- **Any third language to plan for**, so the pipeline is tested with more than one target before
-  it is assumed to generalise.
-- **Translator and format** — who does it, and whether they want XLIFF or a spreadsheet.
+All four open questions answered by Erik on #3439. Nothing about the mechanism changed; what
+changed is scope and two consequences.
+
+- **Nynorsk at launch: plumbing only.** Erik: "We only need the plumbing for nynorsk at MVP
+  launch." So the MVP deliverable is the mechanism plus a complete Bokmål catalogue, exactly as
+  the 9 September decision proposed, and a translator is **not** on the critical path for launch.
+  No `nn-NO.json` ships, not even a stub.
+- **URL strategy: path prefix on public marketing pages only, cookie inside the app.** The
+  recommendation was accepted as written. Public marketing and landing pages (#3423) take an outer
+  locale prefix - `/nn/...`, with the unprefixed path serving Bokmål so existing links never
+  change - while the authenticated application (#3422) resolves locale from the session switch,
+  the account, the tenant default, `Accept-Language`, and finally `nb-NO`.
+
+  **One consequence to note rather than decide now.** Per-school public pages
+  (`example.no/kommune/skolenavn`, from ADR-002) are neither marketing pages nor inside the app.
+  Under this decision they resolve by cookie and `Accept-Language`, which means one URL serves
+  both languages and a Nynorsk school page is not separately indexable. That is acceptable while
+  Nynorsk does not exist, and it is reversible: extending the outer prefix to those routes later
+  is cheap **provided** #3422 and #3423 keep it cheap, and #3441 does not mint a municipality slug
+  that collides with a locale code or with ADR-001's reserved `/app`, `/api/v1`, `/assets` and
+  `/health`. Revisit when a real Nynorsk catalogue exists and search visibility for school pages
+  matters.
+- **Plan for multiple languages, not just two.** Erik: a third language "might be English or Sami
+  dialect". Recorded with one correction that affects the design rather than the decision: Sámi is
+  a separate language family, not a written variety of Norwegian, and there are several - Northern
+  (`se`), Lule (`smj`) and Southern (`sma`) among them. So the pipeline must not assume that every
+  target behaves like `nn-NO` relative to `nb-NO`: plural rules, sorting and date formats differ
+  more than they do between the two Norwegian forms. The BCP 47 locale model and ICU
+  MessageFormat already carry this; the point is that nothing downstream may hard-code two
+  locales or assume Latin-alphabet collation.
+- **Translator format: a spreadsheet.** See the round trip above. No translation supplier, so no
+  addition to #3409.
 
 ## Not verified, not done
 
-No frontend framework is chosen yet (#3415), so the specific i18n library is left open on
-purpose; the constraints above (ICU catalogues, per-locale bundles, no display text from the
+The frontend direction is HTML/HTMX with an isolated React editor page running Tiptap over
+ProseMirror (#3415, #3493, #3490 - Lexical was superseded 22 September). The specific i18n library
+remains open; the constraints above (ICU catalogues, per-locale bundles, no display text from the
 API) are what the choice must satisfy. No Nynorsk text was written. No translation supplier was
 contacted. Nothing was implemented.

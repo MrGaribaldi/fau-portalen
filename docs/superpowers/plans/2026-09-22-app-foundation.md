@@ -36,16 +36,22 @@ reverse.
 | Base image digests | `rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec`, `debian:bookworm-slim@sha256:f3034a6ec3c1205360777c4aae76234998866ad18806ae62b63a3f84ccad782b` | Resolved from the registry 22 September 2026. Rust 1.98.1 matches the toolchain already in the agent box, so local `cargo test` and the image build agree. |
 | PostgreSQL patch version | `postgres:17.5-bookworm@sha256:2088c1744625793a8a89118d2dee63fb121139141ff0ff53bd72e63bb6089d0d` | Exactly the version infra-tools' `psql-cluster` module runs (`ghcr.io/cloudnative-pg/postgresql:17.5`). Matching the patch, not just the major, removes a class of "works locally" surprise. |
 | Static placeholder: binary or file | Embedded in the binary with `include_str!` | The runtime stage has a read-only root filesystem and readiness must not depend on the filesystem. One less failure mode, and #3422 replaces it wholesale anyway. |
-| `lock_timeout` value | 10 000 ms, overridable with `MIGRATION_LOCK_TIMEOUT_MS` | See "The advisory-lock nuance" below — this is not as simple as the spec line suggests. |
+| `lock_timeout` value | 10 000 ms, overridable with `MIGRATION_LOCK_TIMEOUT_MS` | See "The advisory-lock nuance" below (corrected 23 September 2026). |
 | Initial `schema_contract` minimum | 2 | The binary requires the identity and tenancy spine that `0002` creates. Declaring 1 would let it serve a database it cannot use. |
 
 ### The advisory-lock nuance
 
 The spec's test table says *"Migration lock held beyond the bound | Fails rather than hanging —
-`lock_timeout` is set on the migration connection."* PostgreSQL's `lock_timeout` does **not** apply
-to advisory locks; it bounds waits for table and row locks only. sqlx's migrator takes
-`pg_advisory_lock`, which would block indefinitely regardless of `lock_timeout`, so setting that
-one variable does not deliver the property the test asks for.
+`lock_timeout` is set on the migration connection."*
+
+> **Corrected 23 September 2026.** This section first claimed that `lock_timeout` does not apply to
+> advisory locks. That was wrong: the Task 4+5 review reproduced a `pg_advisory_lock` wait being
+> cancelled by `lock_timeout=500` after 0.52 s. `lock_timeout` alone would therefore bound sqlx's
+> own migration lock, and the spec line is literally true. The outer lock below is kept for a
+> different reason: the wait for another migrator and the DDL bound are different quantities.
+> Queueing behind a concurrent `migrate` may reasonably take 30 s; a migration holding table locks
+> against live traffic should give up after 10 s. One `lock_timeout` cannot express both, and the
+> outer lock also yields a named `LockUnavailable` error instead of a generic SQLSTATE 55P03.
 
 This plan therefore does both:
 

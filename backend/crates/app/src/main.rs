@@ -73,6 +73,8 @@ fn run(f: impl FnOnce() -> Result<(), StartupError>) -> ExitCode {
 enum StartupError {
     #[error("{0}")]
     Config(#[from] config::ConfigError),
+    #[error("{0}")]
+    Migrate(#[from] fau_persistence::MigrateError),
 }
 
 fn serve() -> Result<(), StartupError> {
@@ -81,6 +83,20 @@ fn serve() -> Result<(), StartupError> {
 }
 
 fn migrate() -> Result<(), StartupError> {
-    let _config = MigrateConfig::from_env()?;
-    todo!("migrate")
+    let config = MigrateConfig::from_env()?;
+
+    // `migrate` is a one-shot command, not a long-lived server, so a runtime built
+    // here -- rather than `#[tokio::main]` on `main` -- keeps `--version` and a
+    // future synchronous `serve` startup path free of one.
+    let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for `migrate`");
+    rt.block_on(async {
+        let settings = fau_persistence::MigrationSettings {
+            url: config.migration_database_url.expose().clone(),
+            lock_timeout_ms: config.lock_timeout_ms,
+            lock_wait_ms: config.lock_wait_ms,
+        };
+        fau_persistence::run_migrations(&settings).await
+    })?;
+
+    Ok(())
 }

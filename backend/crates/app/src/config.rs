@@ -230,10 +230,15 @@ fn is_loopback(host: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct MigrateConfig {
     pub migration_database_url: Secret<String>,
-    /// Bounds the DDL *inside* a migration -- a table lock held by a long-running
-    /// query. It does not bound the advisory lock; see `persistence::migrate`.
+    /// Bounds a single DDL statement's wait on a table lock held by live traffic --
+    /// short, because it protects production queries from a stuck migration. Also
+    /// bounds sqlx's own internal advisory lock as a backstop, which is exactly why
+    /// this cannot double as the run-level queueing wait below; see
+    /// `fau_persistence::migrate`'s module docs for why the two must differ.
     pub lock_timeout_ms: u64,
-    /// How long to wait for the outer advisory lock before giving up.
+    /// How long it is normal to queue behind another FAU migrator already running
+    /// (e.g. during a rolling deploy) before giving up on the outer lock -- long,
+    /// unlike `lock_timeout_ms` above.
     pub lock_wait_ms: u64,
 }
 
@@ -282,6 +287,26 @@ mod tests {
             text,
             "configuration variable DATABASE_URL is not a valid value"
         );
+    }
+
+    #[test]
+    fn migrate_config_lock_timeout_and_wait_default_to_10s_and_30s() {
+        // The only test in this binary that touches these three variable names, so
+        // mutating the process environment here cannot race another test reading
+        // the same names.
+        unsafe {
+            std::env::set_var("MIGRATION_DATABASE_URL", "postgres://u:p@127.0.0.1:1/none");
+            std::env::remove_var("MIGRATION_LOCK_TIMEOUT_MS");
+            std::env::remove_var("MIGRATION_LOCK_WAIT_MS");
+        }
+
+        let cfg = MigrateConfig::from_env().expect("valid minimal migrate config");
+        assert_eq!(cfg.lock_timeout_ms, 10_000);
+        assert_eq!(cfg.lock_wait_ms, 30_000);
+
+        unsafe {
+            std::env::remove_var("MIGRATION_DATABASE_URL");
+        }
     }
 
     #[test]

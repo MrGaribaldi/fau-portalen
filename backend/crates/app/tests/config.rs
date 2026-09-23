@@ -173,3 +173,62 @@ fn http_bind_and_log_level_have_defaults() {
     assert!(!text.contains("HTTP_BIND"), "output was: {text}");
     assert!(!text.contains("LOG_LEVEL"), "output was: {text}");
 }
+
+// The migration lock's bounds, ruling 7: MIGRATION_LOCK_TIMEOUT_MS and
+// MIGRATION_LOCK_WAIT_MS default when absent, and an invalid value is rejected by
+// variable name only. The database in MIGRATION_DATABASE_URL is deliberately
+// unreachable (127.0.0.1:1) in all three: config validation happens before any
+// connection attempt, so these never depend on the runner actually connecting.
+
+#[test]
+fn migrate_lock_timeout_and_wait_have_defaults() {
+    let out = fau_with(
+        &[("MIGRATION_DATABASE_URL", "postgres://u:p@127.0.0.1:1/none")],
+        "migrate",
+    );
+    let text = combined(&out);
+    assert!(
+        !text.contains("MIGRATION_LOCK_TIMEOUT_MS"),
+        "output was: {text}"
+    );
+    assert!(
+        !text.contains("MIGRATION_LOCK_WAIT_MS"),
+        "output was: {text}"
+    );
+}
+
+#[test]
+fn migrate_rejects_an_invalid_lock_timeout_without_echoing_it() {
+    let out = fau_with(
+        &[
+            ("MIGRATION_DATABASE_URL", "postgres://u:p@127.0.0.1:1/none"),
+            ("MIGRATION_LOCK_TIMEOUT_MS", "banana-sentinel"),
+        ],
+        "migrate",
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("MIGRATION_LOCK_TIMEOUT_MS"),
+        "output was: {text}"
+    );
+    assert!(!text.contains("banana-sentinel"), "value leaked: {text}");
+}
+
+#[test]
+fn migrate_rejects_an_invalid_lock_wait_without_echoing_it() {
+    let out = fau_with(
+        &[
+            ("MIGRATION_DATABASE_URL", "postgres://u:p@127.0.0.1:1/none"),
+            ("MIGRATION_LOCK_WAIT_MS", "banana-sentinel"),
+        ],
+        "migrate",
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("MIGRATION_LOCK_WAIT_MS"),
+        "output was: {text}"
+    );
+    assert!(!text.contains("banana-sentinel"), "value leaked: {text}");
+}

@@ -39,6 +39,20 @@ const TEMPLATE_PREFIX: &str = "fau_test_tpl_";
 /// every process across every test binary must pick the same key to contend on.
 const TEMPLATE_LOCK: i64 = 0x0FA0_0001;
 
+/// Session-level advisory lock id guarding `apply_roles`. `CREATE ROLE` and `ALTER
+/// ROLE` touch the shared, cluster-wide `pg_authid` catalog, and PostgreSQL's update
+/// path for shared catalogs can raise "tuple concurrently updated" when two sessions
+/// modify the same row at the same moment -- observed running the migration tests
+/// with several `TestDb::fresh()` databases in parallel, each calling `apply_roles`.
+///
+/// Unlike `pg_authid` itself, **advisory locks are scoped to the session's current
+/// database, not the cluster** (confirmed empirically: two sessions connected to
+/// different databases do not contend for the same key). So this only serialises
+/// callers that acquire it while connected to the *same* database -- which is why
+/// [`apply_roles_sql`] always takes it on a connection to [`admin_url`]'s database,
+/// never on a connection to the per-test database it is about to modify.
+const ROLES_LOCK: i64 = 0x0FA0_0002;
+
 /// `roles.sql`'s contents, embedded at compile time -- both applied to the template
 /// and folded into [`template_name`]'s content hash.
 const ROLES_SQL: &str = include_str!("../../../../db/roles.sql");
@@ -61,6 +75,16 @@ pub async fn admin_pool() -> PgPool {
 /// host and port.
 fn with_database(base: &str, db_name: &str) -> String {
     let mut url = url::Url::parse(base).expect("TEST_DATABASE_URL must be a valid postgres URL");
+    url.set_path(&format!("/{db_name}"));
+    url.to_string()
+}
+
+/// Returns `base` pointed at `db_name`, with `role` as both username and password --
+/// the harness-wide convention that `apply_roles` establishes on the database side.
+fn role_url(base: &str, db_name: &str, role: &str) -> String {
+    let mut url = url::Url::parse(base).expect("valid postgres URL");
+    let _ = url.set_username(role);
+    let _ = url.set_password(Some(role));
     url.set_path(&format!("/{db_name}"));
     url.to_string()
 }
@@ -145,6 +169,17 @@ impl TestDb {
         .execute(&pool)
         .await
         .expect("create test database from template");
+
+        // `create database ... template ...` copies the template's schema-level
+        // ACLs (pg_namespace/pg_class -- per-database catalogs) but *not* its
+        // database-level ACL (pg_database.datacl, a shared/cluster catalog): the
+        // clone gets a fresh, default ACL no matter what roles.sql set on the
+        // template. Without reapplying it here, a cloned database would silently
+        // regain PUBLIC's default TEMPORARY privilege that roles.sql revokes --
+        // found by a schema-review test that expected `fau_app` to lack it and
+        // didn't.
+        apply_roles_sql(&with_database(&admin_url(), &name)).await;
+
         Self {
             name,
             admin_url: admin_url(),
@@ -167,11 +202,7 @@ impl TestDb {
     }
 
     fn role_url(&self, role: &str) -> String {
-        let mut url = url::Url::parse(&self.admin_url).expect("valid postgres URL");
-        let _ = url.set_username(role);
-        let _ = url.set_password(Some(role));
-        url.set_path(&format!("/{}", self.name));
-        url.to_string()
+        role_url(&self.admin_url, &self.name, role)
     }
 
     /// A superuser pool for this database, for assertions and direct SQL. Lazy: no
@@ -180,6 +211,16 @@ impl TestDb {
     pub fn admin_pool(&self) -> PgPool {
         let url = with_database(&self.admin_url, &self.name);
         PgPool::connect_lazy(&url).expect("build lazy admin pool")
+    }
+
+    /// A pool connected as the runtime role `fau_app` to this database.
+    /// `apply_roles` -- called directly, or already applied while the migrated
+    /// template was built -- must have run first, or the role has no password to
+    /// connect with.
+    pub async fn app_pool(&self) -> PgPool {
+        PgPool::connect(&self.url())
+            .await
+            .expect("connect as fau_app")
     }
 }
 
@@ -290,7 +331,7 @@ async fn build_template(conn: &mut PgConnection, name: &str) {
         .await
         .expect("create template-build database");
 
-    apply_roles_and_migrations(&with_database(&admin_url(), &building)).await;
+    apply_roles_and_migrations(&admin_url(), &building).await;
 
     sqlx::query(&format!(
         r#"alter database "{building}" rename to "{name}""#
@@ -323,29 +364,159 @@ async fn cleanup_old_templates(conn: &mut PgConnection, keep: &str) {
     }
 }
 
-/// Prepares the migrated template: applies `roles.sql` as superuser, then runs
-/// pending migrations. Closes its own pool before returning -- `create database ...
-/// template ...` fails while any session is still connected to the template, so this
-/// cannot rely on drop order.
-async fn apply_roles_and_migrations(url: &str) {
-    let pool = PgPool::connect(url)
+/// Prepares the migrated template: applies `roles.sql` and grants login as
+/// superuser, then runs pending migrations as `fau_migrate`. Closes its own pool
+/// before returning -- `create database ... template ...` fails while any session is
+/// still connected to the template, so this cannot rely on drop order.
+async fn apply_roles_and_migrations(admin_base: &str, db_name: &str) {
+    apply_roles_sql(&with_database(admin_base, db_name)).await;
+
+    let migration_url = role_url(admin_base, db_name, "fau_migrate");
+    run_pending_migrations(&migration_url).await;
+}
+
+/// Runs `roles.sql` (idempotent under a race -- see the file itself) then grants
+/// both roles `login` with a password equal to the role name, the convention
+/// `role_url` assumes. A test-only convenience: production grants login out of
+/// band, never through this file.
+///
+/// Holds [`ROLES_LOCK`] on a pinned connection to [`admin_url`]'s database for the
+/// whole critical section, while the actual `roles.sql` and `alter role` statements
+/// run on a second connection to `url` -- the database whose privileges are being
+/// set up. Two connections, not one, because the lock must be acquired on a
+/// database every caller shares, and `url` is a different database every time.
+async fn apply_roles_sql(url: &str) {
+    let mut lock_conn = PgConnection::connect(&admin_url())
         .await
-        .expect("connect to template database");
+        .expect("connect to hold the roles advisory lock");
+
+    sqlx::query("select pg_advisory_lock($1)")
+        .bind(ROLES_LOCK)
+        .execute(&mut lock_conn)
+        .await
+        .expect("acquire the roles advisory lock");
+
+    let mut conn = PgConnection::connect(url)
+        .await
+        .expect("connect to apply roles.sql");
 
     sqlx::raw_sql(ROLES_SQL)
-        .execute(&pool)
+        .execute(&mut conn)
         .await
         .expect("apply roles.sql");
 
-    run_pending_migrations(url).await;
+    for role in ["fau_app", "fau_migrate"] {
+        sqlx::query(&format!("alter role {role} login password '{role}'"))
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("grant login to role {role}: {e}"));
+    }
 
-    pool.close().await;
+    // Closed before releasing the lock, not after: the whole point is that no other
+    // session may run these statements while this one still could be.
+    conn.close()
+        .await
+        .expect("close connection after applying roles.sql");
+
+    let unlocked: bool = sqlx::query_scalar("select pg_advisory_unlock($1)")
+        .bind(ROLES_LOCK)
+        .fetch_one(&mut lock_conn)
+        .await
+        .expect("release the roles advisory lock");
+    assert!(
+        unlocked,
+        "roles advisory lock was not held by this session -- something is wrong with \
+         lock accounting, not with the roles themselves"
+    );
+    lock_conn
+        .close()
+        .await
+        .expect("close the roles-lock connection");
 }
 
-/// Applies pending migrations to `migration_url`. Not implemented yet: `fau migrate`
-/// currently ends in `todo!()` (see `crates/app/src/main.rs`), so invoking the binary
-/// here would only panic. Task 4, which builds the migration runner, replaces this
-/// body with a `Command::new(env!("CARGO_BIN_EXE_fau"))` run of `migrate` against
-/// `MIGRATION_DATABASE_URL = migration_url`. Nothing exercises `TestDb::migrated()`
-/// before then.
-async fn run_pending_migrations(_migration_url: &str) {}
+/// Applies `roles.sql` to `db`'s own database as superuser, then grants both roles
+/// `login`. Needed before running `fau migrate` (or connecting as `fau_app`) against
+/// a database that was not built from the migrated template, e.g. `TestDb::fresh()`.
+/// Idempotent, so calling it again on an already-prepared database is harmless.
+pub async fn apply_roles(db: &TestDb) {
+    apply_roles_sql(&with_database(&db.admin_url, &db.name)).await;
+}
+
+/// Runs `fau migrate` against `migration_url` (the `fau_migrate` DSN for the
+/// database being prepared) and panics on failure. Used only while building the
+/// migrated template, where a failure means the template itself is broken and every
+/// test that would use it must not silently proceed.
+async fn run_pending_migrations(migration_url: &str) {
+    let out = fau_command("migrate", &[("MIGRATION_DATABASE_URL", migration_url)])
+        .output()
+        .await
+        .expect("run fau migrate while building the template");
+    assert!(
+        out.status.success(),
+        "fau migrate failed while building the template: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `Command` for the `fau` binary under test, with a clean environment (`PATH`
+/// only) plus `env`, so no ambient variable from the harness's own process leaks
+/// into what is meant to be an isolated run.
+fn fau_command(subcommand: &str, env: &[(&str, &str)]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fau"));
+    cmd.arg(subcommand)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
+/// Runs `fau migrate` against `db`'s `fau_migrate` URL and returns the process
+/// output. Requires `apply_roles(db)` (or an already-migrated template) to have run
+/// first, since the role must exist and accept the harness's test password.
+pub async fn run_fau_migrate(db: &TestDb) -> std::process::Output {
+    run_fau_migrate_with(db, &[]).await
+}
+
+/// As [`run_fau_migrate`], with extra environment variables layered on top of the
+/// runner's defaults -- e.g. a short `MIGRATION_LOCK_WAIT_MS` for the bounded-lock
+/// test.
+pub async fn run_fau_migrate_with(db: &TestDb, extra_env: &[(&str, &str)]) -> std::process::Output {
+    let migration_url = db.migration_url();
+    let mut cmd = fau_command(
+        "migrate",
+        &[("MIGRATION_DATABASE_URL", migration_url.as_str())],
+    );
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.output().await.expect("run fau migrate")
+}
+
+/// Runs `fau serve` against `db`'s `fau_app` URL and waits for it to exit, bounded by
+/// a timeout. `serve` currently ends in `todo!()` right after loading its
+/// configuration, so this observes a failure today either way -- the point of the
+/// test that uses it is only that no schema object appears, not the exit code.
+pub async fn start_serve_expecting_failure(db: &TestDb) -> std::process::Output {
+    let database_url = db.url();
+    let mut cmd = fau_command(
+        "serve",
+        &[
+            ("APP_ENV", "test"),
+            ("HTTP_BIND", "127.0.0.1:0"),
+            ("PUBLIC_BASE_URL", "http://localhost:8000"),
+            ("DATABASE_URL", database_url.as_str()),
+            ("DB_POOL_MAX_CONNECTIONS", "5"),
+            ("LOG_LEVEL", "info"),
+        ],
+    );
+    // The `output()` future is wrapped in a timeout below and may be dropped before
+    // the child exits; without this, dropping it would orphan the process instead
+    // of killing it.
+    cmd.kill_on_drop(true);
+    tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .expect("fau serve did not exit within the timeout")
+        .expect("run fau serve")
+}

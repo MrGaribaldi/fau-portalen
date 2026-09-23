@@ -12,7 +12,10 @@ mod sql;
 mod token;
 
 pub use error::{ExistingFau, MembershipError};
-pub use invitations::IssuedInvitation;
+pub use invitations::{
+    accept_invitation, issue_invitation, resend_invitation, withdraw_invitation, AcceptInvitation,
+    Accepted, InvitationChange, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,
+};
 pub use signup::{
     activate_tenant, create_pending_tenant, expire_pending_tenants, Activated, Activation,
     PendingSignup, PendingTenant,

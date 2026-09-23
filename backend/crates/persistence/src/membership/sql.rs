@@ -10,8 +10,10 @@
 //! timestamps always come from the caller's `Moment`, never from SQL `now()`, so a test
 //! can move time.
 
+use fau_domain::membership::access::{tenant_has_admin, AssignmentView, GrantView};
 use fau_domain::membership::period::Period;
-use fau_domain::membership::vocabulary::TenantStatus;
+use fau_domain::membership::rules::{recent_holder_window_start, EWB_OVERSIGHT_ADDRESS};
+use fau_domain::membership::vocabulary::{CapabilityClass, TenantStatus};
 use fau_domain::time::Moment;
 use jiff::civil::Date;
 use jiff::Timestamp;
@@ -20,6 +22,13 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::error::MembershipError;
+
+/// The condition every "usable membership" query shares: the membership itself is not
+/// revoked, and the account behind it is verified and not disabled. Kept in one place
+/// so every query that filters on it agrees -- the handover-grant queries once drifted
+/// from the role-assignment ones by omitting the verified check.
+const USABLE_ACCOUNT: &str =
+    "m.revoked_at is null and a.disabled_at is null and a.verified_at is not null";
 
 pub(crate) fn date_param(d: Date) -> String {
     d.to_string()
@@ -65,6 +74,7 @@ pub(crate) async fn lock_tenant(
 /// Who performed an audited action. Matches `audit_events.actor_kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActorKind {
+    Member,
     System,
     Registrant,
 }
@@ -72,6 +82,7 @@ pub(crate) enum ActorKind {
 impl ActorKind {
     fn code(self) -> &'static str {
         match self {
+            ActorKind::Member => "member",
             ActorKind::System => "system",
             ActorKind::Registrant => "registrant",
         }
@@ -92,6 +103,27 @@ pub(crate) struct Audit {
 }
 
 impl Audit {
+    /// An entry by a member acting through their membership.
+    pub(crate) fn member(
+        tenant_id: Uuid,
+        membership_id: Uuid,
+        action: &'static str,
+        subject_type: &'static str,
+        subject_id: Uuid,
+        params: Value,
+    ) -> Self {
+        Self {
+            tenant_id: Some(tenant_id),
+            actor_kind: ActorKind::Member,
+            actor_account_id: None,
+            actor_membership_id: Some(membership_id),
+            action,
+            subject_type,
+            subject_id,
+            params,
+        }
+    }
+
     /// An entry written by a scheduled sweep rather than a person.
     pub(crate) fn system(
         tenant_id: Uuid,
@@ -240,4 +272,259 @@ pub(crate) async fn insert_assignment(
     .execute(&mut *conn)
     .await?;
     Ok(id)
+}
+
+pub(crate) fn period_from(starts: &str, ends: &str) -> Result<Period, MembershipError> {
+    Period::new(parse_date(starts)?, parse_date(ends)?).map_err(|_| MembershipError::decode())
+}
+
+/// Active and not frozen: the state in which invitations and requests may be created.
+pub(crate) fn require_open(state: &TenantState) -> Result<(), MembershipError> {
+    if state.status != TenantStatus::Active {
+        return Err(MembershipError::TenantNotActive);
+    }
+    if state.frozen {
+        return Err(MembershipError::TenantFrozen);
+    }
+    Ok(())
+}
+
+/// Whether `membership_id` holds an admin-class role valid today, through a membership
+/// that is not revoked and an account that is verified and not disabled.
+pub(crate) async fn is_admin_today(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    today: Date,
+) -> Result<bool, MembershipError> {
+    let sql = format!(
+        "select exists (
+           select 1
+             from memberships m
+             join accounts a          on a.id = m.account_id
+             join role_assignments ra on ra.tenant_id = m.tenant_id and ra.membership_id = m.id
+             join roles r             on r.tenant_id = ra.tenant_id and r.id = ra.role_id
+            where m.tenant_id = $1 and m.id = $2
+              and {USABLE_ACCOUNT}
+              and ra.revoked_at is null and r.capability_class = 'admin'
+              and ra.starts_on <= $3::date and ra.ends_on_exclusive > $3::date)"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(tenant_id)
+        .bind(membership_id)
+        .bind(date_param(today))
+        .fetch_one(&mut *conn)
+        .await?)
+}
+
+pub(crate) async fn require_admin(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    today: Date,
+) -> Result<(), MembershipError> {
+    if is_admin_today(conn, tenant_id, membership_id, today).await? {
+        Ok(())
+    } else {
+        Err(MembershipError::NotAuthorized)
+    }
+}
+
+/// Whether the membership is not revoked and its account is verified and not disabled.
+pub(crate) async fn membership_usable(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+) -> Result<bool, MembershipError> {
+    let sql = format!(
+        "select exists (
+           select 1 from memberships m join accounts a on a.id = m.account_id
+            where m.tenant_id = $1 and m.id = $2
+              and {USABLE_ACCOUNT})"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(tenant_id)
+        .bind(membership_id)
+        .fetch_one(&mut *conn)
+        .await?)
+}
+
+/// The account address behind a usable membership, or `None`.
+pub(crate) async fn usable_member_email(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+) -> Result<Option<String>, MembershipError> {
+    let sql = format!(
+        "select a.email from memberships m join accounts a on a.id = m.account_id
+          where m.tenant_id = $1 and m.id = $2
+            and {USABLE_ACCOUNT}"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(tenant_id)
+        .bind(membership_id)
+        .fetch_optional(&mut *conn)
+        .await?)
+}
+
+/// Whether `grant_id` is valid today and still belongs to `membership_id`, through a
+/// membership that is not revoked and an account that is not disabled (spec 6.3).
+pub(crate) async fn handover_grant_valid(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    grant_id: Uuid,
+    membership_id: Uuid,
+    today: Date,
+) -> Result<bool, MembershipError> {
+    let sql = format!(
+        "select exists (
+           select 1
+             from handover_grants g
+             join role_assignments ra on ra.tenant_id = g.tenant_id and ra.id = g.source_assignment_id
+             join memberships m       on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
+             join accounts a          on a.id = m.account_id
+            where g.tenant_id = $1 and g.id = $2 and ra.membership_id = $3
+              and g.revoked_at is null
+              and g.starts_on <= $4::date and g.ends_on_exclusive > $4::date
+              and {USABLE_ACCOUNT})"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(tenant_id)
+        .bind(grant_id)
+        .bind(membership_id)
+        .bind(date_param(today))
+        .fetch_one(&mut *conn)
+        .await?)
+}
+
+/// Every admin-class assignment and handover grant held through a usable membership:
+/// the inputs to the no-admin predicate (spec 6.4).
+pub(crate) struct AdminState {
+    assignments: Vec<AssignmentView>,
+    grants: Vec<GrantView>,
+}
+
+impl AdminState {
+    pub(crate) async fn load(
+        conn: &mut PgConnection,
+        tenant_id: Uuid,
+    ) -> Result<Self, MembershipError> {
+        let assignments_sql = format!(
+            "select to_char(ra.starts_on, 'YYYY-MM-DD'), to_char(ra.ends_on_exclusive, 'YYYY-MM-DD'),
+                    ra.revoked_at is not null
+               from role_assignments ra
+               join roles r       on r.tenant_id = ra.tenant_id and r.id = ra.role_id
+               join memberships m on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
+               join accounts a    on a.id = m.account_id
+              where ra.tenant_id = $1 and r.capability_class = 'admin'
+                and {USABLE_ACCOUNT}"
+        );
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(&assignments_sql)
+            .bind(tenant_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        let mut assignments = Vec::with_capacity(rows.len());
+        for (starts, ends, revoked) in rows {
+            assignments.push(AssignmentView {
+                capability: CapabilityClass::Admin,
+                period: period_from(&starts, &ends)?,
+                revoked,
+            });
+        }
+
+        let grants_sql = format!(
+            "select to_char(g.starts_on, 'YYYY-MM-DD'), to_char(g.ends_on_exclusive, 'YYYY-MM-DD'),
+                    g.revoked_at is not null
+               from handover_grants g
+               join role_assignments ra on ra.tenant_id = g.tenant_id and ra.id = g.source_assignment_id
+               join memberships m       on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
+               join accounts a          on a.id = m.account_id
+              where g.tenant_id = $1 and {USABLE_ACCOUNT}"
+        );
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(&grants_sql)
+            .bind(tenant_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        let mut grants = Vec::with_capacity(rows.len());
+        for (starts, ends, revoked) in rows {
+            grants.push(GrantView {
+                period: period_from(&starts, &ends)?,
+                revoked,
+            });
+        }
+        Ok(Self {
+            assignments,
+            grants,
+        })
+    }
+
+    pub(crate) fn has_admin(&self, today: Date) -> bool {
+        tenant_has_admin(&self.assignments, &self.grants, today)
+    }
+}
+
+/// Addresses of every current member: a usable membership with any role valid today.
+pub(crate) async fn current_member_emails(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    today: Date,
+) -> Result<Vec<String>, MembershipError> {
+    member_emails(conn, tenant_id, today, false).await
+}
+
+async fn member_emails(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    today: Date,
+    admins_only: bool,
+) -> Result<Vec<String>, MembershipError> {
+    Ok(sqlx::query_scalar(
+        "select distinct a.email
+           from memberships m
+           join accounts a          on a.id = m.account_id
+           join role_assignments ra on ra.tenant_id = m.tenant_id and ra.membership_id = m.id
+           join roles r             on r.tenant_id = ra.tenant_id and r.id = ra.role_id
+          where m.tenant_id = $1
+            and m.revoked_at is null and a.disabled_at is null and a.verified_at is not null
+            and ra.revoked_at is null
+            and ra.starts_on <= $2::date and ra.ends_on_exclusive > $2::date
+            and ($3 = false or r.capability_class = 'admin')
+          order by a.email",
+    )
+    .bind(tenant_id)
+    .bind(date_param(today))
+    .bind(admins_only)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// Recovery notices (spec 6.4.4, ADR-003 decision 10): every current member; when none
+/// remain, everyone who held a role in the past 24 months. EWB is always added, as the
+/// notified second party for every recovery on every FAU (ADR-003 decision 8).
+pub(crate) async fn recovery_notice_recipients(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    today: Date,
+) -> Result<Vec<String>, MembershipError> {
+    let mut recipients = current_member_emails(conn, tenant_id, today).await?;
+    if recipients.is_empty() {
+        recipients = sqlx::query_scalar(
+            "select distinct a.email
+               from role_assignments ra
+               join memberships m on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
+               join accounts a    on a.id = m.account_id
+              where ra.tenant_id = $1 and a.disabled_at is null
+                and ra.starts_on <= $2::date and ra.ends_on_exclusive > $3::date
+              order by a.email",
+        )
+        .bind(tenant_id)
+        .bind(date_param(today))
+        .bind(date_param(recent_holder_window_start(today)))
+        .fetch_all(&mut *conn)
+        .await?;
+    }
+    if !recipients.iter().any(|e| e == EWB_OVERSIGHT_ADDRESS) {
+        recipients.push(EWB_OVERSIGHT_ADDRESS.to_owned());
+    }
+    Ok(recipients)
 }

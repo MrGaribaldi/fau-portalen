@@ -33,8 +33,10 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-# Test-only: dates for the membership fixtures.
+# Test-only: dates for the membership fixtures, and an independent SHA-256 to check
+# that invitations store the token's hash and never the token.
 jiff = { workspace = true }
+sha2 = { workspace = true }
 # Test-only HTTP client for the integration-test harness (`ServeHandle`). rustls,
 # no default features: no reliance on the platform's native TLS stack, matching the
 # app's own `sqlx` TLS backend.

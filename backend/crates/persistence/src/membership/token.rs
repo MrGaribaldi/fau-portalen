@@ -41,6 +41,15 @@ pub(crate) fn hash_token(raw: &str) -> Vec<u8> {
     Sha256::digest(raw.as_bytes()).to_vec()
 }
 
+/// Whether `raw` has the shape of a token this module generates. Anything else is
+/// rejected before a database lookup.
+pub(crate) fn looks_like_token(raw: &str) -> bool {
+    raw.len() == 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,11 +58,7 @@ mod tests {
     fn tokens_are_64_lowercase_hex_characters_and_unique() {
         let a = InvitationToken::generate().unwrap();
         let b = InvitationToken::generate().unwrap();
-        let hex = a.expose();
-        assert_eq!(hex.len(), 64);
-        assert!(hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(looks_like_token(a.expose()), "{}", a.expose().len());
         assert_ne!(a.expose(), b.expose());
     }
 
@@ -77,5 +82,13 @@ mod tests {
         let debug = format!("{t:?}");
         assert_eq!(debug, "InvitationToken([redacted])");
         assert!(!debug.contains(t.expose()));
+    }
+
+    #[test]
+    fn malformed_tokens_are_recognised() {
+        assert!(!looks_like_token(""));
+        assert!(!looks_like_token(&"A".repeat(64)), "upper case is not ours");
+        assert!(!looks_like_token(&"a".repeat(63)));
+        assert!(looks_like_token(&"a".repeat(64)));
     }
 }

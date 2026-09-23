@@ -4,10 +4,11 @@
 use fau_domain::email::{Email, VerifiedEmail};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::rules::default_admin_end;
-use fau_domain::membership::vocabulary::FauName;
+use fau_domain::membership::vocabulary::{CapabilityClass, FauName, RoleName};
 use fau_domain::time::Moment;
 use fau_persistence::membership::{
-    activate_tenant, create_pending_tenant, Activation, PendingSignup,
+    accept_invitation, activate_tenant, create_pending_tenant, issue_invitation, AcceptInvitation,
+    Accepted, Activation, IssueInvitation, OfferedRole, PendingSignup, RoleChoice,
 };
 use jiff::civil::Date;
 use sqlx::PgPool;
@@ -78,6 +79,48 @@ pub async fn active_fau(pool: &PgPool, registrant: &str, at: Moment) -> Fau {
         admin_role_id: activated.admin_role_id,
         admin_assignment_id: activated.admin_assignment_id,
     }
+}
+
+pub fn new_role(name: &str, capability: CapabilityClass) -> RoleChoice {
+    RoleChoice::New {
+        name: RoleName::parse(name).unwrap(),
+        capability,
+    }
+}
+
+/// The FAU's admin invites `address` to one role, and `address` accepts.
+pub async fn add_member(
+    pool: &PgPool,
+    fau: &Fau,
+    address: &str,
+    role: RoleChoice,
+    period: Period,
+    at: Moment,
+) -> Accepted {
+    let issued = issue_invitation(
+        pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            recipient: email(address),
+            roles: vec![OfferedRole { role, period }],
+            handover_grant_id: None,
+        },
+        at,
+    )
+    .await
+    .expect("issue");
+    accept_invitation(
+        pool,
+        AcceptInvitation {
+            token: issued.token.expose().to_owned(),
+            acceptor: verified(address),
+            admin_end_override: None,
+        },
+        at,
+    )
+    .await
+    .expect("accept")
 }
 
 pub async fn count(pool: &PgPool, sql: &str) -> i64 {

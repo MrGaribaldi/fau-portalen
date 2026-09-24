@@ -2546,3 +2546,22 @@ made these rulings on Erik's behalf:
   search plan must then return no rows rather than run the match.
 - **`primary_nace` picks the priority-1 NACE code.** It is tested on a combined school, since 50
   combined schools depend on it.
+
+## FAU contact e-mail: fetched live by outreach, never stored in the product (#3441, #3431) — 24 September 2026
+
+Erik wants to contact FAU-er registered in Brreg and invite them to FAU-portalen. He decided on
+24 September:
+- **The product stores only the FAU's organisation number.** `registered_faus.orgnr` is the key,
+  so the Brreg record can always be retrieved again. `fau register export` lists the linked FAU's
+  orgnr for each school.
+- **The contact e-mail is fetched live from Brreg by the outreach tooling (#3431), at send
+  time,** and kept there under #3426/#3427's retention. It never goes into the product database,
+  and the register's source parser never reads Brreg's `epostadresse`, `mobil` or `telefon`
+  fields.
+- **Why:** Brreg's FAU e-mail is often a parent's private address. Two of nine sampled records
+  had a private Gmail or Hotmail address. Keeping it out upholds "the register holds nothing about
+  individuals", and keeps parents' addresses out of every product backup.
+- **Still required before any mail is sent:** Erik's authorisation of outreach, and the legal
+  check on #3427. Markedsføringsloven §15 generally forbids unsolicited marketing e-mail to natural
+  persons without consent. Whether a private address registered for an FAU (a legal person)
+  counts as a natural person's is exactly the question that check must answer.

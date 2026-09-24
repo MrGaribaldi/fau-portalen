@@ -39,6 +39,17 @@ struct ListDto {
     enhet_liste: Vec<ListItemDto>,
 }
 
+/// The municipality list (`/v4/enheter/kommune/{nr}`), unlike `/v4/enheter`, carries no paging
+/// fields at all, so their absence there is normal and must not be an error.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PagedListDto {
+    sidenummer: u32,
+    antall_sider: u32,
+    totalt_antall_enheter: u32,
+    enhet_liste: Vec<ListItemDto>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ListItemDto {
@@ -51,6 +62,9 @@ struct ListItemDto {
     dato_endret: Option<String>,
 }
 
+// `Option<…>` fields below (Maalform, Utgaattype, the addresses, and so on) are optional
+// attributes, which serde treats as absent when missing; that is accepted because they do not
+// decide scope, unlike ErPrivatskole, Skolekategorier and Naeringskoder just below.
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct UnitDto {
@@ -60,11 +74,8 @@ struct UnitDto {
     er_aktiv: bool,
     er_skole: bool,
     er_grunnskole: bool,
-    #[serde(default)]
     er_privatskole: bool,
-    #[serde(default)]
     skolekategorier: Vec<IdDto>,
-    #[serde(default)]
     naeringskoder: Vec<NaceDto>,
     #[serde(rename = "SkoletrinnGSFra")]
     skoletrinn_gs_fra: Option<i16>,
@@ -131,11 +142,8 @@ fn address(a: Option<AddressDto>) -> NsrAddress {
     }
 }
 
-pub fn parse_list_page(bytes: &[u8]) -> Result<NsrListPage, SourceError> {
-    let dto: ListDto =
-        serde_json::from_slice(bytes).map_err(|e| SourceError::parse(Source::Nsr, &e))?;
-    let units = dto
-        .enhet_liste
+fn list_items(items: Vec<ListItemDto>) -> Result<Vec<NsrListItem>, SourceError> {
+    items
         .into_iter()
         .map(|u| {
             Ok(NsrListItem {
@@ -148,12 +156,37 @@ pub fn parse_list_page(bytes: &[u8]) -> Result<NsrListPage, SourceError> {
                 changed_at: timestamp(u.dato_endret, "DatoEndret")?,
             })
         })
-        .collect::<Result<Vec<_>, SourceError>>()?;
+        .collect()
+}
+
+/// Parses `/v4/enheter/kommune/{nr}`, which carries no paging fields at all (unlike
+/// `/v4/enheter`): a municipality's whole list comes back in one `EnhetListe`, so `Sidenummer`,
+/// `AntallSider` and `TotaltAntallEnheter` are simply absent, not merely unpopulated, and
+/// defaulting them here is correct rather than a leniency.
+pub fn parse_list_page(bytes: &[u8]) -> Result<NsrListPage, SourceError> {
+    let dto: ListDto =
+        serde_json::from_slice(bytes).map_err(|e| SourceError::parse(Source::Nsr, &e))?;
+    let units = list_items(dto.enhet_liste)?;
     let total = dto.totalt_antall_enheter.unwrap_or(units.len() as u32);
     Ok(NsrListPage {
         page: dto.sidenummer.unwrap_or(1),
         page_count: dto.antall_sider.unwrap_or(1),
         total,
+        units,
+    })
+}
+
+/// Parses one page of `/v4/enheter`, where `Sidenummer`, `AntallSider` and
+/// `TotaltAntallEnheter` are REQUIRED: paging must fail loudly on a missing field, never fall
+/// back to a guess that could hide a truncated run (§5.3).
+pub fn parse_paged_list_page(bytes: &[u8]) -> Result<NsrListPage, SourceError> {
+    let dto: PagedListDto =
+        serde_json::from_slice(bytes).map_err(|e| SourceError::parse(Source::Nsr, &e))?;
+    let units = list_items(dto.enhet_liste)?;
+    Ok(NsrListPage {
+        page: dto.sidenummer,
+        page_count: dto.antall_sider,
+        total: dto.totalt_antall_enheter,
         units,
     })
 }

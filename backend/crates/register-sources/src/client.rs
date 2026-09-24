@@ -85,8 +85,10 @@ impl SourceClient {
 
     pub async fn nsr_all_units(&self) -> Result<Vec<NsrListItem>, SourceError> {
         let url = format!("{}/v4/enheter", self.urls.nsr);
-        let mut units = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut units: Vec<NsrListItem> = Vec::new();
         let mut page_count = None;
+        let mut total = None;
         for page in 1..=NSR_MAX_PAGES {
             let body = self
                 .get(
@@ -99,17 +101,44 @@ impl SourceClient {
                     false,
                 )
                 .await?;
-            let parsed = nsr::parse_list_page(&body)?;
+            let parsed = nsr::parse_paged_list_page(&body)?;
             let count = *page_count.get_or_insert(parsed.page_count);
+            let expected_total = *total.get_or_insert(parsed.total);
             if parsed.units.is_empty() {
-                return Ok(units);
+                // An empty page before the claimed page count is a truncated run, never a
+                // silent partial list (§5.3).
+                if page < count {
+                    return Err(SourceError::new(
+                        Source::Nsr,
+                        SourceErrorKind::IncompletePaging,
+                    ));
+                }
+                return Self::finished_paging(units, expected_total);
             }
-            units.extend(parsed.units);
+            for item in parsed.units {
+                if seen.insert(item.orgnr.clone()) {
+                    units.push(item);
+                }
+            }
             if page >= count {
-                return Ok(units);
+                return Self::finished_paging(units, expected_total);
             }
         }
         Err(SourceError::new(Source::Nsr, SourceErrorKind::TooManyPages))
+    }
+
+    /// The deduped count must equal the claimed total, or the run is incomplete (§5.3).
+    fn finished_paging(
+        units: Vec<NsrListItem>,
+        total: u32,
+    ) -> Result<Vec<NsrListItem>, SourceError> {
+        if units.len() as u32 != total {
+            return Err(SourceError::new(
+                Source::Nsr,
+                SourceErrorKind::IncompletePaging,
+            ));
+        }
+        Ok(units)
     }
 
     pub async fn nsr_units_in(
@@ -121,8 +150,21 @@ impl SourceClient {
     }
 
     pub async fn nsr_unit(&self, orgnr: &str) -> Result<NsrUnit, SourceError> {
+        self.nsr_unit_with_payload(orgnr)
+            .await
+            .map(|(unit, _)| unit)
+    }
+
+    /// Like [`Self::nsr_unit`], but also hands back the raw bytes it parsed, so a caller can
+    /// store the payload and its hash for provenance (§4.3).
+    pub async fn nsr_unit_with_payload(
+        &self,
+        orgnr: &str,
+    ) -> Result<(NsrUnit, Vec<u8>), SourceError> {
         let url = format!("{}/v4/enhet/{orgnr}", self.urls.nsr);
-        nsr::parse_unit(&self.get(Source::Nsr, &url, &[], false).await?)
+        let body = self.get(Source::Nsr, &url, &[], false).await?;
+        let unit = nsr::parse_unit(&body)?;
+        Ok((unit, body))
     }
 
     pub async fn municipalities(&self) -> Result<Vec<MunicipalityRecord>, SourceError> {
@@ -137,6 +179,9 @@ impl SourceClient {
     }
 
     /// Streams the gzipped bulk file to `dest` (about 210 MB) without holding it in memory.
+    /// Written first to `dest` with `.partial` appended, renamed to `dest` only once the write
+    /// has flushed successfully. On any error the partial file is removed (best effort) and
+    /// `dest` is never created or overwritten.
     pub async fn download_brreg_bulk(&self, dest: &Path) -> Result<u64, SourceError> {
         let url = format!("{}/enheter/lastned", self.urls.brreg);
         let transport = |_| SourceError::new(Source::Brreg, SourceErrorKind::Transport);
@@ -156,13 +201,35 @@ impl SourceClient {
             ));
         }
         let io = |_| SourceError::new(Source::Brreg, SourceErrorKind::Io);
-        let mut file = tokio::fs::File::create(dest).await.map_err(io)?;
-        let mut written = 0u64;
-        while let Some(chunk) = resp.chunk().await.map_err(transport)? {
-            file.write_all(&chunk).await.map_err(io)?;
-            written += chunk.len() as u64;
+        let partial = partial_path(dest);
+        let result: Result<u64, SourceError> = async {
+            let mut file = tokio::fs::File::create(&partial).await.map_err(io)?;
+            let mut written = 0u64;
+            while let Some(chunk) = resp.chunk().await.map_err(transport)? {
+                file.write_all(&chunk).await.map_err(io)?;
+                written += chunk.len() as u64;
+            }
+            file.flush().await.map_err(io)?;
+            Ok(written)
         }
-        file.flush().await.map_err(io)?;
-        Ok(written)
+        .await;
+        match result {
+            Ok(written) => {
+                tokio::fs::rename(&partial, dest).await.map_err(io)?;
+                Ok(written)
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&partial).await;
+                Err(err)
+            }
+        }
     }
+}
+
+/// `dest` with `.partial` appended to its file name, e.g. `enheter.json.gz` becomes
+/// `enheter.json.gz.partial`.
+fn partial_path(dest: &Path) -> std::path::PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    dest.with_file_name(name)
 }

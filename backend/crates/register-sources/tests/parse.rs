@@ -1,8 +1,11 @@
 //! Parsing the recorded fixtures (tests/fixtures/README.md). These are real API responses,
 //! and the expected values below are taken from them.
 
+use std::io::Write;
+
 use fau_domain::register::scope::{classify, OutOfScopeReason, ScopeDecision};
-use fau_register_sources::{nsr, Source, SourceErrorKind};
+use fau_domain::register::source::OfficialName;
+use fau_register_sources::{brreg, kartverket, nsr, ssb, Source, SourceErrorKind};
 
 fn fixture(path: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -128,6 +131,35 @@ fn a_missing_required_field_fails_loudly() {
     }
 }
 
+/// The three fields that drive scope decisions must be required: a missing one is a parse
+/// error naming it, never a silent default (§5.3).
+fn missing_required_field_fails(field: &str) {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("nsr/enhet-974552124.json")).unwrap();
+    v.as_object_mut().unwrap().remove(field);
+    let err = nsr::parse_unit(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+    assert_eq!(err.source, Source::Nsr);
+    match err.kind {
+        SourceErrorKind::Parse { detail } => assert!(detail.contains(field), "{detail}"),
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_er_privatskole_fails_loudly() {
+    missing_required_field_fails("ErPrivatskole");
+}
+
+#[test]
+fn a_missing_skolekategorier_fails_loudly() {
+    missing_required_field_fails("Skolekategorier");
+}
+
+#[test]
+fn a_missing_naeringskoder_fails_loudly() {
+    missing_required_field_fails("Naeringskoder");
+}
+
 #[test]
 fn a_parse_error_never_quotes_the_input() {
     let mut v: serde_json::Value =
@@ -136,9 +168,6 @@ fn a_parse_error_never_quotes_the_input() {
     let err = nsr::parse_unit(&serde_json::to_vec(&v).unwrap()).unwrap_err();
     assert!(!format!("{err:?} {err}").contains("SECRET-LOOKING-VALUE"));
 }
-
-use fau_domain::register::source::OfficialName;
-use fau_register_sources::{kartverket, ssb};
 
 fn names(n: &[(&str, &str, u8)]) -> Vec<OfficialName> {
     n.iter()
@@ -215,6 +244,47 @@ fn an_unknown_kartverket_language_is_an_error() {
     );
 }
 
+/// A mutable handle on Oslo's (`0301`) `gyldigeNavn[1]`, a `{navn: null, sprak: null}` padding
+/// entry in the recorded fixture, so a test can null out only one side of it.
+fn oslo_padding_entry(v: &mut serde_json::Value) -> &mut serde_json::Value {
+    for county in v.as_array_mut().unwrap() {
+        for kommune in county["kommuner"].as_array_mut().unwrap() {
+            if kommune["kommunenummer"] == "0301" {
+                return &mut kommune["gyldigeNavn"][1];
+            }
+        }
+    }
+    panic!("0301 not found in the fixture");
+}
+
+#[test]
+fn a_gyldige_navn_entry_with_only_navn_null_is_an_error() {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    oslo_padding_entry(&mut v)["sprak"] = "Norwegian".into();
+    let err = kartverket::parse_municipalities(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+    assert_eq!(
+        err.kind,
+        SourceErrorKind::UnexpectedValue {
+            field: "gyldigeNavn"
+        }
+    );
+}
+
+#[test]
+fn a_gyldige_navn_entry_with_only_sprak_null_is_an_error() {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    oslo_padding_entry(&mut v)["navn"] = "Oslo (variant)".into();
+    let err = kartverket::parse_municipalities(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+    assert_eq!(
+        err.kind,
+        SourceErrorKind::UnexpectedValue {
+            field: "gyldigeNavn"
+        }
+    );
+}
+
 #[test]
 fn ssb_changes_of_2024_include_the_renumbering_and_the_split() {
     let c = ssb::parse_changes(&fixture("ssb/changes-2024.json")).unwrap();
@@ -250,8 +320,17 @@ fn ssb_changes_of_2026_include_the_boundary_adjustment() {
     );
 }
 
-use fau_register_sources::brreg;
-use std::io::Write;
+#[test]
+fn ssb_changes_missing_code_changes_fails_loudly() {
+    let err = ssb::parse_changes(b"{}").unwrap_err();
+    assert!(matches!(err.kind, SourceErrorKind::Parse { .. }));
+}
+
+#[test]
+fn ssb_changes_with_an_empty_list_is_ok() {
+    let c = ssb::parse_changes(br#"{"codeChanges": []}"#).unwrap();
+    assert!(c.is_empty());
+}
 
 fn gzipped(path: &str) -> Vec<u8> {
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -284,6 +363,51 @@ fn only_fli_units_with_an_fau_name_are_kept() {
     assert_eq!(hosle.postal_address, Default::default());
 }
 
+/// One fixture record, edited and re-wrapped as a fresh single-unit gzipped array, so a test
+/// can exercise one field change without touching the others.
+fn one_edited_unit(index: usize, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&fixture("brreg/enheter-sample.json")).unwrap();
+    let mut unit = v.as_array().unwrap()[index].clone();
+    edit(&mut unit);
+    let wrapped = serde_json::Value::Array(vec![unit]);
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&serde_json::to_vec(&wrapped).unwrap())
+        .unwrap();
+    enc.finish().unwrap()
+}
+
+#[test]
+fn a_unit_with_adresse_null_parses() {
+    let bytes = one_edited_unit(0, |u| {
+        u["forretningsadresse"]["adresse"] = serde_json::Value::Null
+    });
+    let mut out = Vec::new();
+    let stats = brreg::for_each_fau(&bytes[..], |f| out.push(f)).unwrap();
+    assert_eq!(stats.faus, 1);
+    assert!(out[0].business_address.lines.is_empty());
+}
+
+#[test]
+fn an_empty_kommunenummer_becomes_none() {
+    let bytes = one_edited_unit(0, |u| {
+        u["forretningsadresse"]["kommunenummer"] = "  ".into();
+    });
+    let mut out = Vec::new();
+    brreg::for_each_fau(&bytes[..], |f| out.push(f)).unwrap();
+    assert_eq!(out[0].municipality_number, None);
+}
+
+#[test]
+fn a_non_fli_unit_with_an_fau_like_name_is_skipped() {
+    let bytes = one_edited_unit(0, |u| u["organisasjonsform"]["kode"] = "AS".into());
+    let mut out = Vec::new();
+    let stats = brreg::for_each_fau(&bytes[..], |f| out.push(f)).unwrap();
+    assert_eq!(stats.units_seen, 1, "the unit is still counted as seen");
+    assert_eq!(stats.faus, 0, "AS is not FLI, regardless of the name");
+    assert!(out.is_empty());
+}
+
 #[test]
 fn contact_fields_are_never_read() {
     // 913591100 carries an invented e-mail and mobile (fixtures README). The value types have
@@ -296,12 +420,57 @@ fn contact_fields_are_never_read() {
 }
 
 #[test]
-fn a_truncated_file_is_an_error() {
+fn json_truncated_inside_a_valid_gzip_is_a_parse_error() {
+    // The gzip container is intact (a real encoder wrote it); the JSON inside it is cut short,
+    // so serde_json hits EOF while still expecting more input. That is a shape problem in the
+    // JSON, not a read failure, so it stays a Parse error.
     let full = fixture("brreg/enheter-sample.json");
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     enc.write_all(&full[..full.len() / 2]).unwrap();
     let err = brreg::for_each_fau(&enc.finish().unwrap()[..], |_| {}).unwrap_err();
     assert_eq!(err.source, fau_register_sources::Source::Brreg);
+    assert!(
+        matches!(err.kind, SourceErrorKind::Parse { .. }),
+        "{:?}",
+        err.kind
+    );
+}
+
+/// A gzip stream broken at the byte level (not just JSON cut short) surfaces as an I/O error
+/// from the decoder, and must be reported as `Io`, never `Parse` (which would suggest a JSON
+/// shape problem instead of a corrupt download).
+fn broken_gzip_is_io_error(mangle: impl FnOnce(&mut Vec<u8>)) {
+    let full = fixture("brreg/enheter-sample.json");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&full).unwrap();
+    let mut bytes = enc.finish().unwrap();
+    mangle(&mut bytes);
+    let err = brreg::for_each_fau(&bytes[..], |_| {}).unwrap_err();
+    assert_eq!(
+        (err.source, err.kind),
+        (fau_register_sources::Source::Brreg, SourceErrorKind::Io)
+    );
+}
+
+#[test]
+fn gzip_bytes_cut_in_the_middle_is_an_io_error() {
+    broken_gzip_is_io_error(|bytes| bytes.truncate(bytes.len() / 2));
+}
+
+#[test]
+fn gzip_missing_its_crc_and_size_trailer_is_an_io_error() {
+    broken_gzip_is_io_error(|bytes| {
+        let new_len = bytes.len() - 8;
+        bytes.truncate(new_len);
+    });
+}
+
+#[test]
+fn gzip_with_a_flipped_crc_byte_is_an_io_error() {
+    broken_gzip_is_io_error(|bytes| {
+        let crc_start = bytes.len() - 8;
+        bytes[crc_start] ^= 0xFF;
+    });
 }
 
 #[test]

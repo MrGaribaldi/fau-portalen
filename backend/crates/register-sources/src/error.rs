@@ -22,6 +22,10 @@ pub enum SourceErrorKind {
     Transport,
     /// NSR paging did not end within the hard limit.
     TooManyPages,
+    /// NSR paging ended without covering every unit: an empty page arrived before the claimed
+    /// page count, or the deduped count did not match the claimed total. Never returned as a
+    /// partial list (§5.3).
+    IncompletePaging,
     /// Reading or writing the local Brreg download failed.
     Io,
 }
@@ -50,6 +54,11 @@ impl SourceError {
     /// Never serde_json's full message: an invalid-type error quotes the input's value. Keep
     /// the missing field's name, or else the error class, plus the position.
     pub(crate) fn parse(source: Source, err: &serde_json::Error) -> Self {
+        if err.classify() == serde_json::error::Category::Io {
+            // A read failure underneath serde_json, e.g. a corrupt gzip stream: this is not a
+            // shape mismatch in the JSON, so it must not be reported as a parse error.
+            return Self::new(source, SourceErrorKind::Io);
+        }
         let msg = err.to_string();
         let missing = msg
             .strip_prefix("missing field `")

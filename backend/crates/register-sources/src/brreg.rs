@@ -40,8 +40,10 @@ struct FormDto {
 
 #[derive(Deserialize)]
 struct AddressDto {
+    // Brreg sends `"adresse": null` for some units, not just an absent field: `Option` accepts
+    // both, and either way it means no address lines.
     #[serde(default)]
-    adresse: Vec<Option<String>>,
+    adresse: Option<Vec<Option<String>>>,
     postnummer: Option<String>,
     kommunenummer: Option<String>,
 }
@@ -53,6 +55,7 @@ fn address(a: Option<&AddressDto>) -> BrregAddress {
             lines: a
                 .adresse
                 .iter()
+                .flatten()
                 .flatten()
                 .map(|l| l.trim().to_owned())
                 .filter(|l| !l.is_empty())
@@ -89,7 +92,8 @@ impl<'de, F: FnMut(BrregFau)> Visitor<'de> for Each<'_, F> {
             let municipality_number = u
                 .forretningsadresse
                 .as_ref()
-                .and_then(|a| a.kommunenummer.clone());
+                .and_then(|a| a.kommunenummer.clone())
+                .filter(|n| !n.trim().is_empty());
             (self.f)(BrregFau {
                 orgnr: u.organisasjonsnummer,
                 registered_name: u.navn,
@@ -105,7 +109,9 @@ impl<'de, F: FnMut(BrregFau)> Visitor<'de> for Each<'_, F> {
 
 /// Streams a gzipped Enhetsregisteret array, calling `f` for each FAU-like entity (FLI plus
 /// an FAU word in the name). A truncated file or a unit missing a required field is an error,
-/// never a silent partial result.
+/// never a silent partial result. On `Err`, `f` may already have been called with some FAU-er
+/// from earlier in the stream: the caller must discard everything it collected rather than
+/// treat the partial run as complete.
 pub fn for_each_fau<R: Read>(
     gzipped: R,
     mut f: impl FnMut(BrregFau),

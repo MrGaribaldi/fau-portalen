@@ -51,9 +51,19 @@ pub fn parse_municipalities(bytes: &[u8]) -> Result<Vec<MunicipalityRecord>, Sou
         for m in county.kommuner {
             let mut names = Vec::new();
             for n in m.gyldige_navn {
-                // Kartverket pads the list with {navn: null, sprak: null}.
-                let (Some(name), Some(sprak)) = (n.navn, n.sprak) else {
-                    continue;
+                // Kartverket pads the list with {navn: null, sprak: null}: both null is padding
+                // and is skipped. Exactly one null is not padding, and is a shape error.
+                let (name, sprak) = match (n.navn, n.sprak) {
+                    (None, None) => continue,
+                    (Some(name), Some(sprak)) => (name, sprak),
+                    _ => {
+                        return Err(SourceError::new(
+                            Source::Kartverket,
+                            SourceErrorKind::UnexpectedValue {
+                                field: "gyldigeNavn",
+                            },
+                        ))
+                    }
                 };
                 let language = language(&sprak).ok_or_else(|| {
                     SourceError::new(

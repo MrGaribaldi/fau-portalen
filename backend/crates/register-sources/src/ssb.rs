@@ -9,7 +9,6 @@ use crate::error::{Source, SourceError, SourceErrorKind};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChangesDto {
-    #[serde(default)]
     code_changes: Vec<ChangeDto>,
 }
 

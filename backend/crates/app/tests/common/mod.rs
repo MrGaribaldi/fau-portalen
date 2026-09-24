@@ -25,6 +25,8 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
+pub mod membership;
+
 /// The database the harness talks to before any per-test database exists: superuser,
 /// used only for `create database` / `drop database` and to hold the template-build
 /// advisory lock.

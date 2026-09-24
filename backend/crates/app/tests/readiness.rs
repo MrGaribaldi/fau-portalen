@@ -60,7 +60,7 @@ async fn database_down_then_back_does_not_restart_the_process() {
 async fn readiness_is_503_when_the_contract_is_below_the_minimum() {
     let db = TestDb::migrated().await;
     let app = common::spawn_serve(&db).await;
-    sqlx::query("delete from schema_contract where version = 2")
+    sqlx::query("delete from schema_contract where version >= 2")
         .execute(&db.admin_pool())
         .await
         .unwrap();

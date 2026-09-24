@@ -2219,3 +2219,192 @@ uploaded with `readyToUse=true` on both the local and the S3 copy, and stages 0 
 namespace, its ClusterIssuers, the empty Cloudflare token secret and the staging issuer - which is
 #3485's pending work sitting in the uncommitted 2-cluster source, not rotation drift. "Rerun
 everything" would have deployed cert-manager as a side effect. It remains unapplied.
+
+## Delete protection on lb-fau: turned on by hand, fixed upstream later — 23 September 2026
+
+`lb-fau` is the public entrypoint since the ingress-nginx pass: `fau-lab.bim.graphics` points at
+its addresses, and the Hetzner CCM now manages its services. Deleting it would lose those addresses.
+Deletion could come by hand, from a destroy of the wrong root, or from the CCM if the ingress
+Service is removed. Hetzner's delete protection guards against that. It was the one open item on
+#3485.
+
+The upstream `bootstrap/network` module creates the load balancer without `delete_protection` and
+has no variable for it. With hcloud provider 1.66.0 an unset value means `false`, so protection
+enabled outside Terraform becomes permanent stage 1 drift.
+
+**Decided by Erik:**
+- He enables delete protection on `lb-fau` in the Hetzner Console now.
+- The agent writes an upstream enhancement asking for a `load_balancer_delete_protection` variable:
+  docs/infra-tools-lb-delete-protection-issue.md.
+
+The alternatives were: wait for upstream with no protection meanwhile; or have the agent set it
+through the API, which ends in the same drift and adds a live change made from the container.
+
+**Consequence until upstream lands:** stage 1's plan shows one expected in-place change,
+`delete_protection: true -> false` on `module.bootstrap_network.hcloud_load_balancer.nginx[0]`.
+**Never apply that change.** Any stage 1 apply before the variable exists must be checked for it,
+because applying it silently removes the protection. When the variable exists, set
+`load_balancer_delete_protection = true` in `infrastructure/1-bootstrap`; stage 1 then plans
+clean again.
+
+## FAU creation and membership flow designed (#3413) — 23 September 2026
+
+The flow that creates an FAU and brings people into it was designed with Erik on 23 September and
+is written up in docs/fau-creation-and-membership-flow.md. The spec lists every decision. The ones
+that change or clarify earlier entries:
+
+- **ADR-003 decision 8, clarified.** In an FAU with no admin (no admin role valid and no handover
+  grant valid), the recovery contact's single power, initiating the addition of a member, may grant
+  an admin role. Outside that state it remains a plain member addition. All of decision 10's
+  notifications apply.
+- **Replacement proposals are in the MVP.** A member may propose a successor for their own role,
+  and an admin approves it, which issues a normal invitation. This supersedes the 7 September
+  "Confirmed simplifications" deferral for this one case. It shares one request model with the
+  access request below. Other member-initiated invitations, and substitute invitations, stay
+  deferred.
+- **Passkeys are not in the MVP**; passcode only. This settles the inconsistency between ADR-003's
+  "Closed" section and its decision 4a.
+- **The leader invitation is exempt from #3414's TOTP gate.** It is issued in the activation
+  transaction, because it completes the signup form rather than being a new admin action. Every
+  later invitation is gated.
+
+New decisions in the same session:
+- **School selection.** The school is picked from the register (#3441), with the "Mangler skolen
+  din?" fallback. The dependency on the register import is accepted.
+- **One FAU per school**, enforced, counting pending FAUs. A duplicate attempt is copied to Erik.
+  - If the existing FAU is active, the registrant is told to contact its admins, and the portal
+    relays a passcode-verified access request without revealing who they are.
+  - If it is pending, they are told it is being registered.
+  - An unverified pending FAU expires after 7 days.
+- **The first admin end date** is asked at signup. It defaults to the next 1 October at least three
+  months away, within a range of 1–24 months.
+- **A single admin is allowed**, with a banner while there is only one.
+- **Invitations** are valid for 14 days, and opening a link never accepts it.
+- **The named leader is taken on trust** in the MVP.
+- **Migration 0003** brings forward minimal append-only `audit_events` and `outbox` tables, so
+  activation does not wait for #3421.
+
+## #3416, #3413 and #3485 accepted — 23 September 2026
+
+- **#3416:** Erik accepted the backend skeleton and merged it to main via PR #1.
+- **#3413:** Erik approved docs/fau-creation-and-membership-flow.md as written.
+- **#3485:** Erik turned on delete protection for `lb-fau` in the Hetzner Console. The API
+  confirms it, and a read-only stage 1 plan shows only the expected
+  `delete_protection true -> false` drift. It must not be applied (#3497).
+
+All three cards are Done. Erik then authorised overnight work, with his review in the morning:
+- research the #3441 school register;
+- plan migration 0003 and the membership domain that does not depend on the register, and build it
+  test-first on a feature branch.
+
+## Membership foundation built overnight: rulings and deferrals (#3418) — 24 September 2026
+
+The register-independent membership foundation was built overnight on the branch
+`membership-foundation-3418`, following docs/superpowers/plans/2026-09-24-membership-foundation.md.
+Every task was reviewed, and a whole-branch review followed. The agent made these rulings on Erik's
+behalf, and Erik reviews them.
+
+**Rulings on behaviour:**
+- **Frozen FAU.** Declining a request, lapsing requests, withdrawing an invitation and revoking roles
+  or memberships are allowed. Each only closes something or reduces rights. This departs from the
+  literal "writes stop" in ADR-003 decision 7a. Issuing, re-sending, approving, granting, proposing
+  and recovery are refused.
+- **Self-proposal.** A member may propose themselves as the successor for their own role. An admin
+  still has to approve it.
+- **Stepping down.** A member may revoke one of their own roles. Spec §7 already lets them leave
+  entirely.
+- **Request message.** It may contain line breaks (`\r\n` is normalised to `\n`). Every other control
+  character is rejected. The limit is 500 characters, counted after normalisation.
+- **Replaced token.** A token replaced by a re-send is answered as unknown, not as "replaced". The old
+  hash is overwritten, so #3417's wording should cover both cases ("check your newest email").
+- **Recovery notices.** Every recovery notice also goes to fau@ewb-solutions.as. EWB holds the seat
+  only while no school representative is confirmed, so this matches ADR-003 decision 10 in every
+  reachable state.
+- **Outbox.** It carries a nullable `tenant_id`, for FAU deletion and Article 17 erasure.
+- **Order of checks.** Authority is checked before any row state is revealed. Tenant state (frozen or
+  closed) may be checked first, because members can see it anyway.
+- **Base-image pins.** The Dockerfile pins multi-arch index digests (recorded 23 September).
+
+**Deferred from spec 3413, not built yet:**
+- §6.1 expiry warnings, and the §6.4 no-admin flag and notification sweep. Both need a scheduler.
+- Recovery adding a plain member, outside the no-admin state.
+- School-representative nomination: nominating, confirming and changing the seat. When it is built,
+  the seat change must take the tenant lock, and recovery invitations must record the seat holder's
+  identity, not only whether the holder is EWB or a school representative.
+- The invitation preview read for the invitation page, and the one-admin banner query. Both come
+  with #3417 and #3422.
+- EWB recovery actions must record the acting operator in the audit entry before any recovery
+  endpoint ships (#3417).
+- The unauthenticated collision path, where each collision emails Erik, must be rate-limited at the
+  HTTP layer (#3417).
+
+**Decisions for Erik:**
+- **The request message is stored as plaintext.** An access request's message (free text, up to 500
+  characters) is on neither ADR-003 decision 6 list. Nothing writes it until #3417. The options are
+  to encrypt it, drop the field, or add it to the plaintext list.
+- **No upper bound on admin role periods.** Nothing limits the length of admin role periods set
+  through invitations, grants or recovery. Only the first signup date is limited, to 1–24 months.
+
+**Register design corrected (#3441).** Migration 0003 already creates the one-live-FAU-per-school
+index, so the register migration adds only the `schools` foreign key.
+
+## Access-request messages are sealed to the FAU — 24 September 2026
+
+Erik chose sealing on 24 September. The access-request message (free text, up to 500 characters,
+written by someone who is not a member) is encrypted to a per-FAU sealing key pair held in the key
+service:
+- The backend seals it on submission with the public key.
+- It is decrypted only on the approval screen, inside an admin's session, by unwrapping the private
+  key through the key service. The call is logged and rate-limited.
+- It is never decrypted for email.
+- Crypto-shredding covers it.
+
+ADR-003 is amended to match: decision 6 gains a "Sealed to the FAU" category, and decision 5 notes
+the key service's second narrow read operation. The rejected options were dropping the field, and
+listing it as plaintext, which would leave strangers' free text in every backup and outside
+crypto-shredding.
+
+**Consequence for code.** Migration 0003's `access_requests.message text` column must become a
+ciphertext column before 0003 is applied anywhere. Until the key service exists, the persistence
+layer must accept no message at all.
+
+## Invitation messages, readable by the invitee before accepting — 24 September 2026
+
+Erik decided on 24 September that an admin may add a message to an invitation, and that the invitee
+sees it on the invitation page after logging in and before accepting. The purpose is
+anti-phishing: an invitation that says who is inviting you and why is harder to fake than a bare
+link.
+
+- **Encryption.** The message is encrypted under a per-invitation key, wrapped by the FAU's KEK. A
+  database dump without the key store shows only ciphertext.
+- **Reading.** The invitee is not yet a member, so the key service unwraps that one invitation's key
+  only for a request that carries a valid, unused token from the logged-in, matching invitee. The
+  call is logged and rate-limited. ADR-003 decisions 5 and 6 are amended.
+- **Resend** keeps the message.
+- **Considered and rejected:**
+  - "Encrypting with the FAU's private key". Its protection would rest on a public key never
+    leaking, which is fragile.
+  - A key derived from the invitation token. It is stronger than the threat model needs, and it
+    loses the message on resend.
+- **Later, not now:** an option to include the message in the invitation email. That needs its own
+  decision, because the plaintext would reach the mail provider.
+
+**Code consequence:** migration 0003 gains a ciphertext column for the invitation message, beside the
+access-request message change recorded above. Until the key service exists, neither message is
+accepted.
+
+## Key-service root key held by hand; member keys later — 24 September 2026
+
+Erik decided on 24 September:
+- **Live root key.** It is never on disk anywhere. Erik keeps it in Proton Pass and loads it by hand
+  whenever the key service starts. Until then the key service is sealed: content stays unreadable,
+  while login and authorization keep working. A sealed key service is a critical alert. The accepted
+  cost is that a restart leaves content unreadable until Erik unseals it. This closes the case where
+  the database and the key service's disk or backups are stolen together.
+- **Member-held keys** are a post-MVP direction. The key service stores several wraps per FAU key
+  from the start (KEK now; member devices and an offline escrow wrap later), so adding them needs no
+  redesign. Adopting them needs passkeys and its own trust-model decision.
+- **#3481** gains a third Proton Pass item: the live root key, beside the SOPS age key and the
+  backup root key.
+
+ADR-003 decision 5 and its closed items and standing risks are amended to match.

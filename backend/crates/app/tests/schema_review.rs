@@ -324,3 +324,111 @@ async fn foreign_key_pairing_check_detects_a_swapped_composite_key() {
         result.checked
     );
 }
+
+#[tokio::test]
+async fn membership_foreign_keys_pair_tenant_id() {
+    // 0003's own tenant-to-tenant references, named so a filtering bug cannot make the
+    // standing guard above pass vacuously for the new tables.
+    let db = TestDb::migrated().await;
+    let result = tenant_fk_pairing_check(&db.admin_pool()).await;
+    assert!(result.violations.is_empty(), "{:?}", result.violations);
+
+    let checked: std::collections::HashSet<&str> =
+        result.checked.iter().map(String::as_str).collect();
+    for expected in [
+        "recovery_contacts_tenant_id_nominated_by_fkey",
+        "handover_grants_tenant_id_source_assignment_id_fkey",
+        "access_requests_tenant_id_requester_membership_id_fkey",
+        "access_requests_tenant_id_replaced_assignment_id_fkey",
+        "access_requests_tenant_id_decided_by_fkey",
+        "invitations_tenant_id_issued_by_fkey",
+        "invitations_tenant_id_handover_grant_id_fkey",
+        "invitations_tenant_id_access_request_id_fkey",
+        "invitations_tenant_id_accepted_membership_id_fkey",
+        "invitation_roles_tenant_id_invitation_id_fkey",
+        "invitation_roles_tenant_id_role_id_fkey",
+    ] {
+        assert!(
+            checked.contains(expected),
+            "expected {expected} among the checked foreign keys, got {:?}",
+            result.checked
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_events_are_append_only_for_the_runtime_role() {
+    // Flow spec §9: the runtime role may insert and select audit, never update or
+    // delete it. 42501 is insufficient_privilege: the grant, not a trigger or a
+    // constraint, is what refuses.
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "insert into audit_events (id, actor_kind, action, subject_type, subject_id, occurred_at)
+         values ($1, 'system', 'tenant.signup_created', 'tenant', $1, now())",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("the runtime role appends audit");
+    let n: i64 = sqlx::query_scalar("select count(*) from audit_events")
+        .fetch_one(&pool)
+        .await
+        .expect("the runtime role reads audit");
+    assert_eq!(n, 1);
+
+    for statement in [
+        "update audit_events set action = 'tenant.changed'",
+        "delete from audit_events",
+        "truncate audit_events",
+    ] {
+        let err = sqlx::query(statement)
+            .execute(&pool)
+            .await
+            .expect_err(statement);
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{statement}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_runtime_role_cannot_delete_from_the_outbox() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let err = sqlx::query("delete from outbox")
+        .execute(&pool)
+        .await
+        .expect_err("the runtime role deleted outbox rows");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501")
+    );
+}
+
+#[tokio::test]
+async fn no_column_stores_a_raw_token() {
+    // Invitation tokens are stored only as SHA-256 hashes (flow spec §5.1). Any column
+    // whose name mentions a token must be a `bytea` named `..._hash`.
+    let db = TestDb::migrated().await;
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "select table_name, column_name, data_type from information_schema.columns
+         where table_schema = 'public' and column_name like '%token%'",
+    )
+    .fetch_all(&db.admin_pool())
+    .await
+    .unwrap();
+    assert!(
+        !columns.is_empty(),
+        "expected invitations.token_hash to exist; the guard would pass vacuously"
+    );
+    for (table, column, data_type) in &columns {
+        assert!(
+            column.ends_with("_hash") && data_type == "bytea",
+            "{table}.{column} ({data_type}) looks like a stored token"
+        );
+    }
+}

@@ -7,7 +7,19 @@ publish = false
 
 [dependencies]
 fau-domain = { path = "../domain" }
+# Invitation tokens: 32 bytes straight from the operating system's CSPRNG. Already in
+# Cargo.lock through `uuid`, so it adds no crate.
+getrandom = { workspace = true }
+# The date and timestamp types the domain rules take; bound into SQL as text (see
+# src/membership/sql.rs), because sqlx 0.8 has no jiff support.
+jiff = { workspace = true }
+# Audit and outbox parameters, bound as text and cast to jsonb.
+serde_json = { workspace = true }
+# SHA-256 of invitation tokens. Already in Cargo.lock through `sqlx`.
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Row ids (UUIDv7, ADR-002), already a workspace dependency.
+uuid = { workspace = true }

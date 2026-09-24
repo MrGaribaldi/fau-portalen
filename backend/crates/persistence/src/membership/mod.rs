@@ -5,6 +5,7 @@
 //! Every function takes a [`fau_domain::time::Moment`]: rule-deciding timestamps and
 //! "today" come from the caller, never from the database clock.
 
+mod access;
 mod error;
 mod handover;
 mod invitations;
@@ -14,6 +15,7 @@ mod signup;
 mod sql;
 mod token;
 
+pub use access::effective_access;
 pub use error::{ExistingFau, MembershipError};
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{

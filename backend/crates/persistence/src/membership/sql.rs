@@ -25,6 +25,15 @@ use uuid::Uuid;
 
 use super::error::MembershipError;
 
+/// The two conditions [`USABLE_ACCOUNT`] conjoins, named separately for callers that
+/// need them apart -- `access::effective_access` reads "the membership is not revoked"
+/// and "the account is verified and not disabled" as two distinct `Standing` fields
+/// rather than one combined boolean (fix round 1, task 10). Kept equal to
+/// `USABLE_ACCOUNT`'s own text by `usable_account_is_the_conjunction_of_its_two_parts`
+/// below, since Rust has no stable way to build one `const &str` out of others.
+pub(crate) const MEMBERSHIP_NOT_REVOKED: &str = "m.revoked_at is null";
+pub(crate) const ACCOUNT_USABLE: &str = "a.disabled_at is null and a.verified_at is not null";
+
 /// The condition every "usable membership" query shares: the membership itself is not
 /// revoked, and the account behind it is verified and not disabled. Kept in one place
 /// so every query that filters on it agrees -- the handover-grant queries once drifted
@@ -633,4 +642,21 @@ pub(crate) async fn admin_emails(
     today: Date,
 ) -> Result<Vec<String>, MembershipError> {
     member_emails(conn, tenant_id, today, true).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards against `USABLE_ACCOUNT` drifting apart from its two named conjuncts
+    /// (fix round 1, task 10): a caller like `access::effective_access` that needs
+    /// them apart reads `MEMBERSHIP_NOT_REVOKED` and `ACCOUNT_USABLE` rather than
+    /// retyping the SQL, so this test is what keeps all three in sync.
+    #[test]
+    fn usable_account_is_the_conjunction_of_its_two_parts() {
+        assert_eq!(
+            format!("{MEMBERSHIP_NOT_REVOKED} and {ACCOUNT_USABLE}"),
+            USABLE_ACCOUNT
+        );
+    }
 }

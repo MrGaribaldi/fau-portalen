@@ -81,6 +81,62 @@ async fn submitted_school(pool: &sqlx::PgPool, m: Uuid) -> Result<Uuid, sqlx::Er
     Ok(id)
 }
 
+/// One field the register itself later curates, overridden from the shape
+/// `schools_app_submit` (0004, tightened 24 September 2026) otherwise allows --
+/// `submitted_school`'s own shape, with exactly one field changed. `label` names
+/// which field, for the assertion message.
+#[derive(Clone, Copy)]
+struct AppSubmitCase<'a> {
+    label: &'a str,
+    slug: Option<&'a str>,
+    orgnr: Option<&'a str>,
+    display_name_curated: bool,
+    status: &'a str,
+    closed_on: Option<&'a str>,
+    successor_id: Option<Uuid>,
+}
+
+impl<'a> AppSubmitCase<'a> {
+    /// `submitted_school`'s own shape, named for the one field the caller means to
+    /// change with struct-update syntax.
+    fn baseline(label: &'a str) -> Self {
+        Self {
+            label,
+            slug: None,
+            orgnr: None,
+            display_name_curated: false,
+            status: "active",
+            closed_on: None,
+            successor_id: None,
+        }
+    }
+}
+
+async fn app_submit_variant(
+    pool: &sqlx::PgPool,
+    m: Uuid,
+    case: AppSubmitCase<'_>,
+) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into schools
+           (id, municipality_id, origin, display_name, verification, slug, orgnr,
+            display_name_curated, status, closed_on, successor_id, search_text)
+         values ($1, $2, 'submitted', 'X', 'pending', $3, $4, $5, $6, $7::date, $8, 'x')",
+    )
+    .bind(id)
+    .bind(m)
+    .bind(case.slug)
+    .bind(case.orgnr)
+    .bind(case.display_name_curated)
+    .bind(case.status)
+    .bind(case.closed_on)
+    .bind(case.successor_id)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
 #[tokio::test]
 async fn register_tables_exist_and_carry_no_tenant_id() {
     let db = TestDb::migrated().await;
@@ -181,6 +237,7 @@ async fn a_referenced_school_cannot_be_deleted() {
         .await
         .unwrap_err();
     assert_eq!(sqlstate(&err).as_deref(), Some("23503"));
+    assert_eq!(constraint_name(&err).as_deref(), Some("tenants_school_fk"));
     let err = sqlx::query("delete from municipalities where id = $1")
         .bind(m)
         .execute(&admin)
@@ -385,6 +442,43 @@ async fn the_runtime_role_may_insert_only_a_pending_submitted_school() {
         "RLS refuses a listed school from fau_app"
     );
 
+    // Every field the register itself later curates must stay untouched for
+    // fau_app's own insert to be accepted (tightened 24 September 2026 after
+    // review): naming any one of them is refused outright, not merely ignored.
+    let held_target = listed_school(&admin, m, "900000029", None).await.unwrap();
+    let cases = [
+        AppSubmitCase {
+            slug: Some("x-slug"),
+            ..AppSubmitCase::baseline("a slug")
+        },
+        AppSubmitCase {
+            orgnr: Some("900000041"),
+            ..AppSubmitCase::baseline("an orgnr")
+        },
+        AppSubmitCase {
+            display_name_curated: true,
+            ..AppSubmitCase::baseline("display_name_curated")
+        },
+        AppSubmitCase {
+            status: "closed",
+            closed_on: Some("2024-01-01"),
+            ..AppSubmitCase::baseline("a closed status")
+        },
+        AppSubmitCase {
+            successor_id: Some(held_target),
+            ..AppSubmitCase::baseline("a successor")
+        },
+    ];
+    for case in cases {
+        let err = app_submit_variant(&app, m, case).await.unwrap_err();
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("42501"),
+            "fau_app inserted a school naming {}: {err:?}",
+            case.label
+        );
+    }
+
     let err = sqlx::query("update schools set display_name = 'x'")
         .execute(&app)
         .await
@@ -394,6 +488,103 @@ async fn the_runtime_role_may_insert_only_a_pending_submitted_school() {
                            values ($1, 'x', '03', 'x', '0000-x', 'active', 'manual', 'x')")
         .bind(Uuid::now_v7()).execute(&app).await.unwrap_err();
     assert_eq!(sqlstate(&err).as_deref(), Some("42501"));
+}
+
+#[tokio::test]
+async fn the_runtime_role_may_queue_a_submission_and_its_lookup_but_not_curate_them() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let app = db.app_pool().await;
+    let m = municipality(&admin, "3201", "3201-baerum").await.unwrap();
+
+    let account = Uuid::now_v7();
+    sqlx::query("insert into accounts (id, email) values ($1, $2)")
+        .bind(account)
+        .bind(format!("{account}@example.test"))
+        .execute(&app)
+        .await
+        .unwrap();
+
+    // fau_app may queue a pending submission and a freshly queued lookup (D9): it
+    // has no select grant on either table, so this proves acceptance by the insert
+    // succeeding, never by reading the row back.
+    let school = submitted_school(&app, m).await.unwrap();
+    let submission = Uuid::now_v7();
+    sqlx::query(
+        "insert into school_submissions
+           (id, school_id, submitted_by, submitted_name, decision_url, decision_kind,
+            retrieval_status, review_state)
+         values ($1, $2, $3, 'Ny skole', 'https://example.test/vedtak', 'municipal_decision',
+                 'fetched', 'pending')",
+    )
+    .bind(submission)
+    .bind(school)
+    .bind(account)
+    .execute(&app)
+    .await
+    .expect("fau_app may queue a pending submission");
+
+    let lookup = Uuid::now_v7();
+    sqlx::query(
+        "insert into register_lookups (id, submission_id, queued_at) values ($1, $2, now())",
+    )
+    .bind(lookup)
+    .bind(submission)
+    .execute(&app)
+    .await
+    .expect("fau_app may queue a fresh lookup");
+
+    // A submission fau_app tries to hand itself an already-curated review_state is
+    // refused outright.
+    let school2 = submitted_school(&app, m).await.unwrap();
+    let err = sqlx::query(
+        "insert into school_submissions
+           (id, school_id, submitted_by, submitted_name, decision_url, decision_kind,
+            retrieval_status, review_state)
+         values ($1, $2, $3, 'Ny skole', 'https://example.test/vedtak', 'municipal_decision',
+                 'fetched', 'verified')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(school2)
+    .bind(account)
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not curate a submission's review_state"
+    );
+
+    // Likewise a lookup fau_app tries to hand itself an outcome.
+    let school3 = submitted_school(&app, m).await.unwrap();
+    let submission3 = Uuid::now_v7();
+    sqlx::query(
+        "insert into school_submissions
+           (id, school_id, submitted_by, submitted_name, decision_url, decision_kind,
+            retrieval_status, review_state)
+         values ($1, $2, $3, 'Ny skole', 'https://example.test/vedtak', 'municipal_decision',
+                 'fetched', 'pending')",
+    )
+    .bind(submission3)
+    .bind(school3)
+    .bind(account)
+    .execute(&app)
+    .await
+    .unwrap();
+    let err = sqlx::query(
+        "insert into register_lookups (id, submission_id, queued_at, outcome) values ($1, $2, now(), 'approved')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(submission3)
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not assert a lookup outcome"
+    );
 }
 
 #[tokio::test]
@@ -449,7 +640,10 @@ async fn the_register_role_writes_the_register_and_deletes_only_held_schools() {
 async fn the_outbox_accepts_the_global_register_templates_only() {
     let db = TestDb::migrated().await;
     let reg = db.register_pool().await;
+    // 0003's own global template still works: 0004 widens the list, it does not
+    // replace it.
     for template in [
+        "signup.collision",
         "register.review_item",
         "register.seed_summary",
         "register.submission_approved",

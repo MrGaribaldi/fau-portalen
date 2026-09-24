@@ -269,12 +269,37 @@ grant insert on schools, school_submissions, register_lookups to fau_app;
 
 alter table schools enable row level security;
 create policy schools_app_read on schools for select to fau_app using (true);
+-- fau_app may only ever queue a fresh, unreviewed submission: every field the
+-- register itself later curates (a slug, an orgnr, the curated-name flag, closure
+-- and its successor, verification and scope) must still be at its untouched
+-- default (D9; tightened 24 September 2026 after review).
 create policy schools_app_submit on schools for insert to fau_app
   with check (origin = 'submitted' and verification = 'pending' and slug is null
-              and orgnr is null and not display_name_curated);
+              and orgnr is null and not display_name_curated
+              and status = 'active' and closed_on is null and closure_reason is null
+              and successor_id is null and verified_at is null and scope_override is null
+              and in_scope);
 create policy schools_register_read on schools for select to fau_register using (true);
 create policy schools_register_insert on schools for insert to fau_register with check (true);
 create policy schools_register_update on schools for update to fau_register using (true) with check (true);
 create policy schools_register_delete_held on schools for delete to fau_register using (verification = 'held');
+
+-- fau_register curates every submission and lookup outcome; fau_app only ever
+-- queues a fresh one and never reads or edits the register's own bookkeeping
+-- back (D9 -- the runtime role must not assert register outcomes; tightened 24
+-- September 2026 after review).
+alter table school_submissions enable row level security;
+create policy school_submissions_register_read on school_submissions for select to fau_register using (true);
+create policy school_submissions_register_insert on school_submissions for insert to fau_register with check (true);
+create policy school_submissions_register_update on school_submissions for update to fau_register using (true) with check (true);
+create policy school_submissions_app_insert on school_submissions for insert to fau_app
+  with check (review_state = 'pending' and reviewed_at is null);
+
+alter table register_lookups enable row level security;
+create policy register_lookups_register_read on register_lookups for select to fau_register using (true);
+create policy register_lookups_register_insert on register_lookups for insert to fau_register with check (true);
+create policy register_lookups_register_update on register_lookups for update to fau_register using (true) with check (true);
+create policy register_lookups_app_insert on register_lookups for insert to fau_app
+  with check (processed_at is null and outcome is null and attempts = 0);
 
 insert into schema_contract (version) values (4);

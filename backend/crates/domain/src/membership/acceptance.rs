@@ -27,6 +27,12 @@ pub struct AcceptanceSnapshot {
     /// `recovery` mode: the FAU has an admin today, which ends the recovery contact's
     /// authority (§6.4).
     pub tenant_has_admin_today: bool,
+    /// `recovery` mode: the seat that issued this invitation is still the seat holder
+    /// today. A recovery invitation is tied to the seat that wrote it, so a seat that
+    /// has since moved -- for example from EWB to a confirmed school representative --
+    /// ends the old invitation's authority too, the same way a handover invitation dies
+    /// with its grant.
+    pub recovery_seat_matches_today: bool,
 }
 
 /// Why an acceptance was refused. Each maps to its own message in #3422, and none of
@@ -70,7 +76,7 @@ pub fn check_acceptance(s: &AcceptanceSnapshot, now: Timestamp) -> Result<(), Ac
     let authorised = match s.mode {
         InvitationMode::Normal => s.issuer_admin_today,
         InvitationMode::Handover => s.handover_grant_valid_today,
-        InvitationMode::Recovery => !s.tenant_has_admin_today,
+        InvitationMode::Recovery => !s.tenant_has_admin_today && s.recovery_seat_matches_today,
         // Completes the signup form (decision 11): the registrant's own authority is not
         // re-checked, only the token, the address and the FAU.
         InvitationMode::Activation => true,
@@ -107,6 +113,7 @@ mod tests {
             issuer_admin_today: true,
             handover_grant_valid_today: true,
             tenant_has_admin_today: false,
+            recovery_seat_matches_today: true,
         }
     }
 
@@ -249,6 +256,21 @@ mod tests {
         };
         assert_eq!(
             check_acceptance(&recovery, ts(NOW)),
+            Err(AcceptanceRefusal::IssuerLacksAuthority)
+        );
+    }
+
+    /// A recovery invitation is tied to the seat that issued it (spec §6.4, §6.5): if
+    /// the seat has since moved to someone else, the old invitation no longer carries
+    /// authority, whether or not the FAU still has no admin.
+    #[test]
+    fn a_recovery_invitation_dies_when_the_seat_moves() {
+        let s = AcceptanceSnapshot {
+            recovery_seat_matches_today: false,
+            ..valid(InvitationMode::Recovery)
+        };
+        assert_eq!(
+            check_acceptance(&s, ts(NOW)),
             Err(AcceptanceRefusal::IssuerLacksAuthority)
         );
     }

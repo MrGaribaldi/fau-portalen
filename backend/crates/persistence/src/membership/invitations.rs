@@ -313,6 +313,8 @@ struct InvitationRow {
     recipient_email: String,
     issued_by: Option<Uuid>,
     handover_grant_id: Option<Uuid>,
+    /// Which seat issued a `recovery` invitation (spec 6.4, 6.5); `None` otherwise.
+    recovery_holder: Option<RecoveryHolder>,
     expires_at: Timestamp,
     accepted: bool,
     revoked: bool,
@@ -324,9 +326,18 @@ async fn lock_invitation(
     invitation_id: Uuid,
     token_hash: Option<&[u8]>,
 ) -> Result<Option<InvitationRow>, MembershipError> {
-    type Row = (String, String, Option<Uuid>, Option<Uuid>, i64, bool, bool);
+    type Row = (
+        String,
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        i64,
+        bool,
+        bool,
+    );
     let row: Option<Row> = sqlx::query_as(
-        "select mode, recipient_email, issued_by, handover_grant_id,
+        "select mode, recipient_email, issued_by, handover_grant_id, recovery_holder,
                 (extract(epoch from expires_at) * 1000000)::bigint,
                 accepted_at is not null, revoked_at is not null
            from invitations
@@ -338,20 +349,59 @@ async fn lock_invitation(
     .bind(token_hash)
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((mode, recipient_email, issued_by, handover_grant_id, expires_us, accepted, revoked)) =
-        row
+    let Some((
+        mode,
+        recipient_email,
+        issued_by,
+        handover_grant_id,
+        recovery_holder,
+        expires_us,
+        accepted,
+        revoked,
+    )) = row
     else {
         return Ok(None);
     };
+    let recovery_holder = recovery_holder
+        .map(|h| RecoveryHolder::from_code(&h).ok_or_else(MembershipError::decode))
+        .transpose()?;
     Ok(Some(InvitationRow {
         mode: InvitationMode::from_code(&mode).ok_or_else(MembershipError::decode)?,
         recipient_email,
         issued_by,
         handover_grant_id,
+        recovery_holder,
         expires_at: from_micros(expires_us)?,
         accepted,
         revoked,
     }))
+}
+
+/// Whether the seat that issued a `recovery` invitation is still the seat holder today
+/// (spec 6.4, 6.5). A seat that has since moved -- for example from EWB to a confirmed
+/// school representative -- ends the old invitation's authority, the same way a
+/// handover invitation dies with its grant.
+///
+/// **Scope limit (fix round 1, Minor #5, carried forward):** this compares only the
+/// seat *kind* (`ewb` vs `school_rep`), not the specific person -- there is exactly one
+/// seat per tenant today, so the kind is the whole identity. It cannot yet distinguish
+/// a re-nomination from one confirmed school representative to a different one while
+/// the seat stays `school_rep`, because nothing builds that path yet (school-rep
+/// nomination is out of scope for #3418; see global-constraints.md). When nomination
+/// lands, an invitation must snapshot the seat's specific identity (not just its kind)
+/// and a seat *change* must take `lock_tenant` first, the same as every other
+/// membership mutation, so this check and the write that moves the seat cannot race.
+async fn recovery_seat_matches(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    issuing_holder: RecoveryHolder,
+) -> Result<bool, MembershipError> {
+    let current: Option<String> =
+        sqlx::query_scalar("select holder from recovery_contacts where tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(current.as_deref() == Some(issuing_holder.code()))
 }
 
 /// Re-sending or withdrawing a pending invitation.
@@ -632,6 +682,12 @@ pub async fn accept_invitation(
     } else {
         true
     };
+    let recovery_seat_matches_today = match (inv.mode, inv.recovery_holder) {
+        (InvitationMode::Recovery, Some(holder)) => {
+            recovery_seat_matches(&mut tx, tenant_id, holder).await?
+        }
+        _ => true,
+    };
 
     let snapshot = AcceptanceSnapshot {
         mode: inv.mode,
@@ -646,6 +702,7 @@ pub async fn accept_invitation(
         issuer_admin_today,
         handover_grant_valid_today,
         tenant_has_admin_today,
+        recovery_seat_matches_today,
     };
     check_acceptance(&snapshot, at.now()).map_err(MembershipError::Acceptance)?;
 

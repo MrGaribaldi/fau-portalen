@@ -6,6 +6,7 @@
 //! "today" come from the caller, never from the database clock.
 
 mod error;
+mod handover;
 mod invitations;
 mod requests;
 mod roles;
@@ -14,6 +15,7 @@ mod sql;
 mod token;
 
 pub use error::{ExistingFau, MembershipError};
+pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{
     accept_invitation, issue_invitation, resend_invitation, withdraw_invitation, AcceptInvitation,
     Accepted, InvitationChange, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,

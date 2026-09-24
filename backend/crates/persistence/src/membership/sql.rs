@@ -28,8 +28,9 @@ use super::error::MembershipError;
 /// The condition every "usable membership" query shares: the membership itself is not
 /// revoked, and the account behind it is verified and not disabled. Kept in one place
 /// so every query that filters on it agrees -- the handover-grant queries once drifted
-/// from the role-assignment ones by omitting the verified check.
-const USABLE_ACCOUNT: &str =
+/// from the role-assignment ones by omitting the verified check. `pub(crate)` so the
+/// sweep in `handover.rs` shares it too (fix round 1, Minor #4).
+pub(crate) const USABLE_ACCOUNT: &str =
     "m.revoked_at is null and a.disabled_at is null and a.verified_at is not null";
 
 pub(crate) fn date_param(d: Date) -> String {
@@ -80,6 +81,8 @@ pub(crate) enum ActorKind {
     System,
     Registrant,
     Requester,
+    RecoveryEwb,
+    RecoverySchoolRep,
 }
 
 impl ActorKind {
@@ -89,6 +92,8 @@ impl ActorKind {
             ActorKind::System => "system",
             ActorKind::Registrant => "registrant",
             ActorKind::Requester => "requester",
+            ActorKind::RecoveryEwb => "recovery_ewb",
+            ActorKind::RecoverySchoolRep => "recovery_school_rep",
         }
     }
 }
@@ -394,6 +399,11 @@ pub(crate) async fn usable_member_email(
 
 /// Whether `grant_id` is valid today and still belongs to `membership_id`, through a
 /// membership that is not revoked and an account that is not disabled (spec 6.3).
+///
+/// **Defence in depth (fix round 1, Critical #1):** also requires the grant's own
+/// source assignment to be unrevoked. The sweep that creates grants now locks the
+/// tenant first, so a grant should never outlive a revocation of its source, but this
+/// read does not trust that invariant either.
 pub(crate) async fn handover_grant_valid(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -409,7 +419,7 @@ pub(crate) async fn handover_grant_valid(
              join memberships m       on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
              join accounts a          on a.id = m.account_id
             where g.tenant_id = $1 and g.id = $2 and ra.membership_id = $3
-              and g.revoked_at is null
+              and g.revoked_at is null and ra.revoked_at is null
               and g.starts_on <= $4::date and g.ends_on_exclusive > $4::date
               and {USABLE_ACCOUNT})"
     );
@@ -475,6 +485,9 @@ impl AdminState {
             });
         }
 
+        // Defence in depth (fix round 1, Critical #1): `ra.revoked_at is null` as well,
+        // so a grant can never confer admin coverage once its source assignment is
+        // revoked, whether or not the grant row itself was also revoked.
         let grants_sql = format!(
             "select g.source_assignment_id, ra.membership_id,
                     to_char(g.starts_on, 'YYYY-MM-DD'), to_char(g.ends_on_exclusive, 'YYYY-MM-DD'),
@@ -483,7 +496,7 @@ impl AdminState {
                join role_assignments ra on ra.tenant_id = g.tenant_id and ra.id = g.source_assignment_id
                join memberships m       on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
                join accounts a          on a.id = m.account_id
-              where g.tenant_id = $1 and {USABLE_ACCOUNT}"
+              where g.tenant_id = $1 and ra.revoked_at is null and {USABLE_ACCOUNT}"
         );
         let rows: Vec<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(&grants_sql)
             .bind(tenant_id)

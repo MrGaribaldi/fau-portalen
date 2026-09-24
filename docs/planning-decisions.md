@@ -2500,3 +2500,49 @@ Brreg bulk download and a full NSR grunnskole download, both discarded afterward
   already listed, becomes a review item.
 - **Weekly timing.** Mondays at 04:30 Europe/Oslo, after NSR's nightly Brreg import. The circuit
   breaker keeps its thresholds of 2% closed and 5% renamed per run.
+
+## Register foundation built: rulings for Erik's review (#3441) — 24 September 2026
+
+Part 1 of the register was built on the branch `school-register-3441`, following
+docs/superpowers/plans/2026-09-24-register-foundation.md. It covers migration 0004, the
+`fau_register` role and the pure register rules in `fau-domain`. Every task was reviewed, and a
+whole-branch review followed. Nothing has been seeded or applied to any environment. The agent
+made these rulings on Erik's behalf:
+
+**Schema (0004 is unapplied, so all of these are still cheap to change):**
+- **Row-level security confines the runtime role on three tables.** On `schools`, `fau_app` may
+  insert only a fresh, pending, submitted row. On `school_submissions`, only a pending submission
+  that no reviewer has touched. On `register_lookups`, only an unprocessed lookup with no
+  attempts. D9 says the runtime role must not be able to assert register outcomes.
+- **`fau_register` may delete only `held` schools.** This guards against mistakes, not against
+  the role itself, which can relabel a row.
+- **Review items point at schools with `on delete set null`.** A held row named in a
+  `possible_submission_match` can then be deleted when the match is resolved (§4.5). Its orgnr and
+  name must be kept in the item's `details`. The sync must write neither orgnr history nor FAU
+  links for a held row, because those references would block the delete again.
+- **Checks added beyond the plan:**
+  - `scope_reason` is limited to the seven domain codes;
+  - slug format and length checks on every slug column;
+  - review-item `details` capped at 2 KB;
+  - `fau_register` may delete municipality names that Kartverket drops.
+
+**Brreg rules:**
+- **FAU words are exactly §2.5's list.** "Samarbeidsutvalg" and "foreldreutvalg" were removed:
+  a samarbeidsutvalg is a different statutory body, and one registered at the school's address
+  would block the real FAU's link.
+- **A line is personal wherever its marker sits.** That covers a `c/o` anywhere, a `v/` before
+  the house number, and a `v/` after the house number that is followed by more words. The cost is
+  losing some real addresses, such as "V. Slottsgate 2" and "Storgata 12 V 2". Privacy wins over
+  recall. A lone house letter ("Storgata 12 V") still counts.
+- **What counts as naming the school, under Erik's `c/o` exception.** The line must contain the
+  school's full name, or its distinctive part followed by a school word ("Hosle skule" for Hosle
+  skole). A line that names the school but has no street and number yields no key.
+- **Addresses cannot reach a log.** `AddressKey` prints its street as `<redacted>` in debug
+  output. Keys may only ever be compared for exact equality, and never logged or stored. The
+  matcher plan inherits that rule.
+
+**Search and scope:**
+- **An empty search matches nothing.** A query with no letters or digits folds to "", and the
+  search plan must then return no rows rather than run the match.
+- **`primary_nace` picks the priority-1 NACE code.** It is tested on a combined school, since 50
+  combined schools depend on it.

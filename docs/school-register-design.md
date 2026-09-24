@@ -304,7 +304,7 @@ create unique index municipalities_slug_current on municipalities (slug);
 create table municipality_names (
   municipality_id uuid    not null references municipalities (id) on delete restrict,
   name            text    not null,
-  language        text    not null,                    -- BCP 47: 'nb', 'se', 'fkv', 'sma', 'smj'
+  language        text    not null,                    -- BCP 47: 'no', 'se', 'fkv', 'sma', 'smj'
   priority        integer not null,
   primary key (municipality_id, name)
 );

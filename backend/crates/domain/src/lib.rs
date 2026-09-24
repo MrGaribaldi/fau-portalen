@@ -4,6 +4,7 @@
 pub mod email;
 pub mod error_code;
 pub mod membership;
+pub mod register;
 pub mod schema_contract;
 pub mod time;
 

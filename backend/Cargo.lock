@@ -557,6 +557,7 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]

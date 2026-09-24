@@ -2408,3 +2408,10 @@ Erik decided on 24 September:
   backup root key.
 
 ADR-003 decision 5 and its closed items and standing risks are amended to match.
+
+## #3418 accepted; no upper bound on admin role periods for now — 24 September 2026
+
+Erik accepted #3418 on 24 September and merged the membership foundation (PR #2). On the open
+question he answered: admin role periods set through invitations, handover or recovery need no upper
+bound for now. Only the first signup date stays limited, to 1–24 months. He also confirmed the sealed
+access-request message on the card.

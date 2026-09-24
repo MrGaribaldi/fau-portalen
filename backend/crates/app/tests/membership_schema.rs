@@ -229,32 +229,24 @@ async fn access_request_constraints() {
     let pool = db.admin_pool();
     let (t, _, _) = seeded(&pool).await;
 
-    let insert = |email: &'static str, message: String| {
+    let insert = |email: &'static str| {
         sqlx::query(
             "insert into access_requests
-               (tenant_id, id, kind, requester_email, invitee_email, message, created_on, created_at)
-             values ($1, $2, 'access', $3, $3, $4, current_date, now())",
+               (tenant_id, id, kind, requester_email, invitee_email, created_on, created_at)
+             values ($1, $2, 'access', $3, $3, current_date, now())",
         )
         .bind(t)
         .bind(Uuid::now_v7())
         .bind(email)
-        .bind(message)
         .execute(&pool)
     };
-    insert("a@example.test", "ø".repeat(500)).await.unwrap();
-    let dup = insert("a@example.test", "igjen".into())
+    insert("a@example.test").await.unwrap();
+    let dup = insert("a@example.test")
         .await
         .expect_err("a second open request from one address was accepted");
     assert_eq!(
         constraint_name(&dup).as_deref(),
         Some("access_requests_one_open_per_address")
-    );
-    let long = insert("b@example.test", "ø".repeat(501))
-        .await
-        .expect_err("a 501-character message was accepted");
-    assert_eq!(
-        constraint_name(&long).as_deref(),
-        Some("access_request_message_is_short")
     );
 
     let replacement_without_role = sqlx::query(
@@ -270,6 +262,79 @@ async fn access_request_constraints() {
     assert_eq!(
         constraint_name(&replacement_without_role).as_deref(),
         Some("replacement_names_proposer_and_role")
+    );
+}
+
+#[tokio::test]
+async fn access_request_sealed_message_is_bounded() {
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+    let (t, _, _) = seeded(&pool).await;
+
+    let insert = |email: &'static str, sealed_message: Vec<u8>| {
+        sqlx::query(
+            "insert into access_requests
+               (tenant_id, id, kind, requester_email, invitee_email, sealed_message,
+                created_on, created_at)
+             values ($1, $2, 'access', $3, $3, $4, current_date, now())",
+        )
+        .bind(t)
+        .bind(Uuid::now_v7())
+        .bind(email)
+        .bind(sealed_message)
+        .execute(&pool)
+    };
+    insert("a@example.test", vec![0u8; 2200])
+        .await
+        .expect("2200 bytes is within the bound");
+    let too_long = insert("b@example.test", vec![0u8; 2201])
+        .await
+        .expect_err("2201 bytes was accepted");
+    assert_eq!(
+        sqlstate(&too_long).as_deref(),
+        Some("23514"),
+        "{too_long:?}"
+    );
+    assert_eq!(
+        constraint_name(&too_long).as_deref(),
+        Some("access_request_sealed_message_is_bounded")
+    );
+}
+
+#[tokio::test]
+async fn invitation_encrypted_message_is_bounded() {
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+    let (t, _, _) = seeded(&pool).await;
+
+    let insert = |hash: Vec<u8>, encrypted_message: Vec<u8>| {
+        sqlx::query(
+            "insert into invitations
+               (tenant_id, id, token_hash, mode, recipient_email, expires_at, created_at,
+                encrypted_message)
+             values ($1, $2, $3, 'activation', 'ny@example.test', now() + interval '14 days',
+                     now(), $4)",
+        )
+        .bind(t)
+        .bind(Uuid::now_v7())
+        .bind(hash)
+        .bind(encrypted_message)
+        .execute(&pool)
+    };
+    insert(vec![1u8; 32], vec![0u8; 2200])
+        .await
+        .expect("2200 bytes is within the bound");
+    let too_long = insert(vec![2u8; 32], vec![0u8; 2201])
+        .await
+        .expect_err("2201 bytes was accepted");
+    assert_eq!(
+        sqlstate(&too_long).as_deref(),
+        Some("23514"),
+        "{too_long:?}"
+    );
+    assert_eq!(
+        constraint_name(&too_long).as_deref(),
+        Some("invitation_encrypted_message_is_bounded")
     );
 }
 

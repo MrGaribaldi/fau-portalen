@@ -333,7 +333,6 @@ async fn handover_allows_nothing_else() {
         CreateAccessRequest {
             tenant_id: fau.tenant_id,
             requester: verified("sporsmal@example.test"),
-            message: None,
         },
         inside,
     )

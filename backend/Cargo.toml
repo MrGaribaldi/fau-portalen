@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 getrandom = "0.4"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -77,6 +77,7 @@ pub(crate) enum ActorKind {
     Member,
     System,
     Registrant,
+    Requester,
 }
 
 impl ActorKind {
@@ -85,6 +86,7 @@ impl ActorKind {
             ActorKind::Member => "member",
             ActorKind::System => "system",
             ActorKind::Registrant => "registrant",
+            ActorKind::Requester => "requester",
         }
     }
 }
@@ -478,24 +480,25 @@ async fn member_emails(
     today: Date,
     admins_only: bool,
 ) -> Result<Vec<String>, MembershipError> {
-    Ok(sqlx::query_scalar(
+    let sql = format!(
         "select distinct a.email
            from memberships m
            join accounts a          on a.id = m.account_id
            join role_assignments ra on ra.tenant_id = m.tenant_id and ra.membership_id = m.id
            join roles r             on r.tenant_id = ra.tenant_id and r.id = ra.role_id
           where m.tenant_id = $1
-            and m.revoked_at is null and a.disabled_at is null and a.verified_at is not null
+            and {USABLE_ACCOUNT}
             and ra.revoked_at is null
             and ra.starts_on <= $2::date and ra.ends_on_exclusive > $2::date
             and ($3 = false or r.capability_class = 'admin')
-          order by a.email",
-    )
-    .bind(tenant_id)
-    .bind(date_param(today))
-    .bind(admins_only)
-    .fetch_all(&mut *conn)
-    .await?)
+          order by a.email"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(tenant_id)
+        .bind(date_param(today))
+        .bind(admins_only)
+        .fetch_all(&mut *conn)
+        .await?)
 }
 
 /// Recovery notices (spec 6.4.4, ADR-003 decision 10): every current member; when none
@@ -527,4 +530,13 @@ pub(crate) async fn recovery_notice_recipients(
         recipients.push(EWB_OVERSIGHT_ADDRESS.to_owned());
     }
     Ok(recipients)
+}
+
+/// Addresses of everyone holding an admin-class role valid today.
+pub(crate) async fn admin_emails(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    today: Date,
+) -> Result<Vec<String>, MembershipError> {
+    member_emails(conn, tenant_id, today, true).await
 }

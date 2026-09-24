@@ -7,6 +7,7 @@
 
 mod error;
 mod invitations;
+mod requests;
 mod signup;
 mod sql;
 mod token;
@@ -15,6 +16,10 @@ pub use error::{ExistingFau, MembershipError};
 pub use invitations::{
     accept_invitation, issue_invitation, resend_invitation, withdraw_invitation, AcceptInvitation,
     Accepted, InvitationChange, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,
+};
+pub use requests::{
+    approve_request, create_access_request, create_replacement_proposal, decline_request,
+    lapse_requests, CreateAccessRequest, CreateReplacementProposal, RequestDecision,
 };
 pub use signup::{
     activate_tenant, create_pending_tenant, expire_pending_tenants, Activated, Activation,

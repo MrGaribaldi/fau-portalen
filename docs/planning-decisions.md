@@ -2415,3 +2415,83 @@ Erik accepted #3418 on 24 September and merged the membership foundation (PR #2)
 question he answered: admin role periods set through invitations, handover or recovery need no upper
 bound for now. Only the first signup date stays limited, to 1–24 months. He also confirmed the sealed
 access-request message on the card.
+
+## School register decided (#3441) — 24 September 2026
+
+Erik answered D1–D11 in docs/school-register-design.md §12 on #3441 on 24 September. Most accept
+the recommendation; four add to it.
+
+**Accepted as recommended:**
+- **D2** scope: the §2.3 filter (active grunnskoler, public and private, combined and special
+  schools in; adult education, VGS-only and abroad out), a manual 2100 Svalbard entry, and a
+  per-school operator override.
+- **D3** municipality slugs use the Norwegian name: `0301-oslo`, `5540-kaafjord`.
+- **D4** transliteration beyond æ/ø/å per §6. ADR-002 is amended.
+- **D5** an operator can override a display name, and the sync respects the override.
+- **D6** enumeration is read as §8 reads it. The register is open data and may be listed. What is
+  protected is personal data, unverified submissions, pending state and membership. Outreach links
+  are not secrets.
+- **D7** unverified submitted schools stay hidden from the picker until verified.
+- **D8** closures and re-registrations are automatic unless an FAU is attached, which makes them a
+  review item.
+- **D10** outreach links may carry one campaign-level parameter shared by every recipient of a
+  mailing (`?kampanje=2026-10`), never a per-recipient one. Outreach itself still needs its own
+  authorisation (#3426, #3427).
+
+**Changed or extended by Erik:**
+- **D1: NSR, Kartverket and SSB, plus Brreg's Enhetsregisteret for the FAU-er themselves.** Most
+  FAU-er are registered in Brreg as their own entities. The register links each one to its school
+  so that an FAU whose name differs from the school's is named correctly from the start. Matching
+  is by address: an FAU and a school at the same address are a match, and several FAU-er at one
+  address are flagged for manual inspection. The Udir `nxr-teknisk@udir.no` notice subscription is
+  part of D1.
+- **D9: a CronJob with its own `fau_register` role, but weekly, not daily.** A "Mangler skolen
+  din?" submission triggers an immediate lookup in NSR. If the school is there, the submission is
+  approved at once instead of waiting for manual review, because the school is now known.
+- **D11: the `fau register review` CLI plus email for the MVP.** The admin web screen (b) is high
+  priority immediately after.
+- **Merging FAU-er when schools merge (new requirement).** When two schools combine, a new FAU for
+  the merged school gets the old FAU-er's documents shared into it. Members keep read-only access
+  to the old FAU-er and continue in the new one. This supersedes §4.5's "The product does not merge
+  FAU-er". It depends on the document layer (#3419) and per-document keys (ADR-003 decision 5), so
+  it is its own card. The register only has to record the merger (many closed schools, one
+  successor), and its schema already allows that.
+
+**Agent rulings on the new parts, for Erik's review.** Measured on 24 September 2026 against a full
+Brreg bulk download and a full NSR grunnskole download, both discarded afterwards:
+- **Brreg addresses are personal data in practice.** 913 of the 2,477 FAU-like entities carry a
+  `c/o` or `v/` line, which usually names a person at a home address. So addresses are used only
+  in memory, during matching. They are never stored, logged, placed in a review item or shown.
+  Stored per entity: organisation number, registered name, organisation form, municipality number,
+  status and the match outcome.
+- **Which entities count as an FAU.** Organisation form FLI with a name containing FAU,
+  "foreldrenes/foreldrerådets arbeidsutvalg", "arbeidsutval(g)" or "foreldreråd(et)", matched on
+  word boundaries: 2,477 entities today. The Brreg search API cannot serve this. Its `navn` filter
+  is not a substring match, and FLI with NACE 94.992 is 73,355 rows, past its 10,000-row paging cap.
+  So the weekly sync streams the bulk file `enheter/lastned` (210 MB gzip, 1.18 million units,
+  about 40 s) and keeps only those entities.
+- **Address matching.** The FAU's street line and postcode are compared with the school's visiting
+  and postal address, after normalisation. `c/o`, `v/` and post-box lines are ignored. Unique in
+  both directions (one FAU, one school) links automatically: 1,256 today. Where the name also
+  identifies a single school, the two agree 876 times and disagree 4 times. Everything else goes to
+  review:
+  - several FAU-er at one school: 28 schools;
+  - one FAU address matching several schools: 29;
+  - address and name disagreeing.
+
+  **Name-only matches (360) are stored as unconfirmed candidates**, not linked and not queued. They
+  wait for the admin screen (D11b), so the seed does not flood the queue.
+- **What a link does.** At signup the FAU name defaults to the linked entity's registered name,
+  case-normalised because Brreg stores names in capitals, and otherwise to the school's display
+  name. It is a suggestion the registrant edits, like every other prefill. The link grants nothing.
+- **The seed sends one summary email**, not one per review item. Later runs email each new item.
+- **The submission lookup keeps D9's privilege line.** The submission queues a lookup row, which
+  the runtime role may insert. `fau register lookups`, running as `fau_register`, reads NSR's
+  list for that municipality and processes the queue. It runs every few minutes as a CronJob
+  (#3424), so "immediately" means within minutes. Approval is automatic only when exactly one
+  active, in-scope NSR school in the submitted municipality, not already in the register, has the
+  same folded name. The submitted school then absorbs the NSR data, is verified, gets its slug,
+  and Erik is told rather than asked. A similar but not identical name, or a match with a school
+  already listed, becomes a review item.
+- **Weekly timing.** Mondays at 04:30 Europe/Oslo, after NSR's nightly Brreg import. The circuit
+  breaker keeps its thresholds of 2% closed and 5% renamed per run.

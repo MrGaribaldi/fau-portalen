@@ -83,11 +83,13 @@ async fn submitted_school(pool: &sqlx::PgPool, m: Uuid) -> Result<Uuid, sqlx::Er
 
 /// One field the register itself later curates, overridden from the shape
 /// `schools_app_submit` (0004, tightened 24 September 2026) otherwise allows --
-/// `submitted_school`'s own shape, with exactly one field changed. `label` names
-/// which field, for the assertion message.
+/// `submitted_school`'s own shape, with exactly one field changed, chosen so the
+/// row passes every table-level `CHECK` constraint and only the policy itself
+/// refuses it. `label` names which field, for the assertion message.
 #[derive(Clone, Copy)]
 struct AppSubmitCase<'a> {
     label: &'a str,
+    verification: &'a str,
     slug: Option<&'a str>,
     orgnr: Option<&'a str>,
     display_name_curated: bool,
@@ -102,6 +104,7 @@ impl<'a> AppSubmitCase<'a> {
     fn baseline(label: &'a str) -> Self {
         Self {
             label,
+            verification: "pending",
             slug: None,
             orgnr: None,
             display_name_curated: false,
@@ -122,10 +125,11 @@ async fn app_submit_variant(
         "insert into schools
            (id, municipality_id, origin, display_name, verification, slug, orgnr,
             display_name_curated, status, closed_on, successor_id, search_text)
-         values ($1, $2, 'submitted', 'X', 'pending', $3, $4, $5, $6, $7::date, $8, 'x')",
+         values ($1, $2, 'submitted', 'X', $3, $4, $5, $6, $7, $8::date, $9, 'x')",
     )
     .bind(id)
     .bind(m)
+    .bind(case.verification)
     .bind(case.slug)
     .bind(case.orgnr)
     .bind(case.display_name_curated)
@@ -447,7 +451,15 @@ async fn the_runtime_role_may_insert_only_a_pending_submitted_school() {
     // review): naming any one of them is refused outright, not merely ignored.
     let held_target = listed_school(&admin, m, "900000029", None).await.unwrap();
     let cases = [
+        // verification is 'verified', not the baseline's 'pending', so this row
+        // passes schools_slug_needs_verification (which requires verification in
+        // ('listed', 'verified') whenever slug is set) and only the policy's own
+        // "slug is null" clause is violated. That clause is actually implied once
+        // verification is pinned to 'pending' -- a slug can never coexist with
+        // 'pending' at the CHECK level either -- and is kept here as defence in
+        // depth.
         AppSubmitCase {
+            verification: "verified",
             slug: Some("x-slug"),
             ..AppSubmitCase::baseline("a slug")
         },
@@ -556,7 +568,7 @@ async fn the_runtime_role_may_queue_a_submission_and_its_lookup_but_not_curate_t
         "fau_app must not curate a submission's review_state"
     );
 
-    // Likewise a lookup fau_app tries to hand itself an outcome.
+    // Likewise a lookup fau_app tries to hand itself an outcome, or a retry count.
     let school3 = submitted_school(&app, m).await.unwrap();
     let submission3 = Uuid::now_v7();
     sqlx::query(
@@ -572,8 +584,14 @@ async fn the_runtime_role_may_queue_a_submission_and_its_lookup_but_not_curate_t
     .execute(&app)
     .await
     .unwrap();
+
+    // processed_at is set too, so this row passes
+    // register_lookups_outcome_when_processed ((processed_at is null) = (outcome is
+    // null)) and only the policy's own "processed_at is null and outcome is null"
+    // clause is violated.
     let err = sqlx::query(
-        "insert into register_lookups (id, submission_id, queued_at, outcome) values ($1, $2, now(), 'approved')",
+        "insert into register_lookups (id, submission_id, queued_at, processed_at, outcome)
+         values ($1, $2, now(), now(), 'approved')",
     )
     .bind(Uuid::now_v7())
     .bind(submission3)
@@ -584,6 +602,23 @@ async fn the_runtime_role_may_queue_a_submission_and_its_lookup_but_not_curate_t
         sqlstate(&err).as_deref(),
         Some("42501"),
         "fau_app must not assert a lookup outcome"
+    );
+
+    // attempts alone, with processed_at and outcome both left null, passes every
+    // CHECK (attempts >= 0) and only the policy's "attempts = 0" clause is
+    // violated.
+    let err = sqlx::query(
+        "insert into register_lookups (id, submission_id, queued_at, attempts) values ($1, $2, now(), 1)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(submission3)
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not assert a lookup's attempt count"
     );
 }
 

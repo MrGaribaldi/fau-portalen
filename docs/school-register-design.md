@@ -910,7 +910,11 @@ leader's published address), and lives **outside the product database**. To avoi
 
 - **The product register is the only source of school identity.** #3431 keys every row on our school
   UUID and orgnr, taken from an export of the product register: `fau register export`, which lists
-  UUID, orgnr, municipality number, name and path. It never edits school data.
+  UUID, orgnr, municipality number, name, path and the linked FAU's Brreg orgnr. It never edits
+  school data.
+- **FAU contact e-mail is fetched live from Brreg by #3431 at send time,** by the FAU's orgnr, and
+  never stored in the product (Erik, 24 September). The register's parser does not read Brreg's
+  `epostadresse`, `mobil` or `telefon` fields at all.
 - **The flow is one-way.** Nothing from #3431 is imported into the product. If sales finds a school
   NSR lacks, it goes through "Mangler skolen din?" or the operator path like any other.
 - Outreach links are built from the export as `/bli-med/<uuid>`. Contact data stays in #3431, under

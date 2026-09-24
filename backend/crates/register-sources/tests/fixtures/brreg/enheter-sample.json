@@ -1,0 +1,523 @@
+[
+ {
+  "organisasjonsnummer": "918316450",
+  "navn": "HOSLE FAU",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2017-01-04",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1362",
+   "poststed": "HOSLE",
+   "adresse": [
+    "Bispeveien 73"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2016-08-31",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "FAU’s formål er å være bindeleddet mellom foreldre og skolen og skal",
+   "jobbe for å fremme et godt læringsmiljø for alle elever."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "833442252",
+  "navn": "FORENINGEN FAU BEKKESTUA SKOLE",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2024-06-12",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1357",
+   "poststed": "BEKKESTUA",
+   "adresse": [
+    "Falkeveien 14"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2024-04-16",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "Foreldrenes Arbeidsutvalg (FAU) på Bekkestua Skole er",
+   "foreldrenes/foresattes formelle organ i samarbeidet med Bekkestua",
+   "skole. Foreldrerådets arbeidsutvalg (FAU) skal fremme fellesinteresser",
+   "til foreldrene, være bindeleddet mellom foreldrene og skolen og jobbe",
+   "for et godt læringsmiljø for alle elever."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "918906762",
+  "navn": "FAU VED BEKKESTUA BARNESKOLE",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2017-04-26",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1357",
+   "poststed": "BEKKESTUA",
+   "adresse": [
+    "Bekkestua barneskole/FAU",
+    "Falkeveien 14"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2017-04-05",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "Skape godt samhold mellom hjemmet og skolen, legge til rette for",
+   "trivsel og positiv utvikling hos elevene og skape kontakt mellom",
+   "skolen og lokalsamfunnet."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "914829984",
+  "navn": "FAU LIOM BARNEHAGE",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2015-02-03",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1358",
+   "poststed": "JAR",
+   "adresse": [
+    "Fagertunveien 120"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2014-01-15",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "Å arbeide for å skape godt samhold og samarbeid mellom hjem og",
+   "barnehage."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "918838678",
+  "navn": "JAR SKOLE FAU",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2017-10-20",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1358",
+   "poststed": "JAR",
+   "adresse": [
+    "Jar Skole",
+    "Storengveien 2-4"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2017-09-13",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "FAU er en forening med formål om å arbeide aktivt for å fremme Jar",
+   "skoles visjon om en begeistret skole. Foreningen skal være et forum",
+   "som skal fremme foreldres felles interesser og ivareta muligheter til",
+   "reell medvirkning og innflytelse på utviklingen av Jar skole.",
+   "Foreningen skal arbeide for en god og åpen relasjon mellom hjem, skole",
+   "og nærmiljø, samt motivere til at elever og foresatte tar aktivt del i",
+   "arbeidet med å skape et godt skolemiljø. Foreningen skal være et",
+   "kontaktledd mellom foreldrene og ledelsen ved Jar skole."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "914495482",
+  "navn": "EMMA HJORTH SKOLE FAU",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "hjemmeside": "emmahjorth.skole.no",
+  "registreringsdatoEnhetsregisteret": "2014-11-20",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1336",
+   "poststed": "SANDVIKA",
+   "adresse": [
+    "Emma Hjorth skole",
+    "Tokes vei 50"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2014-11-12",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "Foreningen skal fremme fellesinteressene til foreldre og barn ved",
+   "skolen, og arbeide for å skape et godt skolemiljø ved Emma Hjorth",
+   "skole."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "988936871",
+  "navn": "FAUSKE IDRETTSLAG ALPINT",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [
+   {
+    "navn": "FAUSKE IDRETTSLAG/ALPINT/SNOWBOARD",
+    "fraDato": "2006-01-20 13:35:25",
+    "tilDato": "2006-02-22 21:41:16"
+   },
+   {
+    "navn": "FAUSKE IDRETTSLAG/ALPINT/SNOWBOARD",
+    "fraDato": "2006-02-22 21:41:16",
+    "tilDato": "2022-12-22 11:10:11"
+   }
+  ],
+  "hjemmeside": "www.holtanlia.no",
+  "postadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "8201",
+   "poststed": "FAUSKE",
+   "adresse": [
+    "Postboks 240"
+   ],
+   "kommune": "FAUSKE",
+   "kommunenummer": "1841"
+  },
+  "registreringsdatoEnhetsregisteret": "2006-01-20",
+  "registrertIMvaregisteret": true,
+  "naeringskode1": {
+   "kode": "93.120",
+   "beskrivelse": "Aktiviteter i idrettslag og -klubber"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "registreringsdatoMerverdiavgiftsregisteret": "2007-11-01",
+  "registreringsdatoMerverdiavgiftsregisteretEnhetsregisteret": "2007-11-13",
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "8219",
+   "poststed": "FAUSKE",
+   "adresse": [
+    "Holtanveien 454"
+   ],
+   "kommune": "FAUSKE",
+   "kommunenummer": "1841"
+  },
+  "stiftelsesdato": "2005-05-24",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": true,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": true,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "vedtektsdato": "2019-06-25",
+  "vedtektsfestetFormaal": [
+   "Drive idrett organisert i Norges Idrettsforbund og Olympiske Komite",
+   "(NIF).",
+   " "
+  ],
+  "aktivitet": [
+   "Drive og bygge snøparkanlegg i Fauske kommune.",
+   " "
+  ],
+  "registreringsdatoForetaksregisteret": "2006-02-22",
+  "registreringsdatoFrivillighetsregisteret": "2014-03-31",
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet"
+ },
+ {
+  "organisasjonsnummer": "913591100",
+  "navn": "FAU STORØYA SKOLE",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2018-03-19",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1364",
+   "poststed": "FORNEBU",
+   "adresse": [
+    "c/o Kari Nordmann",
+    "Oppdiktet vei 1"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2017-09-12",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "Arbeidsutvalg - FAU er bindeleddet mellom foreldrene og skolen."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet",
+  "_fixture_note": "Address, e-mail and mobile replaced with invented values; the real record names a private person.",
+  "epostadresse": "kari.nordmann@example.invalid",
+  "mobil": "+4700000000"
+ },
+ {
+  "organisasjonsnummer": "999999999",
+  "navn": "FAU TESTKOPI HOSLE",
+  "organisasjonsform": {
+   "kode": "FLI",
+   "beskrivelse": "Forening/lag/innretning",
+   "_links": {
+    "self": {
+     "href": "https://data.brreg.no/enhetsregisteret/api/organisasjonsformer/FLI"
+    }
+   }
+  },
+  "historiskeNavn": [],
+  "registreringsdatoEnhetsregisteret": "2017-01-04",
+  "registrertIMvaregisteret": false,
+  "naeringskode1": {
+   "kode": "94.992",
+   "beskrivelse": "Aktiviteter i andre medlemsorganisasjoner ellers"
+  },
+  "harRegistrertAntallAnsatte": false,
+  "forretningsadresse": {
+   "land": "Norge",
+   "landkode": "NO",
+   "postnummer": "1362",
+   "poststed": "HOSLE",
+   "adresse": [
+    "c/o Hosle skole",
+    "Bispeveien 73"
+   ],
+   "kommune": "BÆRUM",
+   "kommunenummer": "3201"
+  },
+  "stiftelsesdato": "2016-08-31",
+  "institusjonellSektorkode": {
+   "kode": "7000",
+   "beskrivelse": "Ideelle organisasjoner"
+  },
+  "registrertIForetaksregisteret": false,
+  "registrertIStiftelsesregisteret": false,
+  "registrertIFrivillighetsregisteret": false,
+  "konkurs": false,
+  "underAvvikling": false,
+  "underTvangsavviklingEllerTvangsopplosning": false,
+  "maalform": "Bokmål",
+  "aktivitet": [
+   "FAU’s formål er å være bindeleddet mellom foreldre og skolen og skal",
+   "jobbe for å fremme et godt læringsmiljø for alle elever."
+  ],
+  "registrertIPartiregisteret": false,
+  "paategninger": [],
+  "erIKonsern": false,
+  "respons_klasse": "Enhet",
+  "_fixture_note": "Synthetic: a real Hosle FAU record with a c/o line naming the school."
+ }
+]

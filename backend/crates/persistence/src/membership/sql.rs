@@ -10,7 +10,9 @@
 //! timestamps always come from the caller's `Moment`, never from SQL `now()`, so a test
 //! can move time.
 
-use fau_domain::membership::access::{tenant_has_admin, AssignmentView, GrantView};
+use fau_domain::membership::access::{
+    removal_leaves_no_admin, tenant_has_admin, AssignmentView, GrantView,
+};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::rules::{recent_holder_window_start, EWB_OVERSIGHT_ADDRESS};
 use fau_domain::membership::vocabulary::{CapabilityClass, TenantStatus};
@@ -332,6 +334,27 @@ pub(crate) async fn require_admin(
     }
 }
 
+/// The membership's revocation state and whether its account is usable (verified and
+/// not disabled), read under `for update`. `None` when no such membership exists.
+/// `grant_role`'s target check: a revoked membership and an unusable account are
+/// reported as distinct, typed refusals rather than collapsed into one.
+pub(crate) async fn membership_and_account_state(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+) -> Result<Option<(bool, bool)>, MembershipError> {
+    let sql = format!(
+        "select m.revoked_at is not null, ({USABLE_ACCOUNT})
+           from memberships m join accounts a on a.id = m.account_id
+          where m.tenant_id = $1 and m.id = $2 for update"
+    );
+    Ok(sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .bind(membership_id)
+        .fetch_optional(&mut *conn)
+        .await?)
+}
+
 /// Whether the membership is not revoked and its account is verified and not disabled.
 pub(crate) async fn membership_usable(
     conn: &mut PgConnection,
@@ -399,11 +422,24 @@ pub(crate) async fn handover_grant_valid(
         .await?)
 }
 
+pub(crate) struct AdminAssignmentRow {
+    pub(crate) id: Uuid,
+    pub(crate) membership_id: Uuid,
+    pub(crate) view: AssignmentView,
+}
+
+pub(crate) struct GrantRow {
+    pub(crate) source_assignment_id: Uuid,
+    pub(crate) membership_id: Uuid,
+    pub(crate) view: GrantView,
+}
+
 /// Every admin-class assignment and handover grant held through a usable membership:
-/// the inputs to the no-admin predicate (spec 6.4).
+/// the inputs to the no-admin predicate (spec 6.4), with ids so the last-admin safeguard
+/// can ask "and without this one?".
 pub(crate) struct AdminState {
-    assignments: Vec<AssignmentView>,
-    grants: Vec<GrantView>,
+    pub(crate) assignments: Vec<AdminAssignmentRow>,
+    pub(crate) grants: Vec<GrantRow>,
 }
 
 impl AdminState {
@@ -412,7 +448,8 @@ impl AdminState {
         tenant_id: Uuid,
     ) -> Result<Self, MembershipError> {
         let assignments_sql = format!(
-            "select to_char(ra.starts_on, 'YYYY-MM-DD'), to_char(ra.ends_on_exclusive, 'YYYY-MM-DD'),
+            "select ra.id, ra.membership_id,
+                    to_char(ra.starts_on, 'YYYY-MM-DD'), to_char(ra.ends_on_exclusive, 'YYYY-MM-DD'),
                     ra.revoked_at is not null
                from role_assignments ra
                join roles r       on r.tenant_id = ra.tenant_id and r.id = ra.role_id
@@ -421,21 +458,26 @@ impl AdminState {
               where ra.tenant_id = $1 and r.capability_class = 'admin'
                 and {USABLE_ACCOUNT}"
         );
-        let rows: Vec<(String, String, bool)> = sqlx::query_as(&assignments_sql)
+        let rows: Vec<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(&assignments_sql)
             .bind(tenant_id)
             .fetch_all(&mut *conn)
             .await?;
         let mut assignments = Vec::with_capacity(rows.len());
-        for (starts, ends, revoked) in rows {
-            assignments.push(AssignmentView {
-                capability: CapabilityClass::Admin,
-                period: period_from(&starts, &ends)?,
-                revoked,
+        for (id, membership_id, starts, ends, revoked) in rows {
+            assignments.push(AdminAssignmentRow {
+                id,
+                membership_id,
+                view: AssignmentView {
+                    capability: CapabilityClass::Admin,
+                    period: period_from(&starts, &ends)?,
+                    revoked,
+                },
             });
         }
 
         let grants_sql = format!(
-            "select to_char(g.starts_on, 'YYYY-MM-DD'), to_char(g.ends_on_exclusive, 'YYYY-MM-DD'),
+            "select g.source_assignment_id, ra.membership_id,
+                    to_char(g.starts_on, 'YYYY-MM-DD'), to_char(g.ends_on_exclusive, 'YYYY-MM-DD'),
                     g.revoked_at is not null
                from handover_grants g
                join role_assignments ra on ra.tenant_id = g.tenant_id and ra.id = g.source_assignment_id
@@ -443,15 +485,19 @@ impl AdminState {
                join accounts a          on a.id = m.account_id
               where g.tenant_id = $1 and {USABLE_ACCOUNT}"
         );
-        let rows: Vec<(String, String, bool)> = sqlx::query_as(&grants_sql)
+        let rows: Vec<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(&grants_sql)
             .bind(tenant_id)
             .fetch_all(&mut *conn)
             .await?;
         let mut grants = Vec::with_capacity(rows.len());
-        for (starts, ends, revoked) in rows {
-            grants.push(GrantView {
-                period: period_from(&starts, &ends)?,
-                revoked,
+        for (source_assignment_id, membership_id, starts, ends, revoked) in rows {
+            grants.push(GrantRow {
+                source_assignment_id,
+                membership_id,
+                view: GrantView {
+                    period: period_from(&starts, &ends)?,
+                    revoked,
+                },
             });
         }
         Ok(Self {
@@ -461,8 +507,43 @@ impl AdminState {
     }
 
     pub(crate) fn has_admin(&self, today: Date) -> bool {
-        tenant_has_admin(&self.assignments, &self.grants, today)
+        let assignments: Vec<AssignmentView> = self.assignments.iter().map(|r| r.view).collect();
+        let grants: Vec<GrantView> = self.grants.iter().map(|r| r.view).collect();
+        tenant_has_admin(&assignments, &grants, today)
     }
+}
+
+/// The last-admin safeguard (spec 7). `removed(assignment_id, membership_id)` names the
+/// assignments an action ends; a grant goes with its source assignment. Refuses, unless
+/// confirmed, an action that `removal_leaves_no_admin` says would leave the FAU without
+/// an admin; returns whether it does, for the audit entry.
+pub(crate) fn check_last_admin(
+    state: &AdminState,
+    today: Date,
+    confirm_no_admin: bool,
+    removed: impl Fn(Uuid, Uuid) -> bool,
+) -> Result<bool, MembershipError> {
+    let (mut kept_a, mut gone_a) = (Vec::new(), Vec::new());
+    for r in &state.assignments {
+        if removed(r.id, r.membership_id) {
+            gone_a.push(r.view);
+        } else {
+            kept_a.push(r.view);
+        }
+    }
+    let (mut kept_g, mut gone_g) = (Vec::new(), Vec::new());
+    for r in &state.grants {
+        if removed(r.source_assignment_id, r.membership_id) {
+            gone_g.push(r.view);
+        } else {
+            kept_g.push(r.view);
+        }
+    }
+    let leaves_none = removal_leaves_no_admin(&kept_a, &kept_g, &gone_a, &gone_g, today);
+    if leaves_none && !confirm_no_admin {
+        return Err(MembershipError::WouldLeaveNoAdmin);
+    }
+    Ok(leaves_none)
 }
 
 /// Addresses of every current member: a usable membership with any role valid today.

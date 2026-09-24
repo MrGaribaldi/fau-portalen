@@ -8,6 +8,7 @@
 mod error;
 mod invitations;
 mod requests;
+mod roles;
 mod signup;
 mod sql;
 mod token;
@@ -20,6 +21,10 @@ pub use invitations::{
 pub use requests::{
     approve_request, create_access_request, create_replacement_proposal, decline_request,
     lapse_requests, CreateAccessRequest, CreateReplacementProposal, RequestDecision,
+};
+pub use roles::{
+    grant_role, revoke_membership, revoke_role_assignment, GrantRole, RevokeAssignment,
+    RevokeMembership,
 };
 pub use signup::{
     activate_tenant, create_pending_tenant, expire_pending_tenants, Activated, Activation,

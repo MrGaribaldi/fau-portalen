@@ -115,6 +115,63 @@ pub fn tenant_has_admin(assignments: &[AssignmentView], grants: &[GrantView], to
         || grants.iter().any(|g| g.valid_on(today))
 }
 
+/// Spec 7's last-admin safeguard: whether ending `removed_*` would leave a day, from
+/// `today` on, on which the FAU has no admin although the removed rows would have given
+/// it one. Judging only today would make "revoking the only other admin" impossible to
+/// catch -- the revoking admin is valid today by definition -- so the check runs over
+/// the removed rows' remaining term: an admin whose own role ends in December revoking
+/// the admin who would have carried the FAU until next October leaves a gap.
+///
+/// Coverage can only drop where a remaining row ends, so checking the first remaining
+/// day of each removed row and every remaining end inside it is exhaustive. Handover
+/// grants that do not exist yet (they are created when a role ends) are not predicted.
+pub fn removal_leaves_no_admin(
+    remaining_assignments: &[AssignmentView],
+    remaining_grants: &[GrantView],
+    removed_assignments: &[AssignmentView],
+    removed_grants: &[GrantView],
+    today: Date,
+) -> bool {
+    let covered = |day: Date| tenant_has_admin(remaining_assignments, remaining_grants, day);
+    let remaining_ends: Vec<Date> = remaining_assignments
+        .iter()
+        .filter(|a| !a.revoked && a.capability == CapabilityClass::Admin)
+        .map(|a| a.period.ends_on_exclusive())
+        .chain(
+            remaining_grants
+                .iter()
+                .filter(|g| !g.revoked)
+                .map(|g| g.period.ends_on_exclusive()),
+        )
+        .collect();
+    let removed = removed_assignments
+        .iter()
+        .filter(|a| !a.revoked && a.capability == CapabilityClass::Admin)
+        .map(|a| a.period)
+        .chain(
+            removed_grants
+                .iter()
+                .filter(|g| !g.revoked)
+                .map(|g| g.period),
+        );
+    for period in removed {
+        if period.has_ended_by(today) {
+            continue;
+        }
+        let first = period.starts_on().max(today);
+        if !covered(first) {
+            return true;
+        }
+        if remaining_ends
+            .iter()
+            .any(|&end| first < end && end < period.ends_on_exclusive() && !covered(end))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +326,75 @@ mod tests {
             tenant_has_admin(&[member], &[g], today),
             "a valid handover grant counts"
         );
+    }
+
+    #[test]
+    fn removing_the_sole_admin_leaves_none() {
+        let today = date(2026, 9, 23);
+        let only = role(CapabilityClass::Admin, date(2026, 9, 1), date(2027, 10, 1));
+        assert!(removal_leaves_no_admin(&[], &[], &[only], &[], today));
+    }
+
+    #[test]
+    fn removing_one_of_two_equal_admins_leaves_one() {
+        let today = date(2026, 9, 23);
+        let a = role(CapabilityClass::Admin, date(2026, 9, 1), date(2027, 10, 1));
+        let b = role(CapabilityClass::Admin, date(2026, 9, 1), date(2027, 10, 1));
+        assert!(!removal_leaves_no_admin(&[a], &[], &[b], &[], today));
+    }
+
+    #[test]
+    fn removing_the_admin_who_outlasts_you_leaves_a_gap() {
+        // Spec 7's "an admin revoking the only other admin".
+        let today = date(2026, 9, 23);
+        let short = role(CapabilityClass::Admin, date(2026, 1, 1), date(2026, 12, 1));
+        let long = role(CapabilityClass::Admin, date(2026, 1, 1), date(2027, 10, 1));
+        assert!(removal_leaves_no_admin(&[short], &[], &[long], &[], today));
+
+        let successor = role(CapabilityClass::Admin, date(2026, 12, 1), date(2027, 10, 1));
+        assert!(!removal_leaves_no_admin(
+            &[short, successor],
+            &[],
+            &[long],
+            &[],
+            today
+        ));
+    }
+
+    #[test]
+    fn removing_an_ended_or_member_role_changes_nothing() {
+        let today = date(2026, 9, 23);
+        let ended = role(CapabilityClass::Admin, date(2025, 9, 1), date(2026, 9, 1));
+        let member = role(CapabilityClass::Member, date(2026, 9, 1), date(2027, 9, 1));
+        assert!(!removal_leaves_no_admin(
+            &[],
+            &[],
+            &[ended, member],
+            &[],
+            today
+        ));
+    }
+
+    #[test]
+    fn removing_a_future_admin_with_nobody_else_then_leaves_a_gap() {
+        let today = date(2026, 9, 23);
+        let current = role(CapabilityClass::Admin, date(2026, 1, 1), date(2026, 12, 1));
+        let next = role(CapabilityClass::Admin, date(2026, 12, 1), date(2027, 12, 1));
+        assert!(removal_leaves_no_admin(
+            &[current],
+            &[],
+            &[next],
+            &[],
+            today
+        ));
+    }
+
+    #[test]
+    fn a_remaining_handover_grant_counts_as_coverage() {
+        let today = date(2026, 9, 23);
+        let g = grant(date(2026, 8, 1), date(2027, 2, 1));
+        let admin = role(CapabilityClass::Admin, date(2026, 9, 1), date(2026, 12, 1));
+        assert!(!removal_leaves_no_admin(&[], &[g], &[admin], &[], today));
+        assert!(removal_leaves_no_admin(&[], &[], &[], &[g], today));
     }
 }

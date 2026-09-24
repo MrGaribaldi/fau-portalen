@@ -2296,3 +2296,54 @@ All three cards are Done. Erik then authorised overnight work, with his review i
 - research the #3441 school register;
 - plan migration 0003 and the membership domain that does not depend on the register, and build it
   test-first on a feature branch.
+
+## Membership foundation built overnight: rulings and deferrals (#3418) — 24 September 2026
+
+The register-independent membership foundation was built overnight on the branch
+`membership-foundation-3418`, following docs/superpowers/plans/2026-09-24-membership-foundation.md.
+Every task was reviewed, and a whole-branch review followed. The agent made these rulings on Erik's
+behalf, and Erik reviews them.
+
+**Rulings on behaviour:**
+- **Frozen FAU.** Declining a request, lapsing requests, withdrawing an invitation and revoking roles
+  or memberships are allowed. Each only closes something or reduces rights. This departs from the
+  literal "writes stop" in ADR-003 decision 7a. Issuing, re-sending, approving, granting, proposing
+  and recovery are refused.
+- **Self-proposal.** A member may propose themselves as the successor for their own role. An admin
+  still has to approve it.
+- **Stepping down.** A member may revoke one of their own roles. Spec §7 already lets them leave
+  entirely.
+- **Request message.** It may contain line breaks (`\r\n` is normalised to `\n`). Every other control
+  character is rejected. The limit is 500 characters, counted after normalisation.
+- **Replaced token.** A token replaced by a re-send is answered as unknown, not as "replaced". The old
+  hash is overwritten, so #3417's wording should cover both cases ("check your newest email").
+- **Recovery notices.** Every recovery notice also goes to fau@ewb-solutions.as. EWB holds the seat
+  only while no school representative is confirmed, so this matches ADR-003 decision 10 in every
+  reachable state.
+- **Outbox.** It carries a nullable `tenant_id`, for FAU deletion and Article 17 erasure.
+- **Order of checks.** Authority is checked before any row state is revealed. Tenant state (frozen or
+  closed) may be checked first, because members can see it anyway.
+- **Base-image pins.** The Dockerfile pins multi-arch index digests (recorded 23 September).
+
+**Deferred from spec 3413, not built yet:**
+- §6.1 expiry warnings, and the §6.4 no-admin flag and notification sweep. Both need a scheduler.
+- Recovery adding a plain member, outside the no-admin state.
+- School-representative nomination: nominating, confirming and changing the seat. When it is built,
+  the seat change must take the tenant lock, and recovery invitations must record the seat holder's
+  identity, not only whether the holder is EWB or a school representative.
+- The invitation preview read for the invitation page, and the one-admin banner query. Both come
+  with #3417 and #3422.
+- EWB recovery actions must record the acting operator in the audit entry before any recovery
+  endpoint ships (#3417).
+- The unauthenticated collision path, where each collision emails Erik, must be rate-limited at the
+  HTTP layer (#3417).
+
+**Decisions for Erik:**
+- **The request message is stored as plaintext.** An access request's message (free text, up to 500
+  characters) is on neither ADR-003 decision 6 list. Nothing writes it until #3417. The options are
+  to encrypt it, drop the field, or add it to the plaintext list.
+- **No upper bound on admin role periods.** Nothing limits the length of admin role periods set
+  through invitations, grants or recovery. Only the first signup date is limited, to 1–24 months.
+
+**Register design corrected (#3441).** Migration 0003 already creates the one-live-FAU-per-school
+index, so the register migration adds only the `schools` foreign key.

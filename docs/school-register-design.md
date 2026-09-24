@@ -378,14 +378,17 @@ create table school_slug_history (
 );
 ```
 
-**The one-FAU-per-school index** (flow §9), in the same migration:
+**The foreign key from tenants**, in the same migration:
 
 ```sql
 alter table tenants
   add constraint tenants_school_fk foreign key (school_id) references schools (id) on delete restrict;
-create unique index tenants_one_live_fau_per_school
-  on tenants (school_id) where status in ('pending', 'active');
 ```
+
+The one-FAU-per-school partial unique index already exists: migration 0003 (#3418) created
+`tenants_one_live_per_school` on `tenants (school_id)` where status is pending or active. The register
+migration adds only the foreign key and must not create the index again. (Corrected 24 September
+2026.)
 
 This **supersedes the comment in 0002** on `tenants.school_id`. That comment predicted a
 tenant-scoped `schools (tenant_id, id)` and a composite, deferrable foreign key. Flow §9 made schools

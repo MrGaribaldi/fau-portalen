@@ -110,7 +110,7 @@ async fn an_aborted_transaction_is_never_acknowledged() {
     // directly as superuser before the app starts.
     sqlx::query(
         "insert into municipalities (id, name, county_number, county_name, slug, status, source, search_text)
-         values ($1, 'Slow write test', '00', 'Slow write test', 'slow-write-test', 'active', 'manual', 'slow write test')",
+         values ($1, 'Slow write test', '00', 'Slow write test', '9999-slow-write-test', 'active', 'manual', 'slow write test')",
     )
     .bind(uuid::Uuid::now_v7())
     .execute(&db.admin_pool())

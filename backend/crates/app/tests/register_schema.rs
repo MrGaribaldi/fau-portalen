@@ -96,6 +96,9 @@ struct AppSubmitCase<'a> {
     status: &'a str,
     closed_on: Option<&'a str>,
     successor_id: Option<Uuid>,
+    register_name: Option<&'a str>,
+    last_seen_in_source_at: bool,
+    source_changed_at: bool,
 }
 
 impl<'a> AppSubmitCase<'a> {
@@ -111,6 +114,9 @@ impl<'a> AppSubmitCase<'a> {
             status: "active",
             closed_on: None,
             successor_id: None,
+            register_name: None,
+            last_seen_in_source_at: false,
+            source_changed_at: false,
         }
     }
 }
@@ -124,8 +130,10 @@ async fn app_submit_variant(
     sqlx::query(
         "insert into schools
            (id, municipality_id, origin, display_name, verification, slug, orgnr,
-            display_name_curated, status, closed_on, successor_id, search_text)
-         values ($1, $2, 'submitted', 'X', $3, $4, $5, $6, $7, $8::date, $9, 'x')",
+            display_name_curated, status, closed_on, successor_id, search_text,
+            register_name, last_seen_in_source_at, source_changed_at)
+         values ($1, $2, 'submitted', 'X', $3, $4, $5, $6, $7, $8::date, $9, 'x', $10,
+                 case when $11 then now() else null end, case when $12 then now() else null end)",
     )
     .bind(id)
     .bind(m)
@@ -136,6 +144,9 @@ async fn app_submit_variant(
     .bind(case.status)
     .bind(case.closed_on)
     .bind(case.successor_id)
+    .bind(case.register_name)
+    .bind(case.last_seen_in_source_at)
+    .bind(case.source_changed_at)
     .execute(pool)
     .await?;
     Ok(id)
@@ -480,6 +491,18 @@ async fn the_runtime_role_may_insert_only_a_pending_submitted_school() {
             successor_id: Some(held_target),
             ..AppSubmitCase::baseline("a successor")
         },
+        AppSubmitCase {
+            register_name: Some("Hosle skole"),
+            ..AppSubmitCase::baseline("a register_name")
+        },
+        AppSubmitCase {
+            last_seen_in_source_at: true,
+            ..AppSubmitCase::baseline("a last_seen_in_source_at")
+        },
+        AppSubmitCase {
+            source_changed_at: true,
+            ..AppSubmitCase::baseline("a source_changed_at")
+        },
     ];
     for case in cases {
         let err = app_submit_variant(&app, m, case).await.unwrap_err();
@@ -545,6 +568,29 @@ async fn the_runtime_role_may_queue_a_submission_and_its_lookup_but_not_curate_t
     .execute(&app)
     .await
     .expect("fau_app may queue a fresh lookup");
+
+    // A submission fau_app tries to hand itself 'attached_by_reviewer' -- a status
+    // only the register itself may assert -- is refused, even though it passes
+    // school_submissions' own retrieval_status CHECK.
+    let school_attached = submitted_school(&app, m).await.unwrap();
+    let err = sqlx::query(
+        "insert into school_submissions
+           (id, school_id, submitted_by, submitted_name, decision_url, decision_kind,
+            retrieval_status, review_state)
+         values ($1, $2, $3, 'Ny skole', 'https://example.test/vedtak', 'municipal_decision',
+                 'attached_by_reviewer', 'pending')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(school_attached)
+    .bind(account)
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not queue a submission already marked attached_by_reviewer"
+    );
 
     // A submission fau_app tries to hand itself an already-curated review_state is
     // refused outright.
@@ -669,6 +715,184 @@ async fn the_register_role_writes_the_register_and_deletes_only_held_schools() {
         .execute(&reg)
         .await
         .expect("fau_register reads tenants");
+}
+
+#[tokio::test]
+async fn deleting_a_held_row_a_review_item_names_leaves_the_reference_null() {
+    // The whole §4.5 "match" sequence, as fau_register: a held NSR row is held back
+    // while a possible_submission_match item is reviewed, and resolving it as a
+    // match deletes the held row -- which must not be blocked by the review item
+    // that names it (Important finding 1).
+    let db = TestDb::migrated().await;
+    let reg = db.register_pool().await;
+    let m = municipality(&reg, "3201", "3201-baerum")
+        .await
+        .expect("fau_register writes municipalities");
+
+    let submitted = submitted_school(&reg, m).await.unwrap();
+    let held = Uuid::now_v7();
+    sqlx::query(
+        "insert into schools (id, municipality_id, origin, display_name, verification, orgnr, status, search_text)
+         values ($1, $2, 'register', 'Hosle skole', 'held', '900000051', 'active', 'hosle skole')",
+    )
+    .bind(held)
+    .bind(m)
+    .execute(&reg)
+    .await
+    .unwrap();
+
+    let item = Uuid::now_v7();
+    sqlx::query(
+        "insert into register_review_items (id, kind, school_id, other_school_id, details)
+         values ($1, 'possible_submission_match', $2, $3, '{\"orgnr\": \"900000051\"}'::jsonb)",
+    )
+    .bind(item)
+    .bind(submitted)
+    .bind(held)
+    .execute(&reg)
+    .await
+    .unwrap();
+
+    // The match: the held row is deleted, which must succeed (on delete set null,
+    // not restrict) and null out other_school_id on the item that named it.
+    let gone = sqlx::query("delete from schools where id = $1")
+        .bind(held)
+        .execute(&reg)
+        .await
+        .expect("a held row a review item names may still be deleted");
+    assert_eq!(gone.rows_affected(), 1);
+
+    let other_school_id: Option<Uuid> =
+        sqlx::query_scalar("select other_school_id from register_review_items where id = $1")
+            .bind(item)
+            .fetch_one(&reg)
+            .await
+            .unwrap();
+    assert_eq!(other_school_id, None, "the reference goes null, not away");
+
+    // The submitted school absorbs the held row's orgnr and register data.
+    sqlx::query(
+        "update schools set orgnr = '900000051', register_name = 'Hosle skole',
+                verification = 'verified', verified_at = now(), slug = 'hosle-skole'
+         where id = $1",
+    )
+    .bind(submitted)
+    .execute(&reg)
+    .await
+    .expect("the submitted school takes the held row's orgnr and name");
+
+    // Resolving the item is unaffected by the null reference.
+    sqlx::query(
+        "update register_review_items set resolved_at = now(), resolution = 'match' where id = $1",
+    )
+    .bind(item)
+    .execute(&reg)
+    .await
+    .expect("the item resolves with a null other_school_id");
+}
+
+#[tokio::test]
+async fn scope_reason_is_checked_and_matches_in_scope() {
+    let db = TestDb::migrated().await;
+    let reg = db.register_pool().await;
+
+    let insert = |external_id: &'static str, in_scope: bool, scope_reason: &'static str| {
+        let reg = reg.clone();
+        async move {
+            sqlx::query(
+                "insert into register_source_records
+                   (source, external_id, payload, payload_sha256, fetched_at, in_scope, scope_reason)
+                 values ('nsr', $1, '{}'::jsonb, repeat('a', 64), now(), $2, $3)",
+            )
+            .bind(external_id)
+            .bind(in_scope)
+            .bind(scope_reason)
+            .execute(&reg)
+            .await
+        }
+    };
+
+    // Every code fau_domain::register::scope::SCOPE_REASON_CODES lists is accepted,
+    // paired with the matching in_scope value. Each code is also unique, so it
+    // doubles as this loop's external_id.
+    for code in fau_domain::register::scope::SCOPE_REASON_CODES {
+        insert(code, code == "in_scope", code)
+            .await
+            .unwrap_or_else(|e| panic!("{code}: {e}"));
+    }
+
+    // in_scope = false pairs correctly with a non-'in_scope' reason, so only the
+    // known-codes check is violated here, not the in_scope-pairing one.
+    let err = insert("unknown-code", false, "vgs_only").await.unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("register_source_records_scope_reason_known")
+    );
+
+    let err = insert("mismatched", true, "abroad").await.unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("register_source_records_in_scope_matches_reason")
+    );
+    let err = insert("mismatched2", false, "in_scope").await.unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("register_source_records_in_scope_matches_reason")
+    );
+}
+
+#[tokio::test]
+async fn slugs_must_match_their_tables_format() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+
+    let err = municipality(&admin, "3201", "baerum-no-number")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("municipalities_slug_format")
+    );
+
+    let m = municipality(&admin, "3202", "3202-ok").await.unwrap();
+    let err = listed_school(&admin, m, "900000061", Some("Not_Ok"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("schools_slug_format")
+    );
+
+    let long_slug = "a".repeat(81);
+    let err = listed_school(&admin, m, "900000062", Some(&long_slug))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("schools_slug_format")
+    );
+}
+
+#[tokio::test]
+async fn register_review_items_details_is_bounded() {
+    let db = TestDb::migrated().await;
+    let reg = db.register_pool().await;
+    let too_big = format!(
+        "{{\"note\": \"{}\"}}",
+        "x".repeat(2048) // pushes the whole jsonb text well past 2048 bytes
+    );
+    let err = sqlx::query(
+        "insert into register_review_items (id, kind, details) values ($1, 'mass_change', $2::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(too_big)
+    .execute(&reg)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("register_review_items_details_bounded")
+    );
 }
 
 #[tokio::test]

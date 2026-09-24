@@ -35,7 +35,10 @@ create table municipalities (
   search_text       text        not null,
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now(),
-  constraint municipalities_dissolved_has_date check ((status = 'dissolved') = (dissolved_on is not null))
+  constraint municipalities_dissolved_has_date check ((status = 'dissolved') = (dissolved_on is not null)),
+  -- <kommunenr>-<navn>, ADR-002 section 3; NULL is unaffected (nothing here is nullable).
+  constraint municipalities_slug_format
+    check (slug ~ '^[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*$' and length(slug) <= 85)
 );
 create unique index municipalities_slug_current on municipalities (slug);
 
@@ -66,7 +69,9 @@ create table municipality_slug_history (
   valid_from      timestamptz not null,
   valid_until     timestamptz not null,
   primary key (slug, valid_from),
-  check (valid_from < valid_until)
+  check (valid_from < valid_until),
+  constraint municipality_slug_history_slug_format
+    check (slug ~ '^[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*$' and length(slug) <= 85)
 );
 
 -- 2. Schools (4.2).
@@ -110,7 +115,10 @@ create table schools (
   constraint schools_register_origin_has_orgnr check (origin = 'submitted' or orgnr is not null),
   constraint schools_slug_needs_verification check (slug is null or verification in ('listed', 'verified')),
   constraint schools_grades_ordered check (grade_from is null or grade_to is null or grade_from <= grade_to),
-  constraint schools_not_own_successor check (successor_id is null or successor_id <> id)
+  constraint schools_not_own_successor check (successor_id is null or successor_id <> id),
+  -- NULL (unverified) passes: slug ~ '...' on a NULL slug is NULL, which a CHECK accepts.
+  constraint schools_slug_format
+    check (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and length(slug) <= 80)
 );
 -- ADR-002 section 4: school slugs are unique within a municipality, among current slugs.
 create unique index schools_slug_current on schools (municipality_id, slug) where slug is not null;
@@ -133,7 +141,9 @@ create table school_slug_history (
   valid_from      timestamptz not null,
   valid_until     timestamptz not null,
   primary key (municipality_id, slug, valid_from),
-  check (valid_from < valid_until)
+  check (valid_from < valid_until),
+  constraint school_slug_history_slug_format
+    check (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and length(slug) <= 80)
 );
 create index school_slug_history_school_idx on school_slug_history (school_id);
 
@@ -175,8 +185,16 @@ create table register_source_records (
   source_changed_at timestamptz,
   fetched_at        timestamptz not null,
   in_scope          boolean     not null,
-  scope_reason      text        not null,
-  primary key (source, external_id)
+  -- Every code domain::register::scope::SCOPE_REASON_CODES lists; keep the two in
+  -- sync by hand, since the database cannot read the Rust constant.
+  scope_reason      text        not null
+    constraint register_source_records_scope_reason_known
+    check (scope_reason in (
+      'in_scope', 'not_a_school', 'inactive', 'not_grunnskole', 'abroad',
+      'adult_education', 'upper_secondary')),
+  primary key (source, external_id),
+  constraint register_source_records_in_scope_matches_reason
+    check (in_scope = (scope_reason = 'in_scope'))
 );
 
 create table register_sync_runs (
@@ -197,8 +215,12 @@ create table register_review_items (
                     'municipality_split_or_merge', 'mass_change', 'unknown_municipality_number',
                     'fau_several_at_school', 'fau_several_schools', 'fau_match_conflict',
                     'submission_matches_listed_school')),
-  school_id       uuid        references schools (id) on delete restrict,
-  other_school_id uuid        references schools (id) on delete restrict,
+  -- set null, not restrict: 4.5's "match" resolution deletes the held NSR row a
+  -- possible_submission_match item names, once the submitted school has absorbed
+  -- its orgnr and attributes. The held row's own orgnr and name live on in this
+  -- item's details, so the reference going null loses nothing the review needs.
+  school_id       uuid        references schools (id) on delete set null,
+  other_school_id uuid        references schools (id) on delete set null,
   municipality_id uuid        references municipalities (id) on delete restrict,
   fau_orgnr       text        references registered_faus (orgnr) on delete restrict,
   -- Ids, codes, names and orgnrs only; never an address (ruling, 24 September 2026).
@@ -206,7 +228,8 @@ create table register_review_items (
   created_at      timestamptz not null default now(),
   resolved_at     timestamptz,
   resolution      text,
-  constraint register_review_items_resolved_together check ((resolved_at is null) = (resolution is null))
+  constraint register_review_items_resolved_together check ((resolved_at is null) = (resolution is null)),
+  constraint register_review_items_details_bounded check (octet_length(details::text) <= 2048)
 );
 create index register_review_items_open_idx on register_review_items (created_at) where resolved_at is null;
 
@@ -253,8 +276,12 @@ grant select, insert, update on
   register_source_records, register_sync_runs, register_review_items,
   school_submissions, register_lookups
   to fau_register;
--- Only a held row, which nothing references, may be deleted (5.3); RLS below narrows it.
+-- Only a held row may be deleted (5.3); RLS below narrows it. A review item that
+-- named it goes to null on delete, not restrict, so the delete this policy allows
+-- always succeeds.
 grant delete on schools to fau_register;
+-- Kartverket's sync must remove names it has dropped, not merely add new ones.
+grant delete on municipality_names to fau_register;
 -- Whether a school has an FAU decides between automatic change and review (D8).
 grant select on tenants to fau_register;
 grant select, insert on audit_events to fau_register;
@@ -278,10 +305,14 @@ create policy schools_app_submit on schools for insert to fau_app
               and orgnr is null and not display_name_curated
               and status = 'active' and closed_on is null and closure_reason is null
               and successor_id is null and verified_at is null and scope_override is null
-              and in_scope);
+              and in_scope and last_seen_in_source_at is null and source_changed_at is null
+              and register_name is null);
 create policy schools_register_read on schools for select to fau_register using (true);
 create policy schools_register_insert on schools for insert to fau_register with check (true);
 create policy schools_register_update on schools for update to fau_register using (true) with check (true);
+-- Guards against a mistaken delete of a live row, not against the role itself: this
+-- is the only delete grant fau_register has, but nothing stops it from first
+-- updating a row's verification to 'held' and then deleting it through here.
 create policy schools_register_delete_held on schools for delete to fau_register using (verification = 'held');
 
 -- fau_register curates every submission and lookup outcome; fau_app only ever
@@ -293,7 +324,8 @@ create policy school_submissions_register_read on school_submissions for select 
 create policy school_submissions_register_insert on school_submissions for insert to fau_register with check (true);
 create policy school_submissions_register_update on school_submissions for update to fau_register using (true) with check (true);
 create policy school_submissions_app_insert on school_submissions for insert to fau_app
-  with check (review_state = 'pending' and reviewed_at is null);
+  with check (review_state = 'pending' and reviewed_at is null
+              and retrieval_status in ('fetched', 'not_allowlisted', 'failed', 'quarantined'));
 
 alter table register_lookups enable row level security;
 create policy register_lookups_register_read on register_lookups for select to fau_register using (true);

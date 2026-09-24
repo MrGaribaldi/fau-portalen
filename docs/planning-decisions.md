@@ -2565,3 +2565,33 @@ Erik wants to contact FAU-er registered in Brreg and invite them to FAU-portalen
   check on #3427. Markedsføringsloven §15 generally forbids unsolicited marketing e-mail to natural
   persons without consent. Whether a private address registered for an FAU (a legal person)
   counts as a natural person's is exactly the question that check must answer.
+
+## Register sources built: rulings for Erik's review (#3441) — 24 September 2026
+
+Part 2 of the register was built on `school-register-3441`, following
+docs/superpowers/plans/2026-09-24-register-sources.md. It adds a new crate, `fau-register-sources`,
+which parses NSR, Kartverket, SSB and Brreg from recorded fixtures, and a client tested against a
+real local HTTP server. Every task was reviewed, and a whole-branch review followed. Nothing calls
+the live APIs yet. The agent's rulings:
+
+- **Brreg records are read with no contact fields at all.** Recording the fixtures showed that
+  Brreg FAU records carry parents' private e-mail and mobile numbers, as well as `c/o` addresses.
+  The parser declares no field for them, so they are never even decoded. The committed fixtures have
+  every such value removed or replaced with invented ones (see the fixtures README). While checking
+  a sample, two real records' contact details were printed into this session's transcript before
+  they were stripped. That is public Brreg data, but it now sits in a stored transcript.
+- **Loud failure everywhere (§5.3):**
+  - NSR paging must end with exactly the advertised number of unique units. An early empty page
+    is an error, not a stop.
+  - The fields that decide scope (`ErPrivatskole`, `Skolekategorier`, `Naeringskoder`) are
+    required.
+  - SSB's change list is required.
+  - A half-empty Kartverket name entry is an error.
+  - A truncated or corrupt Brreg download is an I/O error.
+
+  The cost: an upstream change fails the weekly run until someone looks, rather than quietly
+  importing wrong data.
+- **The Brreg bulk file is streamed** one unit at a time and written to a `.partial` file that is
+  renamed on success. One gap is carried into part 4: a failed final rename leaves the `.partial`
+  file behind.
+- **Raw NSR payloads are kept** (`nsr_unit_with_payload`), for §4.3's provenance table.

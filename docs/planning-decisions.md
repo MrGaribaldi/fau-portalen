@@ -2347,3 +2347,23 @@ behalf, and Erik reviews them.
 
 **Register design corrected (#3441).** Migration 0003 already creates the one-live-FAU-per-school
 index, so the register migration adds only the `schools` foreign key.
+
+## Access-request messages are sealed to the FAU — 24 September 2026
+
+Erik chose sealing on 24 September. The access-request message (free text, up to 500 characters,
+written by someone who is not a member) is encrypted to a per-FAU sealing key pair held in the key
+service:
+- The backend seals it on submission with the public key.
+- It is decrypted only on the approval screen, inside an admin's session, by unwrapping the private
+  key through the key service. The call is logged and rate-limited.
+- It is never decrypted for email.
+- Crypto-shredding covers it.
+
+ADR-003 is amended to match: decision 6 gains a "Sealed to the FAU" category, and decision 5 notes
+the key service's second narrow read operation. The rejected options were dropping the field, and
+listing it as plaintext, which would leave strangers' free text in every backup and outside
+crypto-shredding.
+
+**Consequence for code.** Migration 0003's `access_requests.message text` column must become a
+ciphertext column before 0003 is applied anywhere. Until the key service exists, the persistence
+layer must accept no message at all.

@@ -370,7 +370,9 @@ document provable rather than best-effort. See decision 7a.
    beside the data.
 
 The key service exposes exactly one read operation: unwrap **one document's** key, for this
-authenticated session. It logs every call and rate-limits them. It has no endpoint that returns
+authenticated session. (Amended 24 September 2026: a second, equally narrow read operation exists
+for the FAU's inbound private key, see decision 6. The rest of this paragraph applies to it
+unchanged.) It logs every call and rate-limits them. It has no endpoint that returns
 more than one document key, no endpoint that returns a KEK, and no endpoint that returns the root
 key. The backend never holds a KEK or the root key.
 
@@ -457,6 +459,26 @@ co-editing remains deferred; this is notification, not collaboration.
 
 **Encrypted under the FAU data key:** document bodies, change sets, uploaded object bytes,
 document titles, and original filenames.
+
+**Sealed to the FAU, decided 24 September 2026:** free text sent *into* an FAU by someone who is
+not a member. The first case is the message on an access request (flow spec §5.2). No member session
+exists when the message arrives, so it cannot be encrypted under the session-held key. Instead:
+
+- **Each FAU has a sealing key pair.** Both halves live in the key service, never in the application
+  database. The private key is wrapped by the FAU's KEK like every other FAU key. The public key is
+  not secret, and the key service hands it out freely.
+- **On submission,** the backend seals the text to the FAU's public key (a libsodium sealed box, or
+  HPKE). It can encrypt but never read back what it sealed.
+- **On reading,** the only place is the approval screen, inside an admin's session. The backend asks
+  the key service to unwrap the FAU's private key for that session. The call is logged and
+  rate-limited like a document-key unwrap, and the key is held under the rules in decision 5a.
+- **Never in email.** Decrypting for mail would need the key outside any member session, and would
+  hand the plaintext to the mail provider. Admin notifications carry ids only.
+- **Deletion:** crypto-shredding destroys the KEK, and every sealed message becomes unreadable,
+  including in backups.
+
+The sender's email address stays plaintext; it is an account-level identifier, as above. Until the
+key service exists, nothing accepts the message field, so no plaintext is ever stored.
 
 Titles and filenames are inside the boundary deliberately. "Klage på lærer Hansen" or
 `bekymringsmelding-elev.pdf` discloses as much as the file it names, and a title sitting in

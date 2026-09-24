@@ -1,7 +1,7 @@
 //! Which NSR units can have an FAU (section 2.3, decision D2).
 
-/// The NSR fields the filter reads. `primary_nace` is the `Naeringskoder` entry with
-/// `Prioritet` 1.
+/// The NSR fields the filter reads. `primary_nace` is filled by `primary_nace(codes)` from
+/// the `Naeringskoder` entry with `Prioritet` 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NsrScopeFacts {
     pub is_school: bool,
@@ -85,6 +85,16 @@ pub fn effective_in_scope(classified_in_scope: bool, operator_override: Option<b
     operator_override.unwrap_or(classified_in_scope)
 }
 
+/// The `Naeringskoder` entry with `Prioritet` 1, which is the only code the filter reads.
+/// A combined school carries 85.201 at priority 1 and an upper-secondary 85.3xx code at
+/// priority 2, and stays in scope (section 2.3).
+pub fn primary_nace<'a>(codes: impl IntoIterator<Item = (i64, &'a str)>) -> Option<&'a str> {
+    codes
+        .into_iter()
+        .find(|(priority, _)| *priority == 1)
+        .map(|(_, code)| code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,15 +117,45 @@ mod tests {
     }
 
     #[test]
-    fn combined_and_special_schools_are_in() {
-        // A combined school's secondary NACE is 85.310; only the primary code counts.
-        let combined = hosle();
-        assert_eq!(classify(&combined), ScopeDecision::InScope);
-        let special = NsrScopeFacts {
-            primary_nace: Some("85.202".into()),
-            ..hosle()
-        };
-        assert_eq!(classify(&special), ScopeDecision::InScope);
+    fn only_the_priority_one_nace_is_considered() {
+        // A combined school carries 85.201 at priority 1 and an upper-secondary 85.3xx at priority 2.
+        assert_eq!(primary_nace([(1, "85.201"), (2, "85.310")]), Some("85.201"));
+        assert_eq!(
+            classify(&NsrScopeFacts {
+                primary_nace: Some("85.201".into()),
+                ..hosle()
+            }),
+            ScopeDecision::InScope
+        );
+
+        // Swapped priorities: upper-secondary code is now primary.
+        assert_eq!(primary_nace([(2, "85.201"), (1, "85.320")]), Some("85.320"));
+        assert_eq!(
+            classify(&NsrScopeFacts {
+                primary_nace: Some("85.320".into()),
+                ..hosle()
+            }),
+            ScopeDecision::OutOfScope(OutOfScopeReason::UpperSecondary)
+        );
+
+        // No codes at all.
+        assert_eq!(primary_nace([]), None);
+        assert_eq!(
+            classify(&NsrScopeFacts {
+                primary_nace: None,
+                ..hosle()
+            }),
+            ScopeDecision::InScope
+        );
+
+        // Special school (85.202) is in scope.
+        assert_eq!(
+            classify(&NsrScopeFacts {
+                primary_nace: Some("85.202".into()),
+                ..hosle()
+            }),
+            ScopeDecision::InScope
+        );
     }
 
     #[test]

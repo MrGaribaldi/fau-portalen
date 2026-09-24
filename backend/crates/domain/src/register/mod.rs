@@ -6,4 +6,5 @@ pub mod brreg;
 pub mod scope;
 pub mod search;
 pub mod slug;
+pub mod source;
 mod text;

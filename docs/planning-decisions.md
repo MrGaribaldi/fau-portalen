@@ -2449,12 +2449,12 @@ the recommendation; four add to it.
   din?" submission triggers an immediate lookup in NSR. If the school is there, the submission is
   approved at once instead of waiting for manual review, because the school is now known.
 - **D11: the `fau register review` CLI plus email for the MVP.** The admin web screen (b) is high
-  priority immediately after.
+  priority immediately after, on #3499.
 - **Merging FAU-er when schools merge (new requirement).** When two schools combine, a new FAU for
   the merged school gets the old FAU-er's documents shared into it. Members keep read-only access
   to the old FAU-er and continue in the new one. This supersedes §4.5's "The product does not merge
   FAU-er". It depends on the document layer (#3419) and per-document keys (ADR-003 decision 5), so
-  it is its own card. The register only has to record the merger (many closed schools, one
+  it is its own card, #3498. The register only has to record the merger (many closed schools, one
   successor), and its schema already allows that.
 
 **Agent rulings on the new parts, for Erik's review.** Measured on 24 September 2026 against a full
@@ -2480,7 +2480,7 @@ Brreg bulk download and a full NSR grunnskole download, both discarded afterward
   - address and name disagreeing.
 
   **Name-only matches (360) are stored as unconfirmed candidates**, not linked and not queued. They
-  wait for the admin screen (D11b), so the seed does not flood the queue.
+  wait for the admin screen (D11b, #3499), so the seed does not flood the queue.
 - **What a link does.** At signup the FAU name defaults to the linked entity's registered name,
   case-normalised because Brreg stores names in capitals, and otherwise to the school's display
   name. It is a suggestion the registrant edits, like every other prefill. The link grants nothing.

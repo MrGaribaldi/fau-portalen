@@ -535,7 +535,7 @@ requirement** (Erik, 24 September): a new FAU is created on the successor school
 documents are shared into it read-only, and their members keep read-only access to the old FAU-er.
 The one-live-FAU index allows exactly that, because the old tenants stay on closed schools. The
 sharing itself depends on the document layer (#3419) and per-document keys (ADR-003 decision 5),
-and is its own card. Until it exists, the review records the successor and the FAU-er carry on
+and is its own card, #3498. Until it exists, the review records the successor and the FAU-er carry on
 where they are.
 
 **A school with an FAU closes.** The FAU keeps working, because closure changes nothing in the
@@ -586,7 +586,7 @@ create unique index school_fau_links_one_per_fau    on school_fau_links (fau_org
    guess goes wrong.
 5. **No address match, and the name core identifies a single school in the FAU's municipality**,
    stores a `candidate` link. It is not used for prefill and not queued. It waits for the admin
-   screen (D11b).
+   screen (D11b, #3499).
 6. An operator link (`method = 'operator'`) or rejection is never overwritten by the sync. An
    entity missing from the bulk file becomes `deleted`, and its link stops being used.
 
@@ -1014,8 +1014,8 @@ extend to the new tables unchanged: no forbidden column names, and the global ta
 - #3426: retention of `school_submissions` and archived decision documents;
 - #3421: system-level audit events (5.2 step 6);
 - #3431: consumes `fau register export`.
-- The FAU merge card: sharing old FAU-er's documents into a successor FAU (4.5).
-- The D11(b) card: an admin review screen, high priority after the MVP CLI.
+- #3498: merging FAU-er, sharing the old FAU-er's documents into a successor FAU (4.5).
+- #3499: the D11(b) admin review screen, high priority after the MVP CLI.
 
 ## 12. Decisions
 

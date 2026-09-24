@@ -2392,3 +2392,19 @@ link.
 **Code consequence:** migration 0003 gains a ciphertext column for the invitation message, beside the
 access-request message change recorded above. Until the key service exists, neither message is
 accepted.
+
+## Key-service root key held by hand; member keys later — 24 September 2026
+
+Erik decided on 24 September:
+- **Live root key.** It is never on disk anywhere. Erik keeps it in Proton Pass and loads it by hand
+  whenever the key service starts. Until then the key service is sealed: content stays unreadable,
+  while login and authorization keep working. A sealed key service is a critical alert. The accepted
+  cost is that a restart leaves content unreadable until Erik unseals it. This closes the case where
+  the database and the key service's disk or backups are stolen together.
+- **Member-held keys** are a post-MVP direction. The key service stores several wraps per FAU key
+  from the start (KEK now; member devices and an offline escrow wrap later), so adding them needs no
+  redesign. Adopting them needs passkeys and its own trust-model decision.
+- **#3481** gains a third Proton Pass item: the live root key, beside the SOPS age key and the
+  backup root key.
+
+ADR-003 decision 5 and its closed items and standing risks are amended to match.

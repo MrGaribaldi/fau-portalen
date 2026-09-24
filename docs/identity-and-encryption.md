@@ -369,6 +369,32 @@ document provable rather than best-effort. See decision 7a.
 4. The key service holds a **root key** that encrypts its store at rest, in memory, never written
    beside the data.
 
+**Custody of the live root key, decided 24 September 2026.** The root key is **never on disk**,
+anywhere: not in the image, a Kubernetes Secret, a volume or a config file. Erik keeps it in Proton
+Pass and loads it by hand each time the key service starts. Until it is loaded, the key service is
+**sealed**:
+- it answers no unwrap, so document content, titles, filenames and sealed messages are unreadable;
+- authentication and authorization keep working, because they need no keys, so members can still
+  log in, and invitations and roles work.
+
+Consequences accepted with it:
+- **Alerting.** A sealed key service is a critical alert through the #3442 route.
+- **Availability depends on one person.** A node reboot or a pod reschedule leaves content
+  unreadable until Erik unseals it. The key service should therefore run as a single, rarely
+  rescheduled workload.
+- **Why this is chosen.** It closes the case where the key service's disk or backups and the
+  database are both stolen. Neither holds a usable key.
+
+**Several wraps per FAU key, a design requirement from 24 September 2026.** The key service stores
+each FAU key with room for more than one wrap: today the KEK; later, one wrap per member device and
+one offline escrow wrap.
+
+**Member-held keys are a post-MVP direction, not built.** The FAU key would be released only when a
+member's device unwraps it, so a running key service alone could not decrypt anything. It needs
+passkeys, which are out of the MVP, and device-loss handling. Because total turnover is the product,
+it also needs an **offline** escrow wrap, not an online one. It moves the trust model towards "not
+without you". ADR-003 deliberately does not claim that today, so adopting it needs its own decision.
+
 The key service exposes exactly one read operation: unwrap **one document's** key, for this
 authenticated session. (Amended 24 September 2026: two more equally narrow read operations exist,
 for the FAU's inbound private key and for one invitation's message key, see decision 6. The rest of this paragraph applies to it
@@ -893,7 +919,8 @@ standing risks worth keeping visible rather than closing.
   22 September because there is currently only one person who could act. That is the right call
   today and a concentration worth naming: the same person holds the Proton Pass credential from
   open item 3, sits in the recovery seat for every FAU that has not confirmed a school
-  representative, and is the only one who can stop a destruction inside its window. No single
+  representative, and is the only one who can stop a destruction inside its window, and since 24 September also the only
+one who can unseal the key service after a restart. No single
   control fixes this; a second trusted operator does, and the design should be revisited the day
   one exists rather than the day one is needed.
 - **ISO 27001 at Hanko is in progress, not achieved**, per Hanko's own statement. Nothing depends
@@ -919,6 +946,8 @@ standing risks worth keeping visible rather than closing.
   Cancelling a queued destruction takes **one operator**.
 - **Custody of the backup root key.** Proton Pass, which makes this a second trigger for #3481
   alongside the SOPS age key.
+- **Custody of the live root key.** Never on disk. It is loaded by hand from Proton Pass when the
+  key service starts, decided 24 September (decision 5). This is a third item for #3481.
 - **Search in the MVP.** Filenames only, decrypted in-session, designed for extension to full
   text. Nothing leaves the encryption boundary - see decision 6.
 - **Retention of member data.** Per-membership, lapsing three months after the last membership

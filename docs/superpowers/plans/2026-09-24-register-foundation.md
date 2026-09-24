@@ -54,7 +54,7 @@ decided (#3441) — 24 September 2026". Conventions: `docs/superpowers/plans/202
 
 | Question | Decision | Reason |
 | --- | --- | --- |
-| Keeping the runtime role to submitted rows | RLS on `schools`: `fau_app` may select all rows and insert only `origin='submitted'`, `verification='pending'`, no slug, no orgnr | D9 says "insert for submissions only". A grant cannot restrict by value, and RLS costs four policies. |
+| Keeping the runtime role to submitted rows | RLS on three tables -- `schools`, `school_submissions`, `register_lookups` -- with `fau_app` granted only a value-restricted insert (plus a full-table select on `schools`) on each | D9 says "insert for submissions only". A grant cannot restrict by value, and a plain grant cannot tell a fresh submission from an already-curated one either, so all three tables that `fau_app` writes need RLS, not just `schools`. |
 | What `fau_register` may delete | Only `held` schools, by an RLS delete policy | §5.3: "the only delete is a held row that loses a match review". |
 | `tenants.school_id` | `not null` plus `tenants_school_fk ... on delete restrict` | §4.2 recommendation. No production tenants exist, and the submitted-school path creates its row in the same transaction. |
 | Register mail templates | 0004 widens `outbox_tenant_scoped_unless_global` with `register.review_item`, `register.seed_summary`, `register.submission_approved` and `register.sync_aborted` | Later plans send these. A migration is cheaper now than a second constraint swap later. |

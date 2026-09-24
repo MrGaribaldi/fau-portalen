@@ -438,7 +438,7 @@ create table register_source_records (
   source_changed_at timestamptz,
   fetched_at      timestamptz not null,
   in_scope        boolean     not null,
-  scope_reason    text        not null,                -- e.g. 'adult_education', 'abroad', 'vgs_only'
+  scope_reason    text        not null,                -- e.g. 'adult_education', 'abroad', 'upper_secondary'
   primary key (source, external_id)
 );
 
@@ -497,6 +497,16 @@ create table school_submissions (
 A submitted school is created with `origin = 'submitted'`, `verification = 'pending'` and no slug.
 It works fully at `/s/<uuid>` and is `noindex` (ADR-002; flow §3.1). By default it is **not** listed
 in the picker or on the municipality page (D7).
+
+**Row-level security.** `schools`, `school_submissions` and `register_lookups` carry RLS. `fau_app`,
+the runtime role, may only ever *insert* a fresh, untouched-by-the-register row on each: a pending
+submitted school with no slug, orgnr, curated-name flag, closure, successor, scope override,
+provenance timestamp or register name; a submission still `pending` and unreviewed, with a
+`retrieval_status` the fetcher itself could have produced (never `attached_by_reviewer`); a lookup
+still unqueued and unprocessed. It has no update or delete grant on any of the three, and no select
+grant on `school_submissions` or `register_lookups` at all. `fau_register` alone reads, updates and
+(for a `held` school only) deletes. A future role granted none of this sees zero rows on these
+tables by default -- RLS with no matching policy is deny-by-default, not merely un-granted.
 
 ### 4.5 How a submitted school meets NSR later, and how re-registrations are handled
 

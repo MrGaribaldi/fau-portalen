@@ -10,7 +10,6 @@ pub(crate) enum Letters {
     /// ADR-002's reversible form: æ→ae, ø→oe, å→aa, ä→ae, ö→oe.
     Transliterate,
     /// What people type without Norwegian letters: æ→a, ø→o, å→a, ä→a, ö→o.
-    #[allow(dead_code)]
     Lossy,
 }
 

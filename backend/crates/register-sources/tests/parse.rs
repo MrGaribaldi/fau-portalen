@@ -1,0 +1,138 @@
+//! Parsing the recorded fixtures (tests/fixtures/README.md). These are real API responses,
+//! and the expected values below are taken from them.
+
+use fau_domain::register::scope::{classify, OutOfScopeReason, ScopeDecision};
+use fau_register_sources::{nsr, Source, SourceErrorKind};
+
+fn fixture(path: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/{path}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+}
+
+fn unit(orgnr: &str) -> fau_domain::register::source::NsrUnit {
+    nsr::parse_unit(&fixture(&format!("nsr/enhet-{orgnr}.json"))).unwrap()
+}
+
+#[test]
+fn nsr_list_page_carries_paging_and_slim_units() {
+    let page = nsr::parse_list_page(&fixture("nsr/list-page-1-of-5.json")).unwrap();
+    assert_eq!((page.page, page.page_count, page.total), (1, 3670, 18350));
+    let orgnrs: Vec<_> = page.units.iter().map(|u| u.orgnr.as_str()).collect();
+    assert_eq!(
+        orgnrs,
+        [
+            "U99999999",
+            "U90099999",
+            "U90099021",
+            "U90099020",
+            "U90099018"
+        ]
+    );
+    assert_eq!(page.units[0].municipality_number, "2599");
+    assert!(!page.units[0].is_active);
+}
+
+#[test]
+fn nsr_municipality_list_for_baerum() {
+    let page = nsr::parse_list_page(&fixture("nsr/kommune-3201.json")).unwrap();
+    assert_eq!(page.units.len(), 218);
+    assert_eq!(
+        page.units
+            .iter()
+            .filter(|u| u.is_active && u.is_primary_school)
+            .count(),
+        45
+    );
+}
+
+#[test]
+fn hosle_skole_in_full() {
+    let u = unit("974552124");
+    assert_eq!(u.name, "Hosle skole");
+    assert_eq!(u.municipality_number, "3201");
+    assert!(u.is_school && u.is_active && u.is_primary_school && !u.is_private);
+    assert_eq!(u.category_ids, ["1", "3", "5", "32"]);
+    assert_eq!(u.nace, [(1, "85.201".to_owned())]);
+    assert_eq!((u.grade_from, u.grade_to), (Some(1), Some(7)));
+    assert_eq!(u.language.as_deref(), Some("nb"));
+    assert_eq!(u.website.as_deref(), Some("www.hosle.no"));
+    assert_eq!(u.visiting.street.as_deref(), Some("Bispeveien 73"));
+    assert_eq!(u.visiting.postcode.as_deref(), Some("1362"));
+    assert_eq!(u.visiting.post_town.as_deref(), Some("HOSLE"));
+    assert_eq!(u.closure, None, "Utgaattype A means not closed");
+    assert_eq!(u.changed_at.unwrap().to_string(), "2026-09-13T01:05:43.46Z");
+    assert_eq!(classify(&u.scope_facts()), ScopeDecision::InScope);
+}
+
+#[test]
+fn every_fixture_unit_classifies_as_section_2_3_says() {
+    use OutOfScopeReason::*;
+    let cases = [
+        ("974552124", ScopeDecision::InScope),              // ordinary
+        ("990672938", ScopeDecision::InScope),              // private
+        ("998516897", ScopeDecision::InScope),              // combined
+        ("998666783", ScopeDecision::InScope),              // special, 85.202
+        ("974795655", ScopeDecision::InScope),              // Svalbard, 2100
+        ("998245508", ScopeDecision::InScope),              // Nynorsk
+        ("998670799", ScopeDecision::InScope),              // no website
+        ("974554682", ScopeDecision::InScope),              // municipality prefix
+        ("933181995", ScopeDecision::InScope),              // Stange, new number
+        ("975270920", ScopeDecision::OutOfScope(Inactive)), // Stange, old number
+        ("999038182", ScopeDecision::OutOfScope(AdultEducation)),
+        ("986779795", ScopeDecision::OutOfScope(UpperSecondary)),
+        ("U90099017", ScopeDecision::OutOfScope(Abroad)),
+    ];
+    for (orgnr, expected) in cases {
+        assert_eq!(classify(&unit(orgnr).scope_facts()), expected, "{orgnr}");
+    }
+}
+
+#[test]
+fn nsr_empty_strings_and_codes_become_absent_or_mapped() {
+    assert_eq!(
+        unit("998516897").website,
+        None,
+        "Lerberg sends an empty website"
+    );
+    assert_eq!(unit("998670799").website, None, "Halsa sends none");
+    assert_eq!(unit("998245508").language.as_deref(), Some("nn"));
+    assert_eq!(
+        unit("U90099017").visiting.postcode,
+        None,
+        "abroad: empty postcode"
+    );
+}
+
+#[test]
+fn a_closed_unit_carries_its_reason_and_time() {
+    let old = unit("975270920");
+    assert!(!old.is_active);
+    let closure = old.closure.expect("Slettet for sammenslåing");
+    assert_eq!(closure.code, "F");
+    assert_eq!(closure.at.unwrap().to_string(), "2024-08-25T01:15:10.91Z");
+}
+
+#[test]
+fn a_missing_required_field_fails_loudly() {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("nsr/enhet-974552124.json")).unwrap();
+    v.as_object_mut().unwrap().remove("Navn");
+    let err = nsr::parse_unit(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+    assert_eq!(err.source, Source::Nsr);
+    match err.kind {
+        SourceErrorKind::Parse { detail } => assert!(detail.contains("Navn"), "{detail}"),
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_parse_error_never_quotes_the_input() {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("nsr/enhet-974552124.json")).unwrap();
+    v["ErAktiv"] = serde_json::Value::String("SECRET-LOOKING-VALUE".into());
+    let err = nsr::parse_unit(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+    assert!(!format!("{err:?} {err}").contains("SECRET-LOOKING-VALUE"));
+}

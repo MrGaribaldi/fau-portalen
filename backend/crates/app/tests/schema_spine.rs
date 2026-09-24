@@ -7,8 +7,24 @@ use uuid::Uuid;
 async fn seed_two_tenants(db: &TestDb) -> (Uuid, Uuid, Uuid) {
     let pool = db.admin_pool();
     let (t1, t2, acc) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-    sqlx::query("insert into tenants (id, name, status) values ($1,'FAU A','active'), ($2,'FAU B','active')")
-        .bind(t1).bind(t2).execute(&pool).await.unwrap();
+    let s1 = common::membership::school(&pool, "seed_two_tenants-a").await;
+    let s2 = common::membership::school(&pool, "seed_two_tenants-b").await;
+    sqlx::query(
+        "insert into tenants (id, name, status, school_id) values ($1,'FAU A','active',$2)",
+    )
+    .bind(t1)
+    .bind(s1)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into tenants (id, name, status, school_id) values ($1,'FAU B','active',$2)",
+    )
+    .bind(t2)
+    .bind(s2)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("insert into accounts (id, email) values ($1, 'a@example.test')")
         .bind(acc)
         .execute(&pool)
@@ -315,8 +331,11 @@ async fn locale_columns_exist_with_the_decided_defaults() {
     assert!(account_locale_nullable);
 
     let t = Uuid::now_v7();
-    sqlx::query("insert into tenants (id, name, status) values ($1,'FAU','pending')")
+    let school =
+        common::membership::school(&pool, "locale_columns_exist_with_the_decided_defaults").await;
+    sqlx::query("insert into tenants (id, name, status, school_id) values ($1,'FAU','pending',$2)")
         .bind(t)
+        .bind(school)
         .execute(&pool)
         .await
         .unwrap();
@@ -332,11 +351,16 @@ async fn locale_columns_exist_with_the_decided_defaults() {
 #[tokio::test]
 async fn tenant_status_is_constrained() {
     let db = TestDb::migrated().await;
-    let bad = sqlx::query("insert into tenants (id, name, status) values ($1,'X','deleted')")
-        .bind(Uuid::now_v7())
-        .execute(&db.admin_pool())
-        .await
-        .expect_err("status must be pending/active/closed");
+    let pool = db.admin_pool();
+    let school = common::membership::school(&pool, "tenant_status_is_constrained").await;
+    let bad = sqlx::query(
+        "insert into tenants (id, name, status, school_id) values ($1,'X','deleted',$2)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(school)
+    .execute(&pool)
+    .await
+    .expect_err("status must be pending/active/closed");
 
     assert_eq!(
         sqlstate(&bad).as_deref(),

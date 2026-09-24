@@ -73,13 +73,21 @@ docker compose exec -T db psql -U postgres -d fau -v ON_ERROR_STOP=1 -c \
   "alter role fau_migrate login password 'fau_migrate'"
 docker compose exec -T db psql -U postgres -d fau -v ON_ERROR_STOP=1 -c \
   "alter role fau_app login password 'fau_app'"
+docker compose exec -T db psql -U postgres -d fau -v ON_ERROR_STOP=1 -c \
+  "alter role fau_register login password 'fau_register'"
 ```
 
-Replace the two literal passwords with whatever `.env` actually sets for
-`FAU_MIGRATE_PASSWORD` / `FAU_APP_PASSWORD` -- `fau_migrate`/`fau_app` above are only
-`.env.example`'s defaults. Do this once; every later `docker compose up` finds the
-roles already correctly configured, and `zz-compose-init.sh` is simply never invoked
-again on this volume (it is still skipped, but it no longer needs to run).
+Replace the three literal passwords with whatever `.env` actually sets for
+`FAU_MIGRATE_PASSWORD` / `FAU_APP_PASSWORD` / `FAU_REGISTER_PASSWORD` --
+`fau_migrate`/`fau_app`/`fau_register` above are only `.env.example`'s defaults. Do
+this once; every later `docker compose up` finds the roles already correctly
+configured, and `zz-compose-init.sh` is simply never invoked again on this volume (it
+is still skipped, but it no longer needs to run).
+
+The same applies to `fau_register` (#3441, migration 0004, `db/roles.sql`): a volume
+already initialised before this role existed never re-runs `zz-compose-init.sh`, so
+`fau_register` gets no login password on it until either the commands above are run
+by hand or the volume is recreated (option (b) below) so the init scripts run fresh.
 
 **(b) Recreate the volume.** `docker compose down -v` removes the named volume along
 with the containers -- **this destroys the dev database and everything in it.** Only
@@ -227,14 +235,16 @@ cargo test -p fau-app --test acceptance -- --ignored --test-threads=1
 ```
 
 **The harness resets role passwords on the target cluster.** Roles are cluster-wide,
-and the harness runs `alter role fau_app login password 'fau_app'` and
-`alter role fau_migrate login password 'fau_migrate'` (each role's password is its
+and the harness runs `alter role fau_app login password 'fau_app'`,
+`alter role fau_migrate login password 'fau_migrate'` and
+`alter role fau_register login password 'fau_register'` (each role's password is its
 own name) on whatever cluster `TEST_DATABASE_URL` points at. Pointing the suite at
-the dev Compose `db`, as above, therefore overwrites any custom `FAU_APP_PASSWORD` or
-`FAU_MIGRATE_PASSWORD` set in `.env` for that cluster: the dev stack's `migrate` and
-`app` then fail authentication until the roles are altered back (see "Keep the data"
-above for the commands). With the defaults the two agree and nothing changes. Never
-point `TEST_DATABASE_URL` at a cluster whose role passwords matter.
+the dev Compose `db`, as above, therefore overwrites any custom `FAU_APP_PASSWORD`,
+`FAU_MIGRATE_PASSWORD` or `FAU_REGISTER_PASSWORD` set in `.env` for that cluster: the
+dev stack's `migrate` and `app` then fail authentication until the roles are altered
+back (see "Keep the data" above for the commands). With the defaults the three agree
+and nothing changes. Never point `TEST_DATABASE_URL` at a cluster whose role
+passwords matter.
 
 The image-contract test (`backend/crates/app/tests/image.rs`) builds the real
 `fau/app:dev` image with the real `Dockerfile` and inspects it -- non-root,

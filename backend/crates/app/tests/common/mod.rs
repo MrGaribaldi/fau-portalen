@@ -26,6 +26,7 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 pub mod membership;
+pub mod register;
 
 /// The database the harness talks to before any per-test database exists: superuser,
 /// used only for `create database` / `drop database` and to hold the template-build
@@ -225,6 +226,14 @@ impl TestDb {
         PgPool::connect(&self.url())
             .await
             .expect("connect as fau_app")
+    }
+
+    /// A pool connected as the register role `fau_register` (D9), which alone writes
+    /// the school register.
+    pub async fn register_pool(&self) -> PgPool {
+        PgPool::connect(&self.role_url("fau_register"))
+            .await
+            .expect("connect as fau_register")
     }
 
     /// Simulates a database outage for readiness tests: sets the
@@ -518,7 +527,7 @@ async fn apply_roles_sql(url: &str) {
         .await
         .expect("apply roles.sql");
 
-    for role in ["fau_app", "fau_migrate"] {
+    for role in ["fau_app", "fau_migrate", "fau_register"] {
         sqlx::query(&format!("alter role {role} login password '{role}'"))
             .execute(&mut conn)
             .await

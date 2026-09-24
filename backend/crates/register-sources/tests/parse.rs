@@ -249,3 +249,68 @@ fn ssb_changes_of_2026_include_the_boundary_adjustment() {
         "3118 continues: a boundary adjustment, not a merger"
     );
 }
+
+use fau_register_sources::brreg;
+use std::io::Write;
+
+fn gzipped(path: &str) -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&fixture(path)).unwrap();
+    enc.finish().unwrap()
+}
+
+fn faus() -> (
+    Vec<fau_domain::register::source::BrregFau>,
+    brreg::BrregStats,
+) {
+    let mut out = Vec::new();
+    let stats =
+        brreg::for_each_fau(&gzipped("brreg/enheter-sample.json")[..], |f| out.push(f)).unwrap();
+    (out, stats)
+}
+
+#[test]
+fn only_fli_units_with_an_fau_name_are_kept() {
+    let (faus, stats) = faus();
+    assert_eq!(stats.units_seen, 9);
+    assert_eq!(stats.faus, 8, "FAUSKE IDRETTSLAG ALPINT is not an FAU");
+    assert!(!faus.iter().any(|f| f.orgnr == "988936871"));
+    let hosle = faus.iter().find(|f| f.orgnr == "918316450").unwrap();
+    assert_eq!(hosle.registered_name, "HOSLE FAU");
+    assert_eq!(hosle.organisation_form, "FLI");
+    assert_eq!(hosle.municipality_number.as_deref(), Some("3201"));
+    assert_eq!(hosle.business_address.lines, ["Bispeveien 73"]);
+    assert_eq!(hosle.business_address.postcode.as_deref(), Some("1362"));
+    assert_eq!(hosle.postal_address, Default::default());
+}
+
+#[test]
+fn contact_fields_are_never_read() {
+    // 913591100 carries an invented e-mail and mobile (fixtures README). The value types have
+    // no field for them, and nothing the parser returns may contain them.
+    let (faus, _) = faus();
+    let shown = format!("{faus:?}");
+    for needle in ["example.invalid", "+4700000000", "Nordmann", "Oppdiktet"] {
+        assert!(!shown.contains(needle), "{needle} leaked into {shown}");
+    }
+}
+
+#[test]
+fn a_truncated_file_is_an_error() {
+    let full = fixture("brreg/enheter-sample.json");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&full[..full.len() / 2]).unwrap();
+    let err = brreg::for_each_fau(&enc.finish().unwrap()[..], |_| {}).unwrap_err();
+    assert_eq!(err.source, fau_register_sources::Source::Brreg);
+}
+
+#[test]
+fn a_unit_without_a_name_fails_loudly() {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("brreg/enheter-sample.json")).unwrap();
+    v[0].as_object_mut().unwrap().remove("navn");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&serde_json::to_vec(&v).unwrap()).unwrap();
+    let err = brreg::for_each_fau(&enc.finish().unwrap()[..], |_| {}).unwrap_err();
+    assert!(matches!(err.kind, SourceErrorKind::Parse { .. }));
+}

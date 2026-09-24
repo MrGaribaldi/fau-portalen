@@ -370,8 +370,8 @@ document provable rather than best-effort. See decision 7a.
    beside the data.
 
 The key service exposes exactly one read operation: unwrap **one document's** key, for this
-authenticated session. (Amended 24 September 2026: a second, equally narrow read operation exists
-for the FAU's inbound private key, see decision 6. The rest of this paragraph applies to it
+authenticated session. (Amended 24 September 2026: two more equally narrow read operations exist,
+for the FAU's inbound private key and for one invitation's message key, see decision 6. The rest of this paragraph applies to it
 unchanged.) It logs every call and rate-limits them. It has no endpoint that returns
 more than one document key, no endpoint that returns a KEK, and no endpoint that returns the root
 key. The backend never holds a KEK or the root key.
@@ -479,6 +479,25 @@ exists when the message arrives, so it cannot be encrypted under the session-hel
 
 The sender's email address stays plaintext; it is an account-level identifier, as above. Until the
 key service exists, nothing accepts the message field, so no plaintext is ever stored.
+
+**Invitation messages, decided 24 September 2026:** an admin may add a message to an invitation,
+so the invitee can see who invited them and why before accepting. That is a defence against
+phishing: an invitation that explains itself is harder to imitate than a bare link.
+
+- **Stored** encrypted under a per-invitation key, wrapped by the FAU's KEK like any other FAU key.
+  The admin writes the message inside a session, so the backend encrypts it with the key it already
+  holds.
+- **Read** on the invitation page, after the invitee has logged in and before they accept. The
+  invitee is not a member, so no session holds the FAU key. The key service unwraps that one
+  invitation's key only when the request carries a valid, unused invitation token *and* the
+  logged-in address matches the invitee. The call is logged and rate-limited like every other
+  unwrap. This is a third narrow read operation beside the two in decision 5.
+- **Resend** keeps the message: the admin's session decrypts and re-encrypts it.
+- **Not in email, for now.** Putting the message into the invitation email is a possible later
+  option. It would need its own decision, because it means decrypting for mail and handing the
+  plaintext to the mail provider.
+- **Once the invitation is accepted, withdrawn or expired,** the ciphertext has served its purpose
+  and can be deleted. Crypto-shredding covers it either way.
 
 Titles and filenames are inside the boundary deliberately. "Klage på lærer Hansen" or
 `bekymringsmelding-elev.pdf` discloses as much as the file it names, and a title sitting in

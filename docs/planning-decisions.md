@@ -2367,3 +2367,28 @@ crypto-shredding.
 **Consequence for code.** Migration 0003's `access_requests.message text` column must become a
 ciphertext column before 0003 is applied anywhere. Until the key service exists, the persistence
 layer must accept no message at all.
+
+## Invitation messages, readable by the invitee before accepting — 24 September 2026
+
+Erik decided on 24 September that an admin may add a message to an invitation, and that the invitee
+sees it on the invitation page after logging in and before accepting. The purpose is
+anti-phishing: an invitation that says who is inviting you and why is harder to fake than a bare
+link.
+
+- **Encryption.** The message is encrypted under a per-invitation key, wrapped by the FAU's KEK. A
+  database dump without the key store shows only ciphertext.
+- **Reading.** The invitee is not yet a member, so the key service unwraps that one invitation's key
+  only for a request that carries a valid, unused token from the logged-in, matching invitee. The
+  call is logged and rate-limited. ADR-003 decisions 5 and 6 are amended.
+- **Resend** keeps the message.
+- **Considered and rejected:**
+  - "Encrypting with the FAU's private key". Its protection would rest on a public key never
+    leaking, which is fragile.
+  - A key derived from the invitation token. It is stronger than the threat model needs, and it
+    loses the message on resend.
+- **Later, not now:** an option to include the message in the invitation email. That needs its own
+  decision, because the plaintext would reach the mail provider.
+
+**Code consequence:** migration 0003 gains a ciphertext column for the invitation message, beside the
+access-request message change recorded above. Until the key service exists, neither message is
+accepted.

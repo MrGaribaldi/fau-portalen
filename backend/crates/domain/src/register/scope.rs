@@ -54,6 +54,19 @@ impl ScopeDecision {
     }
 }
 
+/// Every code `register_source_records.scope_reason` may hold (migration 0004's
+/// `register_source_records_scope_reason_known` check). The migration's list must
+/// match this constant.
+pub const SCOPE_REASON_CODES: [&str; 7] = [
+    "in_scope",
+    "not_a_school",
+    "inactive",
+    "not_grunnskole",
+    "abroad",
+    "adult_education",
+    "upper_secondary",
+];
+
 /// Section 2.3's filter, checked in a fixed order so each unit gets one reason.
 pub fn classify(facts: &NsrScopeFacts) -> ScopeDecision {
     use OutOfScopeReason::*;
@@ -253,6 +266,26 @@ mod tests {
             ]
         );
         assert_eq!(ScopeDecision::InScope.code(), "in_scope");
+    }
+
+    #[test]
+    fn every_code_is_listed_in_scope_reason_codes() {
+        use OutOfScopeReason::*;
+        for reason in [
+            NotASchool,
+            Inactive,
+            NotPrimarySchool,
+            Abroad,
+            AdultEducation,
+            UpperSecondary,
+        ] {
+            assert!(
+                SCOPE_REASON_CODES.contains(&reason.code()),
+                "{reason:?}'s code {} is missing from SCOPE_REASON_CODES",
+                reason.code()
+            );
+        }
+        assert!(SCOPE_REASON_CODES.contains(&ScopeDecision::InScope.code()));
     }
 
     #[test]

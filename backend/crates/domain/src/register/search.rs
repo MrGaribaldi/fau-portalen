@@ -8,6 +8,11 @@ use super::text::{collapse, latin_fold, Letters};
 /// The space-joined matching forms of every name, for a `search_text` column: each
 /// name folded (NFC, lowercase, letters kept), transliterated (`tromsoe`) and lossy
 /// (`tromso`). Duplicate forms are kept once, in first-seen order.
+///
+/// The folded form (e.g. `tromsø`) can never match a [`search_query`] word-prefix
+/// query, because `search_query` is always lossy ASCII and so never contains a
+/// non-ASCII letter to prefix-match against. It is kept in `search_text` anyway, for
+/// trigram similarity, which compares it directly against the un-folded query.
 pub fn search_text<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
     let mut forms: Vec<String> = Vec::new();
     for name in names {
@@ -27,6 +32,12 @@ pub fn search_text<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
 
 /// The query form: lossy, because that is what people type, and it matches all three
 /// stored forms' lossy member.
+///
+/// Returns `""` when the query has no searchable characters (e.g. only punctuation,
+/// or only characters `latin_fold`/`collapse` drop). A caller must treat that empty
+/// result as "no rows", never run it through `like '%' || q || '%'` -- an empty
+/// pattern there matches every row in the table, which is the opposite of what an
+/// empty query means.
 pub fn search_query(q: &str) -> String {
     collapse(&latin_fold(q, Letters::Lossy), ' ')
 }

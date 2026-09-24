@@ -48,16 +48,38 @@ pub fn slugify(name: &str) -> Result<String, SlugError> {
 /// Cuts at the last hyphen within the cap, or hard at the cap if there is none. The
 /// input is ASCII, so byte indices are character indices.
 fn cap(slug: String) -> String {
-    if slug.len() <= MAX_SLUG_LEN {
-        return slug;
+    cut_to_len(&slug, MAX_SLUG_LEN)
+}
+
+/// Shortens `s` to at most `max_len` bytes, cutting at the last hyphen within that
+/// limit, or hard at the limit if there is none. Used both by [`cap`] (against
+/// [`MAX_SLUG_LEN`]) and by [`first_free_slug`] (against a smaller budget, to leave
+/// room for a `-town` or `-N` suffix). The input is ASCII, so byte indices are
+/// character indices.
+fn cut_to_len(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_owned();
     }
-    let head = &slug[..MAX_SLUG_LEN];
-    if slug.as_bytes()[MAX_SLUG_LEN] == b'-' {
+    let head = &s[..max_len];
+    if s.as_bytes()[max_len] == b'-' {
         return head.to_owned();
     }
     match head.rfind('-') {
         Some(i) => head[..i].to_owned(),
         None => head.to_owned(),
+    }
+}
+
+/// Shortens `base` so that `base` plus a `-`-joined `suffix` fits within
+/// [`MAX_SLUG_LEN`] as a whole, cutting `base` (never `suffix`) at a hyphen boundary
+/// per [`cut_to_len`]. `suffix` alone is assumed to fit; that always holds here,
+/// since a post-town slug or a small counter is far short of the cap on its own.
+fn make_room_for(base: &str, suffix: &str) -> String {
+    let budget = MAX_SLUG_LEN.saturating_sub(1 + suffix.len());
+    if base.len() <= budget {
+        base.to_owned()
+    } else {
+        cut_to_len(base, budget)
     }
 }
 
@@ -71,7 +93,9 @@ pub fn municipality_slug(number: &str, norwegian_name: &str) -> Result<String, S
 
 /// Section 6's collision rule within one municipality: the base slug, then with the
 /// post town appended, then numbered from 2. `is_taken` must count a slug held in
-/// history by a different, non-closed school as taken.
+/// history by a different, non-closed school as taken. The result never exceeds
+/// [`MAX_SLUG_LEN`]: when appending `-town` or `-N` would, `base` (or the
+/// town-appended stem) is shortened first, at a hyphen boundary where one exists.
 pub fn first_free_slug(
     base: &str,
     post_town: Option<&str>,
@@ -82,7 +106,7 @@ pub fn first_free_slug(
     }
     let stem = match post_town.and_then(|t| slugify(t).ok()) {
         Some(town) => {
-            let with_town = format!("{base}-{town}");
+            let with_town = format!("{}-{town}", make_room_for(base, &town));
             if !is_taken(&with_town) {
                 return with_town;
             }
@@ -91,7 +115,10 @@ pub fn first_free_slug(
         None => base.to_owned(),
     };
     (2u32..)
-        .map(|n| format!("{stem}-{n}"))
+        .map(|n| {
+            let suffix = n.to_string();
+            format!("{}-{suffix}", make_room_for(&stem, &suffix))
+        })
         .find(|candidate| !is_taken(candidate))
         .expect("some numbered slug is free")
 }
@@ -281,6 +308,43 @@ mod tests {
             first_free_slug("hosle-skole", Some("Школа"), only_base),
             "hosle-skole-2"
         );
+    }
+
+    #[test]
+    fn first_free_slug_never_exceeds_the_cap() {
+        // No hyphen anywhere in the 80-character base: appending "-hosle" must hard-cut.
+        let no_hyphen_base = "abcdefghij".repeat(8);
+        assert_eq!(no_hyphen_base.len(), MAX_SLUG_LEN);
+        let taken_only_base = |c: &str| c == no_hyphen_base;
+        let with_town = first_free_slug(&no_hyphen_base, Some("Hosle"), taken_only_base);
+        assert!(with_town.len() <= MAX_SLUG_LEN, "{}", with_town.len());
+        assert!(with_town.starts_with("abcdefghij"));
+        assert!(with_town.ends_with("-hosle"));
+
+        // A hyphenated 80-character base: the same append must cut at a hyphen
+        // boundary rather than mid-word.
+        let words: Vec<&str> = std::iter::repeat_n("abcdefghi", 7)
+            .chain(std::iter::once("abcdefghij"))
+            .collect();
+        let hyphenated_base = words.join("-");
+        assert_eq!(hyphenated_base.len(), MAX_SLUG_LEN);
+        let taken_only_hyphenated = |c: &str| c == hyphenated_base;
+        let with_town = first_free_slug(&hyphenated_base, Some("Hosle"), taken_only_hyphenated);
+        assert!(with_town.len() <= MAX_SLUG_LEN, "{}", with_town.len());
+        assert!(with_town.ends_with("-hosle"));
+        // The cut must have landed right after a hyphen boundary, not mid-word: the
+        // base part before "-hosle" is itself whole words from `words`, hyphen-joined.
+        let base_part = &with_town[..with_town.len() - "-hosle".len()];
+        assert!(
+            words.iter().any(|w| base_part.ends_with(w)),
+            "base was cut at a hyphen boundary: {base_part}"
+        );
+
+        // Numbering also respects the cap when no post town is available.
+        let only_no_hyphen_taken = |c: &str| c == no_hyphen_base;
+        let numbered = first_free_slug(&no_hyphen_base, None, only_no_hyphen_taken);
+        assert!(numbered.len() <= MAX_SLUG_LEN, "{}", numbered.len());
+        assert!(numbered.ends_with("-2"));
     }
 
     #[test]

@@ -2,7 +2,10 @@
 //! functions in memory only; nothing here is ever stored (ruling, 24 September 2026).
 //! A `c/o`/`v/` line never yields a plain [`address_keys`] key, only a
 //! [`care_of_keys`] one, and only when it names the candidate school (Erik, 24
-//! September 2026).
+//! September 2026). A `v` word is a personal marker both before the house number
+//! (`v/ Kari Nordmann, Hjemveien 12`) and after it when at least one more word
+//! follows (`Hjemveien 12 v/ Kari Nordmann`); a lone trailing `v`/house letter
+//! (`Storgata 12 V`) is not a marker, since it merges into the house number instead.
 
 use super::search::search_query;
 
@@ -76,10 +79,23 @@ pub fn is_fau_name(name: &str) -> bool {
 }
 
 /// A normalised street line and its postcode. Compared in memory; never stored.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AddressKey {
     pub street: String,
     pub postcode: String,
+}
+
+/// Redacts `street`: an address is personal data in practice, and `Debug` output
+/// lands in test failure messages and, if a caller is careless, in logs. `assert_eq!`
+/// on two keys still works -- it is only the printed representation that is
+/// redacted, never the comparison.
+impl std::fmt::Debug for AddressKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddressKey")
+            .field("street", &"<redacted>")
+            .field("postcode", &self.postcode)
+            .finish()
+    }
 }
 
 /// Every usable address line as a key: lines naming a person (`c/o`, `v/`, wherever the
@@ -108,9 +124,13 @@ pub fn address_keys<'a>(
 }
 
 /// Keys from `c/o` and `v/` lines that name `school_name` (Erik, 24 September 2026):
-/// "c/o Hosle skole, Bispeveien 73" counts for Hosle skole, but a line naming a person
-/// or another school never does. Each key counts only towards that school, so the
-/// matcher calls this once per candidate school sharing the postcode.
+/// "c/o Hosle skole, Bispeveien 73" counts for Hosle skole, but a line naming a
+/// person or another school in the marker's name part never does. The street part
+/// after the matched school name is not itself checked for a person's name, so a key
+/// from such a line can exist here in memory -- but it can only ever match if it is
+/// exactly equal to the school's own NSR address key, which a fabricated street
+/// cannot be. Each key counts only towards that school, so the matcher calls this
+/// once per candidate school sharing the postcode.
 pub fn care_of_keys<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     postcode: Option<&str>,
@@ -177,25 +197,35 @@ fn care_of_line(line: &str, school_lossy: &[String], school_core: &[String]) -> 
 }
 
 /// A line is personal (controller ruling) if the pair `c`, `o` appears anywhere among
-/// its words, or a word `v` appears before the first word that carries a digit. A
-/// street abbreviated `V.` folds the same way as `v/`, so it is treated the same way:
-/// privacy wins over recall.
+/// its words, or a word `v` appears before the first word that carries a digit, or a
+/// word `v` appears after that first digit word and at least one more word follows
+/// it. A street abbreviated `V.` folds the same way as `v/`, so it is treated the
+/// same way: privacy wins over recall. A lone trailing `v` (or house letter) is not a
+/// marker -- `normalise_street_words` merges it into the house number instead.
 fn is_personal(words: &[String]) -> bool {
     marker_end(words).is_some()
 }
 
 /// Where a personal marker ends, if `words` has one: right after the `o` of a `c`,
-/// `o` pair found anywhere, or right after the last `v` word before the first word
-/// that carries a digit.
+/// `o` pair found anywhere; else right after the last `v` word before the first word
+/// that carries a digit; else, if the first digit word has at least two words after
+/// it, right after the first `v` word among those but the last.
 fn marker_end(words: &[String]) -> Option<usize> {
     if let Some(i) = words.windows(2).position(|w| w[0] == "c" && w[1] == "o") {
         return Some(i + 2);
     }
     let first_digit = first_digit_index(words)?;
-    words[..first_digit]
+    if let Some(i) = words[..first_digit].iter().rposition(|w| w == "v") {
+        return Some(i + 1);
+    }
+    let after = &words[first_digit + 1..];
+    if after.is_empty() {
+        return None;
+    }
+    after[..after.len() - 1]
         .iter()
-        .rposition(|w| w == "v")
-        .map(|i| i + 1)
+        .position(|w| w == "v")
+        .map(|i| first_digit + 1 + i + 1)
 }
 
 fn first_digit_index(words: &[String]) -> Option<usize> {
@@ -247,7 +277,7 @@ fn is_postbox(words: &[String]) -> bool {
 /// canonicalised, with a trailing house-letter merged, requiring a digit and no post
 /// box.
 fn normalise_street_words(words: &[String]) -> Option<String> {
-    if is_postbox(words) || !words.iter().any(|w| w.bytes().any(|b| b.is_ascii_digit())) {
+    if is_postbox(words) || first_digit_index(words).is_none() {
         return None;
     }
     let mut out: Vec<String> = Vec::with_capacity(words.len());
@@ -541,6 +571,38 @@ mod tests {
             "Bestum skole SFO/FAU"
         );
         assert_eq!(suggest_fau_name("ÅSANE FAU", "Åsane skole"), "Åsane FAU");
+    }
+
+    #[test]
+    fn a_v_word_after_the_house_number_followed_by_more_words_is_personal() {
+        assert!(address_keys(["Hjemveien 12 v/ Kari Nordmann"], Some("1362")).is_empty());
+        assert!(care_of_keys(
+            ["Hjemveien 12 v/ Kari Nordmann"],
+            Some("1362"),
+            "Hosle skole"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_lone_trailing_house_letter_still_merges() {
+        assert_eq!(
+            address_keys(["Storgata 12 V"], Some("1362")),
+            vec![key("storgate 12v", "1362")]
+        );
+        assert_eq!(
+            address_keys(["Storgata 12 v"], Some("1362")),
+            vec![key("storgate 12v", "1362")]
+        );
+    }
+
+    #[test]
+    fn address_key_debug_redacts_the_street() {
+        let k = key("Bispeveien 73", "1362");
+        let printed = format!("{k:?}");
+        assert!(!printed.contains("Bispeveien"), "{printed}");
+        assert!(!printed.contains("bispevei"), "{printed}");
+        assert!(printed.contains("1362"), "{printed}");
     }
 
     #[test]

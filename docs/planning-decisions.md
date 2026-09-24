@@ -2484,6 +2484,11 @@ Brreg bulk download and a full NSR grunnskole download, both discarded afterward
 - **What a link does.** At signup the FAU name defaults to the linked entity's registered name,
   case-normalised because Brreg stores names in capitals, and otherwise to the school's display
   name. It is a suggestion the registrant edits, like every other prefill. The link grants nothing.
+- **Exception, decided by Erik the same day:** a `c/o` or `v/` line that names the school counts,
+  and one that does not stays excluded. "c/o Hosle skole, Bispeveien 73" is evidence for Hosle
+  skole. "c/o <a person>" or a line naming another school is not. Such a line is checked only
+  against a specific candidate school sharing the postcode, and its key counts only for that
+  school.
 - **The seed sends one summary email**, not one per review item. Later runs email each new item.
 - **The submission lookup keeps D9's privilege line.** The submission queues a lookup row, which
   the runtime role may insert. `fau register lookups`, running as `fau_register`, reads NSR's

@@ -575,7 +575,10 @@ create unique index school_fau_links_one_per_fau    on school_fau_links (fau_org
 **Matching, per weekly run**, entirely in memory:
 
 1. For each candidate entity, compute its address keys: every address line with a house number,
-   normalised and paired with its postcode. `c/o`, `v/` and post-box lines are skipped.
+   normalised and paired with its postcode. `c/o`, `v/` and post-box lines are skipped, with one
+   exception (Erik, 24 September). A `c/o` or `v/` line that names the school, such as
+   "c/o Hosle skole, Bispeveien 73", counts for that school only. It is checked against each
+   candidate school sharing the postcode. A line naming a person or another school never counts.
 2. Compute the same for every active in-scope school's visiting and postal address.
 3. **One FAU, one school** at that address. The pair is linked with `method = 'address'`, unless
    the name core identifies a different single school. That raises `fau_match_conflict`, and

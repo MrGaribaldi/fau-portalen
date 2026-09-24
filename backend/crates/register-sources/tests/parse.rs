@@ -136,3 +136,116 @@ fn a_parse_error_never_quotes_the_input() {
     let err = nsr::parse_unit(&serde_json::to_vec(&v).unwrap()).unwrap_err();
     assert!(!format!("{err:?} {err}").contains("SECRET-LOOKING-VALUE"));
 }
+
+use fau_domain::register::source::OfficialName;
+use fau_register_sources::{kartverket, ssb};
+
+fn names(n: &[(&str, &str, u8)]) -> Vec<OfficialName> {
+    n.iter()
+        .map(|(name, lang, p)| OfficialName {
+            name: (*name).into(),
+            language: (*lang).into(),
+            priority: *p,
+        })
+        .collect()
+}
+
+#[test]
+fn kartverket_lists_every_current_municipality() {
+    let all = kartverket::parse_municipalities(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    assert_eq!(all.len(), 357);
+    assert!(all
+        .iter()
+        .all(|m| m.number.len() == 4 && m.county_number.len() == 2));
+    assert!(
+        !all.iter().any(|m| m.number == "2100"),
+        "Svalbard is not a municipality (§2.2)"
+    );
+}
+
+#[test]
+fn kaafjord_has_three_official_names() {
+    let all = kartverket::parse_municipalities(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    let k = all.iter().find(|m| m.number == "5540").unwrap();
+    assert_eq!(k.norwegian_name, "Kåfjord");
+    assert_eq!(k.official_name, "Gáivuotna");
+    assert_eq!(
+        (k.county_number.as_str(), k.county_name.as_str()),
+        ("55", "Troms")
+    );
+    assert_eq!(
+        k.names,
+        names(&[
+            ("Gáivuotna", "se", 1),
+            ("Kåfjord", "no", 2),
+            ("Kaivuono", "fkv", 3)
+        ])
+    );
+}
+
+#[test]
+fn kartverket_padding_entries_are_skipped() {
+    let all = kartverket::parse_municipalities(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    let oslo = all.iter().find(|m| m.number == "0301").unwrap();
+    assert_eq!(oslo.names, names(&[("Oslo", "no", 1)]));
+    assert_eq!(oslo.norwegian_name, "Oslo");
+}
+
+#[test]
+fn every_kartverket_language_is_mapped() {
+    let all = kartverket::parse_municipalities(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    let mut langs: Vec<_> = all
+        .iter()
+        .flat_map(|m| m.names.iter().map(|n| n.language.as_str()))
+        .collect();
+    langs.sort();
+    langs.dedup();
+    assert_eq!(langs, ["fkv", "no", "se", "sma", "smj"]);
+}
+
+#[test]
+fn an_unknown_kartverket_language_is_an_error() {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fixture("kartverket/fylkerkommuner.json")).unwrap();
+    v[0]["kommuner"][0]["gyldigeNavn"][0]["sprak"] = "Klingon".into();
+    let err = kartverket::parse_municipalities(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+    assert_eq!(
+        err.kind,
+        SourceErrorKind::UnexpectedValue { field: "sprak" }
+    );
+}
+
+#[test]
+fn ssb_changes_of_2024_include_the_renumbering_and_the_split() {
+    let c = ssb::parse_changes(&fixture("ssb/changes-2024.json")).unwrap();
+    assert_eq!(c.len(), 118);
+    let has = |old: &str, new: &str| c.iter().any(|x| x.old_code == old && x.new_code == new);
+    assert!(has("3024", "3201"), "Bærum renumbered");
+    assert!(
+        has("1507", "1508") && has("1507", "1580"),
+        "Ålesund split into Ålesund and Haram"
+    );
+    assert!(c.iter().all(|x| x.occurred_on.to_string() == "2024-01-01"));
+    let rana = c.iter().find(|x| x.old_code == "1833").unwrap();
+    assert_eq!(
+        (rana.new_code.as_str(), rana.new_name.as_str()),
+        ("1833", "Rana - Raane"),
+        "a name-only change"
+    );
+}
+
+#[test]
+fn ssb_changes_of_2026_include_the_boundary_adjustment() {
+    let c = ssb::parse_changes(&fixture("ssb/changes-2026.json")).unwrap();
+    assert_eq!(c.len(), 6);
+    let from_3118: Vec<_> = c
+        .iter()
+        .filter(|x| x.old_code == "3118")
+        .map(|x| x.new_code.as_str())
+        .collect();
+    assert_eq!(
+        from_3118,
+        ["3118", "3207", "3216"],
+        "3118 continues: a boundary adjustment, not a merger"
+    );
+}

@@ -18,7 +18,12 @@ async fn signup_creates_a_pending_fau() {
 
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "leder@example.test", t0),
+        signup(
+            school(&pool, "school-1").await,
+            "reg@example.test",
+            "leder@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -45,7 +50,7 @@ async fn a_second_signup_for_a_school_is_refused_and_copied_to_ewb() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    let school = Uuid::now_v7();
+    let school = school(&pool, "contested").await;
 
     let first = create_pending_tenant(
         &pool,
@@ -112,10 +117,15 @@ async fn one_address_holds_at_most_three_pending_faus() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    for _ in 0..3 {
+    for i in 0..3 {
         create_pending_tenant(
             &pool,
-            signup(Uuid::now_v7(), "r@example.test", "r@example.test", t0),
+            signup(
+                school(&pool, &format!("loop-{i}")).await,
+                "r@example.test",
+                "r@example.test",
+                t0,
+            ),
             t0,
         )
         .await
@@ -123,7 +133,12 @@ async fn one_address_holds_at_most_three_pending_faus() {
     }
     let err = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "r@example.test", "r@example.test", t0),
+        signup(
+            school(&pool, "school-2").await,
+            "r@example.test",
+            "r@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -132,7 +147,12 @@ async fn one_address_holds_at_most_three_pending_faus() {
     // Another address is unaffected.
     create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "s@example.test", "s@example.test", t0),
+        signup(
+            school(&pool, "school-3").await,
+            "s@example.test",
+            "s@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -144,7 +164,12 @@ async fn the_admin_end_date_must_be_one_to_twenty_four_months_away() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    let mut s = signup(Uuid::now_v7(), "r@example.test", "r@example.test", t0);
+    let mut s = signup(
+        school(&pool, "school-4").await,
+        "r@example.test",
+        "r@example.test",
+        t0,
+    );
     s.admin_ends_on_exclusive = day(2026, 10, 22);
     assert_eq!(
         create_pending_tenant(&pool, s.clone(), t0)
@@ -164,7 +189,7 @@ async fn a_pending_fau_expires_after_seven_days_and_frees_the_school() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    let school = Uuid::now_v7();
+    let school = school(&pool, "contested").await;
     let pending = create_pending_tenant(
         &pool,
         signup(school, "r@example.test", "r@example.test", t0),
@@ -217,7 +242,7 @@ async fn an_expired_pending_fau_does_not_hold_its_school_before_the_sweep() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    let school = Uuid::now_v7();
+    let school = school(&pool, "contested").await;
     let pending = create_pending_tenant(
         &pool,
         signup(school, "r@example.test", "r@example.test", t0),
@@ -268,7 +293,12 @@ async fn activation_writes_everything_together() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "leder@example.test", t0),
+        signup(
+            school(&pool, "school-5").await,
+            "reg@example.test",
+            "leder@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -387,7 +417,12 @@ async fn activation_is_all_or_nothing() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "leder@example.test", t0),
+        signup(
+            school(&pool, "school-6").await,
+            "reg@example.test",
+            "leder@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -449,7 +484,12 @@ async fn activation_requires_the_registrants_own_address() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "reg@example.test", t0),
+        signup(
+            school(&pool, "school-7").await,
+            "reg@example.test",
+            "reg@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -483,10 +523,15 @@ async fn expired_but_unswept_signups_do_not_count_toward_the_pending_limit() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    for _ in 0..3 {
+    for i in 0..3 {
         create_pending_tenant(
             &pool,
-            signup(Uuid::now_v7(), "r@example.test", "r@example.test", t0),
+            signup(
+                school(&pool, &format!("loop-{i}")).await,
+                "r@example.test",
+                "r@example.test",
+                t0,
+            ),
             t0,
         )
         .await
@@ -497,7 +542,12 @@ async fn expired_but_unswept_signups_do_not_count_toward_the_pending_limit() {
     let later = at("2026-10-01T00:00:00Z");
     create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "r@example.test", "r@example.test", later),
+        signup(
+            school(&pool, "school-8").await,
+            "r@example.test",
+            "r@example.test",
+            later,
+        ),
         later,
     )
     .await
@@ -509,7 +559,7 @@ async fn only_one_of_several_concurrent_signups_for_one_school_succeeds() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
-    let school = Uuid::now_v7();
+    let school = school(&pool, "contested").await;
 
     let mut handles = Vec::new();
     for i in 0..8 {
@@ -544,9 +594,9 @@ async fn only_three_of_several_concurrent_signups_for_one_address_succeed() {
     let address = "many@example.test";
 
     let mut handles = Vec::new();
-    for _ in 0..5 {
+    for i in 0..5 {
         let pool = pool.clone();
-        let school = Uuid::now_v7();
+        let school = school(&pool, &format!("school-{i}")).await;
         handles.push(tokio::spawn(async move {
             create_pending_tenant(&pool, signup(school, address, address, t0), t0).await
         }));
@@ -574,7 +624,12 @@ async fn activating_an_already_active_fau_is_refused() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "reg@example.test", t0),
+        signup(
+            school(&pool, "school-9").await,
+            "reg@example.test",
+            "reg@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -610,7 +665,12 @@ async fn activating_a_frozen_fau_is_refused() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "reg@example.test", t0),
+        signup(
+            school(&pool, "school-10").await,
+            "reg@example.test",
+            "reg@example.test",
+            t0,
+        ),
         t0,
     )
     .await
@@ -651,7 +711,12 @@ async fn activating_with_a_disabled_account_is_refused() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "reg@example.test", t0),
+        signup(
+            school(&pool, "school-11").await,
+            "reg@example.test",
+            "reg@example.test",
+            t0,
+        ),
         t0,
     )
     .await

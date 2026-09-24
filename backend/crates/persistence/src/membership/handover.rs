@@ -278,6 +278,7 @@ pub async fn recovery_grant_admin(
         enqueue(
             &mut tx,
             at,
+            Some(req.tenant_id),
             "recovery.invitation_created",
             recipient,
             json!({ "tenant_id": req.tenant_id, "invitation_id": issued.invitation_id }),

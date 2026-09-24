@@ -369,8 +369,8 @@ async fn audit_and_outbox_codes_are_constrained() {
     );
 
     let big_params = sqlx::query(
-        "insert into outbox (id, template, recipient_email, params, created_at)
-         values ($1, 'invitation.issued', 'x@example.test', jsonb_build_object('pad', repeat('x', 3000)), now())",
+        "insert into outbox (id, tenant_id, template, recipient_email, params, created_at)
+         values ($1, $1, 'invitation.issued', 'x@example.test', jsonb_build_object('pad', repeat('x', 3000)), now())",
     )
     .bind(Uuid::now_v7())
     .execute(&pool)
@@ -859,8 +859,8 @@ async fn outbox_template_must_be_a_code() {
 
     // Positive control: a dotted action-code template is accepted.
     sqlx::query(
-        "insert into outbox (id, template, recipient_email, created_at)
-         values ($1, 'invitation.issued', 'x@example.test', now())",
+        "insert into outbox (id, tenant_id, template, recipient_email, created_at)
+         values ($1, $1, 'invitation.issued', 'x@example.test', now())",
     )
     .bind(Uuid::now_v7())
     .execute(&pool)
@@ -868,8 +868,8 @@ async fn outbox_template_must_be_a_code() {
     .expect("a code-shaped template is accepted");
 
     let err = sqlx::query(
-        "insert into outbox (id, template, recipient_email, created_at)
-         values ($1, 'Invitation Issued', 'y@example.test', now())",
+        "insert into outbox (id, tenant_id, template, recipient_email, created_at)
+         values ($1, $1, 'Invitation Issued', 'y@example.test', now())",
     )
     .bind(Uuid::now_v7())
     .execute(&pool)
@@ -910,4 +910,91 @@ async fn audit_subject_type_must_be_a_code() {
         constraint_name(&err).as_deref(),
         Some("audit_subject_type_is_a_code")
     );
+}
+
+/// The quoted values in a check constraint's definition, in order, as PostgreSQL itself
+/// prints them: `CHECK ((status = ANY (ARRAY['pending'::text, ...])))`.
+async fn allowed_values(pool: &sqlx::PgPool, table: &str, constraint: &str) -> Vec<String> {
+    let def: String = sqlx::query_scalar(
+        "select pg_get_constraintdef(c.oid) from pg_constraint c
+          where c.conrelid = $1::regclass and c.conname = $2 and c.contype = 'c'",
+    )
+    .bind(table)
+    .bind(constraint)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{table}.{constraint}: {e}"));
+    def.split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Final review M10: every closed set the domain code translates has exactly the values
+/// its database check constraint allows, read from the live schema rather than from a
+/// copy of the migration text. A value added on one side only fails here.
+#[tokio::test]
+async fn check_constraints_allow_exactly_the_domain_code_sets() {
+    use fau_domain::membership::vocabulary::{
+        CapabilityClass, InvitationMode, RecoveryHolder, RequestKind, RequestStatus, TenantStatus,
+    };
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+
+    fn codes<T: Copy>(all: &[T], code: fn(T) -> &'static str) -> Vec<String> {
+        all.iter().map(|v| code(*v).to_owned()).collect()
+    }
+    let cases: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "tenants",
+            "tenants_status_check",
+            codes(TenantStatus::ALL, TenantStatus::code),
+        ),
+        (
+            "roles",
+            "roles_capability_class_check",
+            codes(CapabilityClass::ALL, CapabilityClass::code),
+        ),
+        (
+            "invitations",
+            "invitations_mode_check",
+            codes(InvitationMode::ALL, InvitationMode::code),
+        ),
+        (
+            "invitations",
+            "invitations_recovery_holder_check",
+            codes(RecoveryHolder::ALL, RecoveryHolder::code),
+        ),
+        (
+            "recovery_contacts",
+            "recovery_contacts_holder_check",
+            codes(RecoveryHolder::ALL, RecoveryHolder::code),
+        ),
+        (
+            "access_requests",
+            "access_requests_kind_check",
+            codes(RequestKind::ALL, RequestKind::code),
+        ),
+        (
+            "access_requests",
+            "access_requests_status_check",
+            codes(RequestStatus::ALL, RequestStatus::code),
+        ),
+        (
+            "audit_events",
+            "audit_events_actor_kind_check",
+            fau_persistence::membership::audit_actor_kind_codes()
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
+        ),
+    ];
+    for (table, constraint, expected) in cases {
+        assert_eq!(
+            allowed_values(&pool, table, constraint).await,
+            expected,
+            "{table}.{constraint}"
+        );
+    }
 }

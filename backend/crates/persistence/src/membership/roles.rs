@@ -1,17 +1,18 @@
 //! Granting and revoking roles and memberships, with the last-admin safeguard (spec 7).
 
 use fau_domain::membership::period::Period;
+use fau_domain::membership::rules::handover_period;
 use fau_domain::time::Moment;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::error::MembershipError;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
-    membership_and_account_state, require_admin, require_open, ts_param, write_audit, AdminState,
-    Audit,
+    membership_and_account_state, parse_date, require_admin, require_open, ts_param, write_audit,
+    AdminState, Audit,
 };
 
 #[derive(Debug, Clone)]
@@ -195,9 +196,11 @@ pub struct RevokeMembership {
 }
 
 /// Revokes a whole membership: an admin removing someone, or a member leaving. Ends
-/// every current and future role the membership holds and every handover grant derived
-/// from any of its roles, at once. Other FAU-er the account belongs to are untouched
-/// (spec 7, ADR-003 decision 6a).
+/// every current and future role the membership holds, every already-ended admin role
+/// whose handover window is still open (so a later re-invite cannot revive it, final
+/// review I1), and every handover grant derived from any of its roles, at once. The
+/// member's own pending requests and proposals are withdrawn with it. Other FAU-er the
+/// account belongs to are untouched (spec 7, ADR-003 decision 6a).
 ///
 /// No `require_open` here: revoking only ever reduces rights, so this is allowed on a
 /// frozen FAU too -- the same reasoning as `withdraw_invitation` and `decline_request`
@@ -260,6 +263,8 @@ pub async fn revoke_membership(
     .bind(date_param(at.today()))
     .execute(&mut *tx)
     .await?;
+    revoke_ended_admin_roles_with_open_window(&mut tx, req.tenant_id, req.membership_id, at)
+        .await?;
     sqlx::query(
         "update handover_grants g set revoked_at = $3::timestamptz
            from role_assignments ra
@@ -271,6 +276,14 @@ pub async fn revoke_membership(
     .bind(req.membership_id)
     .bind(&now)
     .execute(&mut *tx)
+    .await?;
+    withdraw_pending_requests(
+        &mut tx,
+        req.tenant_id,
+        req.actor_membership_id,
+        req.membership_id,
+        at,
+    )
     .await?;
     write_audit(
         &mut tx,
@@ -290,5 +303,109 @@ pub async fn revoke_membership(
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// The second half of `revoke_membership`'s assignment cascade (final review I1).
+///
+/// An admin-class assignment that has already ended naturally still matters while its
+/// handover window is open: the sweep gives it a grant if it has none yet. Left
+/// unrevoked, such an assignment sits behind a revoked membership only until someone
+/// invites the person back -- `ensure_membership` reopens the same row, and the next
+/// sweep would then hand a removed admin handover authority.
+///
+/// So this revokes every unrevoked, already-ended admin-class assignment of the
+/// membership whose handover window (`handover_period`, the one authoritative
+/// computation) is not over today. The rule is decided in Rust per row rather than
+/// approximated in SQL, because the window's end is truncated at month ends. Together
+/// with the running-or-future update before it, the revoked set is exactly the
+/// assignments that could still confer anything; older assignments are inert history
+/// and keep their natural-end record. An existing grant from one of these assignments
+/// is revoked by the grant cascade that follows, as before.
+async fn revoke_ended_admin_roles_with_open_window(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    at: Moment,
+) -> Result<(), MembershipError> {
+    let today = at.today();
+    let ended: Vec<(Uuid, String)> = sqlx::query_as(
+        "select ra.id, to_char(ra.ends_on_exclusive, 'YYYY-MM-DD')
+           from role_assignments ra
+           join roles r on r.tenant_id = ra.tenant_id and r.id = ra.role_id
+          where ra.tenant_id = $1 and ra.membership_id = $2
+            and ra.revoked_at is null and r.capability_class = 'admin'
+            and ra.ends_on_exclusive <= $3::date",
+    )
+    .bind(tenant_id)
+    .bind(membership_id)
+    .bind(date_param(today))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut open = Vec::new();
+    for (id, ends) in ended {
+        if handover_period(parse_date(&ends)?).is_some_and(|w| !w.has_ended_by(today)) {
+            open.push(id);
+        }
+    }
+    if open.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "update role_assignments set revoked_at = $3::timestamptz
+          where tenant_id = $1 and id = any($2)",
+    )
+    .bind(tenant_id)
+    .bind(&open)
+    .bind(ts_param(at.now()))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Withdraws the revoked member's own pending items (final review M9): replacement
+/// proposals they made, and any access request still pending from their account's
+/// address -- sent before they were invited in, say. A removed member's proposal must
+/// not stay in front of the admins as if they still spoke for the role. `withdrawn`
+/// carries no decider (`access_request_decider_matches_status`) and needs `closed_at`
+/// (`access_request_closure_matches_status`). Each is audited, attributed to the actor
+/// who revoked the membership. Nobody is emailed: the member knows they left or were
+/// removed.
+async fn withdraw_pending_requests(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    actor_membership_id: Uuid,
+    membership_id: Uuid,
+    at: Moment,
+) -> Result<(), MembershipError> {
+    let withdrawn: Vec<Uuid> = sqlx::query_scalar(
+        "update access_requests ar set status = 'withdrawn', closed_at = $3::timestamptz
+          where ar.tenant_id = $1 and ar.status = 'pending'
+            and (ar.requester_membership_id = $2
+                 or ar.requester_email = (select a.email
+                                            from memberships m join accounts a on a.id = m.account_id
+                                           where m.tenant_id = $1 and m.id = $2))
+         returning ar.id",
+    )
+    .bind(tenant_id)
+    .bind(membership_id)
+    .bind(ts_param(at.now()))
+    .fetch_all(&mut *conn)
+    .await?;
+    for request_id in withdrawn {
+        write_audit(
+            conn,
+            at,
+            Audit::member(
+                tenant_id,
+                actor_membership_id,
+                "request.withdrawn",
+                "access_request",
+                request_id,
+                json!({ "cause": "membership_revoked", "membership_id": membership_id }),
+            ),
+        )
+        .await?;
+    }
     Ok(())
 }

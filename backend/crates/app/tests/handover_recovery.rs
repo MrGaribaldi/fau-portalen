@@ -8,11 +8,11 @@ use fau_domain::membership::acceptance::AcceptanceRefusal;
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_domain::time::Moment;
 use fau_persistence::membership::{
-    accept_invitation, approve_request, create_access_request, create_handover_grants, grant_role,
-    issue_invitation, recovery_grant_admin, revoke_membership, revoke_role_assignment,
-    AcceptInvitation, CreateAccessRequest, GrantRole, IssueInvitation, MembershipError,
-    OfferedRole, RecoveryActor, RecoveryGrant, RequestDecision, RevokeAssignment, RevokeMembership,
-    RoleChoice,
+    accept_invitation, approve_request, create_access_request, create_handover_grants,
+    effective_access, grant_role, issue_invitation, recovery_grant_admin, revoke_membership,
+    revoke_role_assignment, AcceptInvitation, CreateAccessRequest, GrantRole, IssueInvitation,
+    MembershipError, OfferedRole, RecoveryActor, RecoveryGrant, RequestDecision, RevokeAssignment,
+    RevokeMembership, RoleChoice,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -956,8 +956,9 @@ async fn the_sweep_skips_an_assignment_whose_membership_is_revoked() {
     let fau = active_fau(&pool, "admin@example.test", t0).await;
 
     // The admin's own role has already ended; only then do they leave the FAU
-    // entirely. `revoke_membership`'s cascade only touches assignments still running
-    // today, so the already-ended assignment keeps `revoked_at = null`.
+    // entirely. Since final review I1, `revoke_membership` also revokes an ended admin
+    // role whose handover window is still open, so the sweep now has two independent
+    // reasons to skip it: the revoked assignment and the revoked membership.
     let after_role_end = at("2027-10-15T10:00:00Z");
     revoke_membership(
         &pool,
@@ -1210,5 +1211,113 @@ async fn recovery_cannot_create_a_new_role() {
         .unwrap_err(),
         MembershipError::NotAuthorized,
         "the recovery contact may only offer an existing role, never create one"
+    );
+}
+
+/// Final review I1: an admin role that ends on the very day its membership is revoked,
+/// before the sweep has given it a grant, must not come back to life as a handover grant
+/// when the same person is later invited back as a plain member. `ensure_membership`
+/// reopens the old membership row, so the ended assignment would otherwise be an
+/// unrevoked admin-class role behind a usable membership -- exactly the sweep's input.
+#[tokio::test]
+async fn a_removed_admin_does_not_regain_handover_through_reopen_and_the_sweep() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let other = add_member(
+        &pool,
+        &fau,
+        "admin2@example.test",
+        RoleChoice::Existing(fau.admin_role_id),
+        period(day(2026, 9, 23), day(2028, 10, 1)),
+        t0,
+    )
+    .await;
+
+    // 1-2. The registrant's admin role ends on D = 2027-10-01; the same day, before any
+    // sweep, the other admin removes them.
+    let d = at("2027-10-01T08:00:00Z");
+    revoke_membership(
+        &pool,
+        RevokeMembership {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: other.membership_id,
+            membership_id: fau.admin_membership_id,
+            confirm_no_admin: false,
+        },
+        d,
+    )
+    .await
+    .unwrap();
+
+    // 3. Invited back as a plain member, and accepted.
+    let issued = issue_invitation(
+        &pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: other.membership_id,
+            recipient: email("admin@example.test"),
+            roles: vec![OfferedRole {
+                role: new_role("Medlem", CapabilityClass::Member),
+                period: period(day(2027, 10, 1), day(2028, 9, 1)),
+            }],
+            handover_grant_id: None,
+        },
+        d,
+    )
+    .await
+    .unwrap();
+    let back = accept_invitation(
+        &pool,
+        accept(issued.token.expose(), "admin@example.test"),
+        d,
+    )
+    .await
+    .unwrap();
+    assert_eq!(back.membership_id, fau.admin_membership_id, "reopened");
+
+    // 4. The sweep runs, that day and the next.
+    let sweep_d = at("2027-10-01T22:00:00Z");
+    assert_eq!(create_handover_grants(&pool, sweep_d).await.unwrap(), 0);
+    let next = at("2027-10-02T10:00:00Z");
+    assert_eq!(create_handover_grants(&pool, next).await.unwrap(), 0);
+
+    // 5. No grant, and no handover reported.
+    assert!(grant_for(&pool, fau.admin_assignment_id).await.is_none());
+    let access = effective_access(&pool, fau.admin_account_id, fau.tenant_id, next)
+        .await
+        .unwrap();
+    assert!(!access.handover);
+    assert_eq!(audit_count(&pool, "handover.granted").await, 0);
+}
+
+/// Final review M7: the recovery contact's grant creates an invitation, which a frozen
+/// FAU refuses like every other issuance.
+#[tokio::test]
+async fn recovery_is_refused_on_a_frozen_fau() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = without_admin(&pool).await;
+    sqlx::query("update tenants set frozen_at = now() where id = $1")
+        .bind(fau.tenant_id)
+        .execute(&db.admin_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery_grant_admin(
+            &pool,
+            recovery(
+                &fau,
+                RecoveryActor::Ewb,
+                "ny-leder@example.test",
+                RoleChoice::Existing(fau.admin_role_id),
+            ),
+            t0,
+        )
+        .await
+        .unwrap_err(),
+        MembershipError::TenantFrozen
     );
 }

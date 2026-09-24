@@ -795,3 +795,214 @@ async fn leaving_one_fau_leaves_the_other_untouched() {
     assert!(!revoked(&pool, "memberships", second.admin_membership_id).await);
     assert!(!revoked(&pool, "role_assignments", second.admin_assignment_id).await);
 }
+
+async fn set_tenant(db: &TestDb, tenant_id: Uuid, sql: &str) {
+    sqlx::query(sql)
+        .bind(tenant_id)
+        .execute(&db.admin_pool())
+        .await
+        .unwrap();
+}
+
+/// Final review M7: granting adds rights, so a frozen FAU refuses it.
+#[tokio::test]
+async fn a_frozen_fau_refuses_granting_a_role() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let member = add_member(
+        &pool,
+        &fau,
+        "medlem@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 23), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    set_tenant(
+        &db,
+        fau.tenant_id,
+        "update tenants set frozen_at = now() where id = $1",
+    )
+    .await;
+    assert_eq!(
+        grant_role(
+            &pool,
+            GrantRole {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                membership_id: member.membership_id,
+                role: new_role("Kasserer", CapabilityClass::Member),
+                period: period(day(2026, 10, 1), day(2027, 10, 1)),
+            },
+            t0,
+        )
+        .await
+        .unwrap_err(),
+        MembershipError::TenantFrozen
+    );
+}
+
+/// Final review M7: `require_open` reports a closed FAU as `TenantNotActive`, checked
+/// here through `grant_role`.
+#[tokio::test]
+async fn a_closed_fau_refuses_granting_a_role_as_not_active() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    set_tenant(
+        &db,
+        fau.tenant_id,
+        "update tenants set status = 'closed' where id = $1",
+    )
+    .await;
+    assert_eq!(
+        grant_role(
+            &pool,
+            GrantRole {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                membership_id: fau.admin_membership_id,
+                role: new_role("Kasserer", CapabilityClass::Member),
+                period: period(day(2026, 10, 1), day(2027, 10, 1)),
+            },
+            t0,
+        )
+        .await
+        .unwrap_err(),
+        MembershipError::TenantNotActive
+    );
+}
+
+/// Final review M7, controller ruling: revocation only reduces rights, so a frozen FAU
+/// allows revoking a role and revoking a membership.
+#[tokio::test]
+async fn a_frozen_fau_still_allows_revocation() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let first = add_member(
+        &pool,
+        &fau,
+        "en@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 23), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    let second = add_member(
+        &pool,
+        &fau,
+        "to@example.test",
+        new_role("Kasserer", CapabilityClass::Member),
+        period(day(2026, 9, 23), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    set_tenant(
+        &db,
+        fau.tenant_id,
+        "update tenants set frozen_at = now() where id = $1",
+    )
+    .await;
+
+    revoke_role_assignment(
+        &pool,
+        RevokeAssignment {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            assignment_id: first.assignment_ids[0],
+            confirm_no_admin: false,
+        },
+        t0,
+    )
+    .await
+    .expect("revoking a role is allowed on a frozen FAU");
+    revoke_membership(
+        &pool,
+        RevokeMembership {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: second.membership_id,
+            confirm_no_admin: false,
+        },
+        t0,
+    )
+    .await
+    .expect("revoking a membership is allowed on a frozen FAU");
+    assert!(revoked(&pool, "role_assignments", first.assignment_ids[0]).await);
+    assert!(revoked(&pool, "memberships", second.membership_id).await);
+}
+
+/// Final review M7: two admins each revoke the other's admin assignment at the same
+/// moment, without confirming. `lock_tenant` serialises them: the first succeeds, and
+/// the second finds its actor no longer an admin. The FAU is never left with no admin
+/// without confirmation. Repeated, so an interleaving that slips past the lock is
+/// likely to show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_admins_revoking_each_other_at_once_never_leave_the_fau_without_an_admin() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    for round in 0..10 {
+        let fau = active_fau(&pool, &format!("a{round}@example.test"), t0).await;
+        let other = add_member(
+            &pool,
+            &fau,
+            &format!("b{round}@example.test"),
+            RoleChoice::Existing(fau.admin_role_id),
+            period(day(2026, 9, 23), day(2027, 10, 1)),
+            t0,
+        )
+        .await;
+        let revoke = |actor: Uuid, assignment_id: Uuid| {
+            let pool = pool.clone();
+            let tenant_id = fau.tenant_id;
+            tokio::spawn(async move {
+                revoke_role_assignment(
+                    &pool,
+                    RevokeAssignment {
+                        tenant_id,
+                        actor_membership_id: actor,
+                        assignment_id,
+                        confirm_no_admin: false,
+                    },
+                    t0,
+                )
+                .await
+            })
+        };
+        let a = revoke(fau.admin_membership_id, other.assignment_ids[0]);
+        let b = revoke(other.membership_id, fau.admin_assignment_id);
+        let results = [a.await.unwrap(), b.await.unwrap()];
+
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok, 1,
+            "round {round}: exactly one revocation succeeds under serialisation"
+        );
+        for r in &results {
+            if let Err(e) = r {
+                assert!(
+                    matches!(
+                        e,
+                        MembershipError::NotAuthorized | MembershipError::WouldLeaveNoAdmin
+                    ),
+                    "round {round}: unexpected {e:?}"
+                );
+            }
+        }
+        let admins_left: i64 = sqlx::query_scalar(
+            "select count(*) from role_assignments ra join roles r on r.id = ra.role_id
+              where ra.tenant_id = $1 and r.capability_class = 'admin' and ra.revoked_at is null",
+        )
+        .bind(fau.tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(admins_left >= 1, "round {round}: no admin left");
+    }
+}

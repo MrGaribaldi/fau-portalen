@@ -70,10 +70,15 @@ create index audit_events_tenant_idx on audit_events (tenant_id, occurred_at);
 
 -- 4. Outbox (spec 2.6, 9). Written in the same transaction as the state change it
 -- announces; a sender (#3410) delivers it later. Never carries a token.
--- Minimal by design (spec section 9): delivery belongs to #3410, which may add
--- tenant scoping additively.
+-- tenant_id scopes every message about an FAU, so deleting an FAU (ADR-003 decision 7)
+-- and an Article 17 erasure can find its queued mail -- recipient addresses included --
+-- by column rather than by parsing params. Nullable only for a global message (the
+-- signup collision copy to EWB, whose audit entry is global too), and, like
+-- audit_events, without a foreign key: a queued message may outlive a deleted pending
+-- tenant, and the deletion flow decides what happens to it.
 create table outbox (
   id              uuid        primary key,
+  tenant_id       uuid,
   template        text        not null
     constraint outbox_template_is_a_code check (template ~ '^[a-z][a-z_]*(\.[a-z][a-z_]*)+$'),
   recipient_email text        not null,
@@ -84,9 +89,14 @@ create table outbox (
   sent_at         timestamptz,
   attempts        integer     not null default 0 check (attempts >= 0),
   -- A fixed classification of the last delivery failure, never the provider's message.
-  last_error_kind text
+  last_error_kind text,
+  -- Every template is tenant-scoped except the global ones named here; a new global
+  -- template must be added deliberately.
+  constraint outbox_tenant_scoped_unless_global
+    check (tenant_id is not null or template in ('signup.collision'))
 );
 create index outbox_unsent_idx on outbox (created_at) where sent_at is null;
+create index outbox_tenant_idx on outbox (tenant_id);
 
 -- 5. The recovery-contact seat (spec 6.5, ADR-003 decisions 8 and 9). One row per
 -- tenant, written at activation with EWB in the seat.

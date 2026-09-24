@@ -64,7 +64,8 @@ pub(crate) struct TenantState {
 }
 
 /// Locks the tenant row for the rest of the transaction and returns its state. Every
-/// membership mutation takes this lock first, which serialises role changes within one
+/// membership mutation takes this lock first (the documented exceptions are listed in
+/// the module doc of `membership`), which serialises role changes within one
 /// FAU: two admins revoking each other at the same moment cannot both pass the
 /// last-admin safeguard. `for no key update` does not block foreign-key checks from
 /// other transactions inserting rows that reference the tenant.
@@ -95,7 +96,18 @@ pub(crate) enum ActorKind {
 }
 
 impl ActorKind {
-    fn code(self) -> &'static str {
+    /// Every variant, in the order `audit_events.actor_kind`'s check constraint lists
+    /// them. `all_lists_every_variant` below keeps it complete.
+    pub(crate) const ALL: &'static [ActorKind] = &[
+        ActorKind::Member,
+        ActorKind::System,
+        ActorKind::Registrant,
+        ActorKind::Requester,
+        ActorKind::RecoveryEwb,
+        ActorKind::RecoverySchoolRep,
+    ];
+
+    pub(crate) fn code(self) -> &'static str {
         match self {
             ActorKind::Member => "member",
             ActorKind::System => "system",
@@ -190,19 +202,23 @@ pub(crate) async fn write_audit(
 }
 
 /// Queues one notification. `params` carries ids and codes for the renderer to look up;
-/// never a token and never free text.
+/// never a token and never free text. `tenant_id` is the FAU the message is about, and
+/// `None` only for a global message (`outbox_tenant_scoped_unless_global` names which
+/// templates may be global), so FAU deletion and erasure can find queued mail by column.
 pub(crate) async fn enqueue(
     conn: &mut PgConnection,
     at: Moment,
+    tenant_id: Option<Uuid>,
     template: &'static str,
     recipient_email: &str,
     params: Value,
 ) -> Result<(), MembershipError> {
     sqlx::query(
-        "insert into outbox (id, template, recipient_email, params, created_at)
-         values ($1, $2, $3, $4::jsonb, $5::timestamptz)",
+        "insert into outbox (id, tenant_id, template, recipient_email, params, created_at)
+         values ($1, $2, $3, $4, $5::jsonb, $6::timestamptz)",
     )
     .bind(Uuid::now_v7())
+    .bind(tenant_id)
     .bind(template)
     .bind(recipient_email)
     .bind(params.to_string())
@@ -644,6 +660,13 @@ pub(crate) async fn admin_emails(
     member_emails(conn, tenant_id, today, true).await
 }
 
+/// The codes `audit_events.actor_kind` accepts, in `ActorKind::ALL` order. Exposed only
+/// so the schema-agreement test (`membership_schema.rs`) can compare them with the live
+/// check constraint; `ActorKind` itself stays internal.
+pub fn audit_actor_kind_codes() -> Vec<&'static str> {
+    ActorKind::ALL.iter().map(|k| k.code()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +675,24 @@ mod tests {
     /// (fix round 1, task 10): a caller like `access::effective_access` that needs
     /// them apart reads `MEMBERSHIP_NOT_REVOKED` and `ACCOUNT_USABLE` rather than
     /// retyping the SQL, so this test is what keeps all three in sync.
+    /// `ActorKind::ALL` names every variant: adding one without listing it fails to
+    /// compile here (the exhaustive match) or fails the count.
+    #[test]
+    fn all_lists_every_variant() {
+        let count = |k: ActorKind| match k {
+            ActorKind::Member
+            | ActorKind::System
+            | ActorKind::Registrant
+            | ActorKind::Requester
+            | ActorKind::RecoveryEwb
+            | ActorKind::RecoverySchoolRep => 1,
+        };
+        assert_eq!(ActorKind::ALL.iter().map(|k| count(*k)).sum::<usize>(), 6);
+        let mut codes: Vec<_> = ActorKind::ALL.iter().map(|k| k.code()).collect();
+        codes.dedup();
+        assert_eq!(codes.len(), 6);
+    }
+
     #[test]
     fn usable_account_is_the_conjunction_of_its_two_parts() {
         assert_eq!(

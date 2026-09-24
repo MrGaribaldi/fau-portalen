@@ -138,20 +138,20 @@ pub async fn create_replacement_proposal(
         .await?
         .ok_or(MembershipError::NotAuthorized)?;
 
-    let assignment: Option<(Uuid, String, String, bool)> = sqlx::query_as(
-        "select membership_id,
-                to_char(starts_on, 'YYYY-MM-DD'), to_char(ends_on_exclusive, 'YYYY-MM-DD'),
+    // Scoped to the proposer's own membership (final review M2): an unknown id and
+    // someone else's assignment both come back as `NotAuthorized`, so a proposal never
+    // reveals whether an assignment id exists.
+    let assignment: Option<(String, String, bool)> = sqlx::query_as(
+        "select to_char(starts_on, 'YYYY-MM-DD'), to_char(ends_on_exclusive, 'YYYY-MM-DD'),
                 revoked_at is not null
-           from role_assignments where tenant_id = $1 and id = $2",
+           from role_assignments where tenant_id = $1 and id = $2 and membership_id = $3",
     )
     .bind(req.tenant_id)
     .bind(req.replaced_assignment_id)
+    .bind(req.proposer_membership_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let (holder, starts, ends, revoked) = assignment.ok_or(MembershipError::UnknownAssignment)?;
-    if holder != req.proposer_membership_id {
-        return Err(MembershipError::NotAuthorized);
-    }
+    let (starts, ends, revoked) = assignment.ok_or(MembershipError::NotAuthorized)?;
     let held = Period::new(parse_date(&starts)?, parse_date(&ends)?)
         .map_err(|_| MembershipError::decode())?;
     if revoked || !held.contains(at.today()) {
@@ -282,6 +282,7 @@ async fn notify_admins(
         enqueue(
             conn,
             at,
+            Some(tenant_id),
             "request.received",
             &admin,
             json!({ "tenant_id": tenant_id, "request_id": request_id, "kind": kind.code() }),
@@ -411,9 +412,10 @@ pub async fn decline_request(
     enqueue(
         &mut tx,
         at,
+        Some(decision.tenant_id),
         "request.declined",
         &request.requester_email,
-        json!({ "request_id": decision.request_id }),
+        json!({ "tenant_id": decision.tenant_id, "request_id": decision.request_id }),
     )
     .await?;
     tx.commit().await?;
@@ -459,6 +461,16 @@ async fn close_request(
 
 /// The scheduled sweep: every request pending for 30 days lapses, and its requester is
 /// told the same as for a decline (spec 5.2.4). Returns how many.
+///
+/// **No `lock_tenant`** (final review M5), deliberately: lapsing closes pending items
+/// across every tenant in one statement and grants nothing, so it needs no tenant-wide
+/// serialisation -- no admin state, role or last-admin check depends on it. The
+/// `update` takes each request row's own row lock, so it never waits on a tenant lock
+/// either. A concurrent `approve_request` or `decline_request` that already holds the
+/// row (`lock_pending_request`'s `for update`) makes it wait; at READ COMMITTED the
+/// update then re-checks `status = 'pending'` against the committed row and skips a
+/// request that was decided meanwhile. The reverse order is covered the same way:
+/// a decision arriving after the lapse finds the row no longer pending.
 pub async fn lapse_requests(pool: &PgPool, at: Moment) -> Result<u64, MembershipError> {
     let mut tx = pool.begin().await?;
     let lapsed: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
@@ -474,9 +486,10 @@ pub async fn lapse_requests(pool: &PgPool, at: Moment) -> Result<u64, Membership
         enqueue(
             &mut tx,
             at,
+            Some(*tenant_id),
             "request.lapsed",
             requester_email,
-            json!({ "request_id": request_id }),
+            json!({ "tenant_id": tenant_id, "request_id": request_id }),
         )
         .await?;
         write_audit(

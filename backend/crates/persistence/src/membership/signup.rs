@@ -47,6 +47,11 @@ pub struct PendingTenant {
 /// [`MembershipError::SchoolTaken`], which says which of the two and nothing else; the
 /// refusal still commits a copy to EWB's outbox and a global audit entry (spec 3.2).
 /// One address may hold at most three pending FAU-er.
+///
+/// **No `lock_tenant`** (final review M5): there is no tenant to lock until this
+/// function creates one. Concurrent signups for one address are serialised by an
+/// advisory lock on the address, and for one school by the partial unique index
+/// `tenants_one_live_per_school`.
 pub async fn create_pending_tenant(
     pool: &PgPool,
     signup: PendingSignup,
@@ -88,9 +93,12 @@ pub async fn create_pending_tenant(
     }
 
     // At most two attempts: the initial insert, and one retry. A lost race is resolved
-    // by re-reading the school's live tenant (below); the loop only continues to a
-    // second attempt when that re-read finds nothing, meaning the transaction we
-    // conflicted with rolled back between the insert and the re-read, so the school
+    // by re-reading the school's live tenant (below). `on conflict do nothing` only
+    // skips the insert for a *committed* holder -- it waits out an in-progress one, and
+    // if that rolls back our insert simply goes ahead -- so a rollback is not what
+    // brings us here. The loop continues to a second attempt only when the re-read
+    // (a fresh READ COMMITTED snapshot) finds nothing: the committed holder was deleted
+    // (a concurrent expiry sweep) or closed after it blocked our insert, so the school
     // may be free again -- a transient, resolvable race, not a decode failure.
     let mut tenant_id = Uuid::now_v7();
     let mut placed = false;
@@ -211,6 +219,9 @@ async fn record_collision(
     enqueue(
         &mut tx,
         at,
+        // Global, like its audit entry: the collision is about a school, and
+        // `existing_tenant_id` in params is only a reference to whichever FAU holds it.
+        None,
         "signup.collision",
         EWB_OVERSIGHT_ADDRESS,
         json!({
@@ -244,6 +255,14 @@ async fn record_collision(
 
 /// Deletes pending FAU-er whose signup has expired (spec 3.3: deleted, not closed, since
 /// they never became FAU-er), optionally only for one school. Returns how many.
+///
+/// **No `lock_tenant`** (final review M5), deliberately: the `delete` takes each
+/// matching tenant row's own row lock, which is the same row `lock_tenant` locks, so
+/// there is no separate tenant-lock wait to add. A concurrent `activate_tenant` holding
+/// that row makes the delete wait; at READ COMMITTED the delete then re-checks its
+/// `where` against the committed row, and a tenant that became `active` meanwhile no
+/// longer matches `status = 'pending'` and is left alone. A pending tenant has no
+/// memberships or roles, so no other membership mutation can be racing on it.
 async fn expire_due(
     conn: &mut PgConnection,
     at: Moment,
@@ -277,7 +296,8 @@ async fn expire_due(
     Ok(expired.len() as u64)
 }
 
-/// The scheduled sweep: deletes every expired pending FAU, freeing its school.
+/// The scheduled sweep: deletes every expired pending FAU, freeing its school. Takes no
+/// `lock_tenant`, for the reasons on `expire_due`.
 pub async fn expire_pending_tenants(pool: &PgPool, at: Moment) -> Result<u64, MembershipError> {
     let mut tx = pool.begin().await?;
     let n = expire_due(&mut tx, at, None).await?;
@@ -431,6 +451,7 @@ pub async fn activate_tenant(
     enqueue(
         &mut tx,
         at,
+        Some(tenant_id),
         "tenant.activated",
         EWB_OVERSIGHT_ADDRESS,
         json!({ "tenant_id": tenant_id }),

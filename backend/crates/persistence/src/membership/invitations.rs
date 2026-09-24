@@ -125,6 +125,7 @@ pub(crate) async fn insert_invitation(
     enqueue(
         conn,
         at,
+        Some(new.tenant_id),
         "invitation.issued",
         new.recipient.as_str(),
         json!({
@@ -527,6 +528,7 @@ pub async fn resend_invitation(
     enqueue(
         &mut tx,
         at,
+        Some(change.tenant_id),
         "invitation.issued",
         &inv.recipient_email,
         json!({
@@ -793,6 +795,7 @@ pub async fn accept_invitation(
         enqueue(
             &mut tx,
             at,
+            Some(tenant_id),
             "recovery.invitation_accepted",
             recipient,
             json!({ "tenant_id": tenant_id, "invitation_id": invitation_id }),

@@ -7,8 +7,9 @@ use fau_domain::membership::requests::{ReplacementDateError, RequestLimit};
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_persistence::membership::{
     accept_invitation, approve_request, create_access_request, create_replacement_proposal,
-    decline_request, lapse_requests, AcceptInvitation, CreateAccessRequest,
-    CreateReplacementProposal, MembershipError, OfferedRole, RequestDecision, RoleChoice,
+    decline_request, lapse_requests, revoke_membership, AcceptInvitation, CreateAccessRequest,
+    CreateReplacementProposal, MembershipError, OfferedRole, RequestDecision, RevokeMembership,
+    RoleChoice,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -539,6 +540,21 @@ async fn a_frozen_fau_refuses_approving_and_proposing() {
         .unwrap_err(),
         MembershipError::TenantFrozen
     );
+
+    // Final review M7, controller ruling: declining closes a pending item and grants
+    // nothing, so a frozen FAU still allows it.
+    decline_request(
+        &pool,
+        RequestDecision {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            request_id,
+        },
+        t0,
+    )
+    .await
+    .expect("declining is allowed on a frozen FAU");
+    assert_eq!(status(&pool, request_id).await, "declined");
 }
 
 #[tokio::test]
@@ -745,6 +761,146 @@ async fn a_member_may_propose_only_for_a_role_they_hold_today() {
         .unwrap_err(),
         MembershipError::NotAuthorized
     );
+}
+
+/// Final review M2: the proposer's assignment is looked up within their own membership
+/// only, so an unknown id and someone else's id are indistinguishable.
+#[tokio::test]
+async fn a_proposal_naming_an_unknown_or_foreign_assignment_reveals_nothing() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let me = add_member(
+        &pool,
+        &fau,
+        "meg@example.test",
+        new_role("Sekretær", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2027, 10, 1)),
+        t0,
+    )
+    .await;
+    let other = add_member(
+        &pool,
+        &fau,
+        "annen@example.test",
+        new_role("Kasserer", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    for assignment in [Uuid::now_v7(), other.assignment_ids[0]] {
+        assert_eq!(
+            create_replacement_proposal(
+                &pool,
+                CreateReplacementProposal {
+                    tenant_id: fau.tenant_id,
+                    proposer_membership_id: me.membership_id,
+                    replaced_assignment_id: assignment,
+                    successor: email("etterfolger@example.test"),
+                    starts_on: day(2027, 10, 1),
+                    ends_on_exclusive: day(2028, 10, 1),
+                    message: None,
+                },
+                t0
+            )
+            .await
+            .unwrap_err(),
+            MembershipError::NotAuthorized
+        );
+    }
+}
+
+/// Final review M9: revoking a membership withdraws the member's own pending proposal
+/// and any pending access request from their address, with an audit entry for each;
+/// other people's requests are untouched.
+#[tokio::test]
+async fn revoking_a_membership_withdraws_the_members_pending_requests() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+
+    // A proposal by one member ...
+    let proposer = add_member(
+        &pool,
+        &fau,
+        "kasserer@example.test",
+        new_role("Kasserer", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    let proposal = create_replacement_proposal(
+        &pool,
+        CreateReplacementProposal {
+            tenant_id: fau.tenant_id,
+            proposer_membership_id: proposer.membership_id,
+            replaced_assignment_id: proposer.assignment_ids[0],
+            successor: email("etterfolger@example.test"),
+            starts_on: day(2027, 9, 1),
+            ends_on_exclusive: day(2028, 9, 1),
+            message: None,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    // ... an access request another member sent before they were invited in ...
+    let early = create_access_request(&pool, access(&fau, "tidlig@example.test", None), t0)
+        .await
+        .unwrap();
+    let early_member = add_member(
+        &pool,
+        &fau,
+        "tidlig@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    // ... and an outsider's request, which must survive.
+    let outsider = create_access_request(&pool, access(&fau, "utenfor@example.test", None), t0)
+        .await
+        .unwrap();
+
+    for membership_id in [proposer.membership_id, early_member.membership_id] {
+        revoke_membership(
+            &pool,
+            RevokeMembership {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                membership_id,
+                confirm_no_admin: false,
+            },
+            t0,
+        )
+        .await
+        .unwrap();
+    }
+
+    for id in [proposal, early] {
+        assert_eq!(status(&pool, id).await, "withdrawn");
+        let (closed, decided): (bool, bool) = sqlx::query_as(
+            "select closed_at is not null, decided_by is not null from access_requests where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(closed && !decided);
+    }
+    assert_eq!(status(&pool, outsider).await, "pending");
+    assert_eq!(audit_count(&pool, "request.withdrawn").await, 2);
+    let subjects: Vec<Uuid> = sqlx::query_scalar(
+        "select subject_id from audit_events where action = 'request.withdrawn' order by subject_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut expected = vec![proposal, early];
+    expected.sort();
+    assert_eq!(subjects, expected);
 }
 
 #[tokio::test]

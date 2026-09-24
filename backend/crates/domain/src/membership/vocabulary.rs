@@ -2,6 +2,8 @@
 //! check constraints in migrations 0002 and 0003 accept. `code()` and `from_code()` are
 //! the only translation between the two.
 
+use std::fmt;
+
 /// The privilege a role grants. The class decides, never the role's name (§2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityClass {
@@ -106,8 +108,9 @@ fn validate_name(raw: &str, max_chars: usize) -> Result<String, NameError> {
 }
 
 /// A role's display name, as an admin typed it ("Leder", "Kasserer"). Free text, so it
-/// is never written to audit parameters; audit carries the role's id instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// is never written to audit parameters; audit carries the role's id instead. `Debug`
+/// is redacted, like `Email`'s.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RoleName(String);
 
 impl RoleName {
@@ -122,8 +125,9 @@ impl RoleName {
     }
 }
 
-/// An FAU's name. Pre-filled from the school name and editable (§3.1.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An FAU's name. Pre-filled from the school name and editable (§3.1.2). `Debug` is
+/// redacted, like `Email`'s: the name is free text the registrant typed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct FauName(String);
 
 impl FauName {
@@ -135,6 +139,18 @@ impl FauName {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for RoleName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RoleName([redacted])")
+    }
+}
+
+impl fmt::Debug for FauName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FauName([redacted])")
     }
 }
 
@@ -206,6 +222,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ewb", "school_rep"]
         );
+    }
+
+    /// Final review M8: role and FAU names are free text an admin or registrant typed,
+    /// so `Debug` redacts them the same way `Email`'s does -- a derived `Debug` on any
+    /// struct holding one (`PendingSignup`, `RoleChoice`, ...) would otherwise print it.
+    #[test]
+    fn names_are_redacted_in_debug() {
+        let role = RoleName::parse("Kasserer Kari").unwrap();
+        let fau = FauName::parse("Nordre skole FAU").unwrap();
+        assert_eq!(format!("{role:?}"), "RoleName([redacted])");
+        assert_eq!(format!("{fau:?}"), "FauName([redacted])");
+        assert!(!format!("{:?}", Some(&role)).contains("Kari"));
+        assert!(!format!("{fau:#?}").contains("Nordre"));
     }
 
     #[test]

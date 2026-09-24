@@ -460,7 +460,12 @@ async fn the_leader_accepts_and_may_adjust_the_end_date_within_range() {
     let t0 = at(T0);
     let pending = create_pending_tenant(
         &pool,
-        signup(Uuid::now_v7(), "reg@example.test", "leder@example.test", t0),
+        signup(
+            school(&pool, "school-1").await,
+            "reg@example.test",
+            "leder@example.test",
+            t0,
+        ),
         t0,
     )
     .await

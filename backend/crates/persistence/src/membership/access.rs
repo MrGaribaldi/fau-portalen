@@ -21,6 +21,14 @@ pub async fn effective_access(
     at: Moment,
 ) -> Result<Access, MembershipError> {
     let mut tx = pool.begin().await?;
+    // One snapshot for all three reads (final review M3): at READ COMMITTED each
+    // statement sees its own snapshot, so a revocation committing between them could
+    // pair a membership's old standing with its new assignments. REPEATABLE READ fixes
+    // the snapshot at the first query; READ ONLY because nothing here writes. It must be
+    // the transaction's first statement.
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *tx)
+        .await?;
     // Reads the two `Standing` fields that `USABLE_ACCOUNT` normally checks together
     // from its own named conjuncts, rather than retyping the SQL by hand (fix round 1,
     // task 10): `sql::tests::usable_account_is_the_conjunction_of_its_two_parts` keeps

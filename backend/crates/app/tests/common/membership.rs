@@ -38,6 +38,23 @@ pub fn period(from: Date, to: Date) -> Period {
     Period::new(from, to).expect("a non-empty test period")
 }
 
+/// The one place a test gets a school id (final review M11). Deterministic: the same
+/// label always gives the same id, so a test's schools are stable across runs. Today a
+/// school is a bare uuid on `tenants.school_id`; when #3441's register migration adds
+/// the foreign key to `schools`, this fixture is the only one that changes -- it will
+/// insert the register row for the id it returns, which is why it already takes the
+/// pool and is async.
+pub async fn school(_pool: &PgPool, label: &str) -> Uuid {
+    // FNV-1a, 128-bit: small, dependency-free and stable across Rust versions, unlike
+    // `std`'s `DefaultHasher`.
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in label.bytes() {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    uuid::Builder::from_custom_bytes(hash.to_be_bytes()).into_uuid()
+}
+
 pub fn signup(school_id: Uuid, registrant: &str, leader: &str, at: Moment) -> PendingSignup {
     PendingSignup {
         school_id,
@@ -58,10 +75,12 @@ pub struct Fau {
 }
 
 pub async fn active_fau(pool: &PgPool, registrant: &str, at: Moment) -> Fau {
-    let pending =
-        create_pending_tenant(pool, signup(Uuid::now_v7(), registrant, registrant, at), at)
-            .await
-            .expect("signup");
+    // One school per FAU the test creates, even when one registrant creates several.
+    let n = count(pool, "select count(*) from tenants").await;
+    let school_id = school(pool, &format!("{registrant}#{n}")).await;
+    let pending = create_pending_tenant(pool, signup(school_id, registrant, registrant, at), at)
+        .await
+        .expect("signup");
     let activated = activate_tenant(
         pool,
         Activation {

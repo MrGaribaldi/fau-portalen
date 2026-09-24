@@ -4,6 +4,20 @@
 //!
 //! Every function takes a [`fau_domain::time::Moment`]: rule-deciding timestamps and
 //! "today" come from the caller, never from the database clock.
+//!
+//! **Ordering rule** (controller ruling, final review M6): authority before row state;
+//! tenant state (frozen/closed) may be checked first, because members can see it
+//! anyway. So an actor without authority gets `NotAuthorized` whether the invitation,
+//! request, assignment or membership they named exists, is already settled, or not --
+//! but may learn from `TenantFrozen` or `TenantNotActive` that the FAU is frozen or
+//! closed.
+//!
+//! **Locking rule:** every mutation of a tenant's membership state takes `lock_tenant`
+//! first, which serialises role changes, the last-admin safeguard and the handover
+//! sweep within one FAU. The exceptions are documented where they occur:
+//! `create_pending_tenant` (no tenant exists yet), `expire_pending_tenants` and
+//! `lapse_requests` (row locks and a READ COMMITTED re-check suffice). The read-only
+//! `effective_access` takes no lock and reads one REPEATABLE READ snapshot instead.
 
 mod access;
 mod error;
@@ -34,4 +48,5 @@ pub use signup::{
     activate_tenant, create_pending_tenant, expire_pending_tenants, Activated, Activation,
     PendingSignup, PendingTenant,
 };
+pub use sql::audit_actor_kind_codes;
 pub use token::InvitationToken;

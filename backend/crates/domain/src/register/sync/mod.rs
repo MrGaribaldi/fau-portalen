@@ -354,6 +354,107 @@ mod tests {
     }
 
     #[test]
+    fn a_resolved_split_lets_its_schools_sync_normally() {
+        // The 2024 1507 -> 1508/1580 split, already resolved: 1508 and 1580 exist, 1507 is
+        // gone, and the fixed SSB lookback still lists the split.
+        let aalesund = record("1508", "Ålesund", "15", "Møre og Romsdal");
+        let haram = record("1580", "Haram", "15", "Møre og Romsdal");
+        let spjelkavik = unit("974585723", "Spjelkavik barneskule", "1508");
+        let (mut schools, mut units) = bystanders(2, "1580", 99);
+        schools.insert(0, school(10, 1, &spjelkavik, "spjelkavik-barneskule"));
+        units.push(NsrUnit {
+            name: "Spjelkavik skule".into(),
+            ..spjelkavik
+        });
+        let snapshot = RegisterSnapshot {
+            municipalities: vec![municipality(1, &aalesund), municipality(2, &haram)],
+            schools,
+            ..RegisterSnapshot::default()
+        };
+        let changes = [
+            change("1507", "Ålesund", "1508", "Ålesund", date(2024, 1, 1)),
+            change("1507", "Ålesund", "1580", "Haram", date(2024, 1, 1)),
+        ];
+        let (plan, after, _) = apply_and_rerun(
+            &snapshot,
+            &[aalesund, haram],
+            &changes,
+            &units,
+            RunKind::Sync,
+        );
+        assert!(
+            plan.reviews.is_empty(),
+            "no split review: {:?}",
+            plan.reviews
+        );
+        assert_eq!(
+            plan.school_ops,
+            [SchoolOp::Rename {
+                id: 10,
+                register_name: "Spjelkavik skule".into(),
+                display_name: Some("Spjelkavik skule".into()),
+                slug: Some(SlugChange {
+                    old: "spjelkavik-barneskule".into(),
+                    new: "spjelkavik-skule".into(),
+                }),
+            }]
+        );
+        assert_eq!(plan.counts.skipped, 0);
+        assert_eq!(after.schools[0].slug.as_deref(), Some("spjelkavik-skule"));
+    }
+
+    #[test]
+    fn a_renumber_with_a_rename_applies_as_one_op_and_then_changes_nothing() {
+        let snapshot = RegisterSnapshot {
+            municipalities: vec![municipality(
+                1,
+                &record("1503", "Kristiansund", "15", "Møre og Romsdal"),
+            )],
+            ..RegisterSnapshot::default()
+        };
+        let records = [record("1599", "Nyby", "15", "Møre og Romsdal")];
+        let changes = [change(
+            "1503",
+            "Kristiansund",
+            "1599",
+            "Nyby",
+            date(2027, 1, 1),
+        )];
+        let (plan, after, _) = apply_and_rerun(
+            &snapshot,
+            &records,
+            &changes,
+            &[unit("900000100", "Nyby skole", "1599")],
+            RunKind::Sync,
+        );
+        let renumbers: Vec<_> = plan
+            .municipality_ops
+            .iter()
+            .filter(|op| !matches!(op, MunicipalityOp::UpdateDetails { .. }))
+            .collect();
+        assert_eq!(
+            renumbers,
+            [&MunicipalityOp::Renumber {
+                id: 1,
+                from: "1503".into(),
+                to: "1599".into(),
+                valid_from: date(2027, 1, 1),
+                name: Some("Nyby".into()),
+                old_slug: "1503-kristiansund".into(),
+                new_slug: "1599-nyby".into(),
+            }]
+        );
+        assert_eq!(plan.counts.renamed, 0);
+        assert_eq!(after.municipalities[0].name, "Nyby");
+        assert_eq!(after.municipalities[0].slug, "1599-nyby");
+        assert_eq!(
+            after.municipality_slug_history,
+            [("1503-kristiansund".to_owned(), 1)],
+            "one history row, not an intermediate 1599-kristiansund"
+        );
+    }
+
+    #[test]
     fn a_rename_writes_slug_history_once() {
         let baerum = record("3201", "Bærum", "32", "Akershus");
         let (mut schools, mut units) = bystanders(1, "3201", 99);

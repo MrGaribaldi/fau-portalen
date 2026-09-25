@@ -33,10 +33,12 @@ pub(super) struct MunicipalityPlan<Id> {
     pub state: MunicipalityState<Id>,
 }
 
-/// An active municipality as this plan leaves it: a renumber changes its number and slug.
+/// An active municipality as this plan leaves it: a renumber changes its number and slug, and
+/// its name when Kartverket renamed it in the same run.
 struct Working<'a, Id> {
     row: &'a MunicipalitySnapshot<Id>,
     number: String,
+    name: String,
     slug: String,
 }
 
@@ -62,6 +64,7 @@ pub(super) fn plan_municipalities<Id: RowId>(
                 Working {
                     row,
                     number: row.number.clone(),
+                    name: row.name.clone(),
                     slug: row.slug.clone(),
                 },
             );
@@ -107,6 +110,11 @@ pub(super) fn plan_municipalities<Id: RowId>(
         a_min.cmp(&b_min).then_with(|| a_code.cmp(b_code))
     });
 
+    let records_by_number: BTreeMap<&str, &MunicipalityRecord> = inputs
+        .municipalities
+        .iter()
+        .map(|r| (r.number.as_str(), r))
+        .collect();
     let mut blocked_numbers: BTreeSet<String> = BTreeSet::new();
     for (old, changes) in &ordered_groups {
         let targets: BTreeMap<&str, &str> = changes
@@ -117,26 +125,43 @@ pub(super) fn plan_municipalities<Id: RowId>(
             Some(Ref::Existing(id)) => Some(*id),
             _ => None,
         };
+        // Already resolved: nobody holds the old code and every target is held. Part 4 reads
+        // SSB over a fixed lookback, so an applied renumber or a split an operator resolved
+        // keeps appearing and must not block anything.
+        if holder.is_none() && targets.keys().all(|t| by_number.contains_key(*t)) {
+            continue;
+        }
         let one_to_one = match targets.keys().next() {
             Some(to) if targets.len() == 1 && gone_groups_per_target[to] == 1 => Some(*to),
             _ => None,
         };
         let reason = match (one_to_one, holder) {
-            // Already applied, or never held: there is nothing to renumber.
+            // Nobody holds the old code, but another group in the feed changes something into
+            // it: a chain this run cannot order (same day, or dated backwards).
+            (_, None) if gone_groups_per_target.contains_key(*old) => "unresolved_chain",
+            // Never held: there is nothing to renumber.
             (Some(_), None) => continue,
             (Some(to), Some(id)) => {
                 let w = &working[&id];
                 if w.row.source == MunicipalitySource::Manual {
                     continue;
                 }
-                if by_number.contains_key(to) {
+                // Kartverket's name for the new number, when it lists it; otherwise unchanged.
+                let name = records_by_number
+                    .get(to)
+                    .map_or(w.name.as_str(), |r| r.norwegian_name.as_str());
+                if blocked_numbers.contains(to) || blocked_numbers.contains(*old) {
+                    "unresolved_chain"
+                } else if by_number.contains_key(to) {
                     "target_in_use"
-                } else if let Ok(new_slug) = municipality_slug(to, &w.row.name) {
+                } else if let Ok(new_slug) = municipality_slug(to, name) {
+                    let renamed = (name != w.name).then(|| name.to_owned());
                     ops.push(MunicipalityOp::Renumber {
                         id,
                         from: (*old).to_owned(),
                         to: to.to_owned(),
                         valid_from: changes[0].occurred_on,
+                        name: renamed.clone(),
                         old_slug: w.slug.clone(),
                         new_slug: new_slug.clone(),
                     });
@@ -145,6 +170,9 @@ pub(super) fn plan_municipalities<Id: RowId>(
                     let w = working.get_mut(&id).expect("the holder is a working row");
                     w.number = to.to_owned();
                     w.slug = new_slug;
+                    if let Some(name) = renamed {
+                        w.name = name;
+                    }
                     continue;
                 } else {
                     "unsluggable"
@@ -155,6 +183,11 @@ pub(super) fn plan_municipalities<Id: RowId>(
         };
         blocked_numbers.insert((*old).to_owned());
         blocked_numbers.extend(targets.keys().map(|t| (*t).to_owned()));
+        let (codes_key, names_key) = if reason == "unresolved_chain" {
+            ("new_code", "new_name")
+        } else {
+            ("new_codes", "new_names")
+        };
         reviews.push(ReviewItem {
             kind: ReviewKind::MunicipalitySplitOrMerge,
             school: None,
@@ -164,8 +197,8 @@ pub(super) fn plan_municipalities<Id: RowId>(
                 ("reason", reason.to_owned()),
                 ("old_code", (*old).to_owned()),
                 ("old_name", changes[0].old_name.clone()),
-                ("new_codes", join(targets.keys().copied())),
-                ("new_names", join(targets.values().copied())),
+                (codes_key, join(targets.keys().copied())),
+                (names_key, join(targets.values().copied())),
             ],
         });
     }
@@ -185,7 +218,7 @@ pub(super) fn plan_municipalities<Id: RowId>(
                 if w.row.source == MunicipalitySource::Manual {
                     continue;
                 }
-                if r.norwegian_name != w.row.name {
+                if r.norwegian_name != w.name {
                     match municipality_slug(&r.number, &r.norwegian_name) {
                         Ok(new_slug) => ops.push(MunicipalityOp::Rename {
                             id: *id,
@@ -245,7 +278,7 @@ pub(super) fn plan_municipalities<Id: RowId>(
                 details: vec![
                     ("reason", "absent_from_kartverket".to_owned()),
                     ("number", w.number.clone()),
-                    ("name", w.row.name.clone()),
+                    ("name", w.name.clone()),
                 ],
             });
         }
@@ -474,6 +507,7 @@ mod tests {
                     from: "3024".into(),
                     to: "3201".into(),
                     valid_from: date(2024, 1, 1),
+                    name: None,
                     old_slug: "3024-baerum".into(),
                     new_slug: "3201-baerum".into(),
                 },
@@ -568,6 +602,7 @@ mod tests {
                     from: "5001".into(),
                     to: "1234".into(),
                     valid_from: date(2024, 1, 1),
+                    name: None,
                     old_slug: "5001-testby".into(),
                     new_slug: "1234-testby".into(),
                 },
@@ -576,6 +611,7 @@ mod tests {
                     from: "1234".into(),
                     to: "5501".into(),
                     valid_from: date(2025, 1, 1),
+                    name: None,
                     old_slug: "1234-testby".into(),
                     new_slug: "5501-testby".into(),
                 },
@@ -659,6 +695,286 @@ mod tests {
             BTreeSet::from(["1507".into(), "1508".into(), "1580".into()])
         );
         assert_eq!(plan.state.blocked_ids, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn a_resolved_split_neither_reviews_nor_blocks() {
+        // The 2024 1507 split, once an operator has resolved it: 1508 and 1580 exist, 1507
+        // is held by no active municipality. The fixed SSB lookback keeps showing the split.
+        let aalesund = municipality(1, &record("1508", "Ålesund", "15", "Møre og Romsdal"));
+        let haram = municipality(2, &record("1580", "Haram", "15", "Møre og Romsdal"));
+        let records = [
+            record("1508", "Ålesund", "15", "Møre og Romsdal"),
+            record("1580", "Haram", "15", "Møre og Romsdal"),
+        ];
+        let changes = [
+            change("1507", "Ålesund", "1508", "Ålesund", date(2024, 1, 1)),
+            change("1507", "Ålesund", "1580", "Haram", date(2024, 1, 1)),
+        ];
+        let plan = run(
+            &snapshot(vec![aalesund, haram]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+        assert!(plan.state.blocked_numbers.is_empty());
+        assert!(plan.state.blocked_ids.is_empty());
+    }
+
+    #[test]
+    fn a_resolved_merger_neither_reviews_nor_blocks_but_an_open_one_still_does() {
+        // 5055 Heim exists; 1571 Halsa is gone, 5011 Hemne is still held.
+        let heim = municipality(1, &record("5055", "Heim", "50", "Trøndelag"));
+        let hemne = municipality(2, &record("5011", "Hemne", "50", "Trøndelag"));
+        let records = [record("5055", "Heim", "50", "Trøndelag")];
+        let changes = [
+            change("1571", "Halsa", "5055", "Heim", date(2020, 1, 1)),
+            change("5011", "Hemne", "5055", "Heim", date(2020, 1, 1)),
+        ];
+        let plan = run(
+            &snapshot(vec![heim.clone()]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty() && plan.reviews.is_empty(), "{plan:?}");
+        assert!(plan.state.blocked_numbers.is_empty());
+
+        let plan = run(
+            &snapshot(vec![heim, hemne]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        let reasons: Vec<_> = plan
+            .reviews
+            .iter()
+            .map(|r| (r.details[0].1.as_str(), r.details[1].1.as_str()))
+            .collect();
+        assert_eq!(reasons, [("merge", "5011")], "1571's group is resolved");
+    }
+
+    #[test]
+    fn a_renumber_and_a_rename_in_one_run_are_one_renumber() {
+        let kristiansund =
+            municipality(1, &record("1503", "Kristiansund", "15", "Møre og Romsdal"));
+        let records = [record("1599", "Nyby", "15", "Møre og Romsdal")];
+        let changes = [change(
+            "1503",
+            "Kristiansund",
+            "1599",
+            "Nyby",
+            date(2027, 1, 1),
+        )];
+        let plan = run(
+            &snapshot(vec![kristiansund]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert_eq!(
+            plan.ops,
+            [
+                MunicipalityOp::Renumber {
+                    id: 1,
+                    from: "1503".into(),
+                    to: "1599".into(),
+                    valid_from: date(2027, 1, 1),
+                    name: Some("Nyby".into()),
+                    old_slug: "1503-kristiansund".into(),
+                    new_slug: "1599-nyby".into(),
+                },
+                MunicipalityOp::UpdateDetails {
+                    id: 1,
+                    official_name: Some("Nyby".into()),
+                    county_number: "15".into(),
+                    county_name: "Møre og Romsdal".into(),
+                    names: no_names("Nyby"),
+                },
+            ],
+            "no separate Rename"
+        );
+        assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+    }
+
+    #[test]
+    fn a_same_day_descending_chain_is_reviewed_and_blocked() {
+        // Both on one day, so code order puts 1234 -> 5501 before 5001 -> 1234: the group for
+        // 1234 has no holder yet, but 1234 is the target of another group in the feed.
+        let testby = municipality(1, &record("5001", "Testby", "50", "Testfylke"));
+        let records = [record("5501", "Testby", "50", "Testfylke")];
+        let d = date(2024, 1, 1);
+        let changes = [
+            change("1234", "Testby", "5501", "Testby", d),
+            change("5001", "Testby", "1234", "Testby", d),
+        ];
+        let plan = run(
+            &snapshot(vec![testby]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(
+            plan.ops.is_empty(),
+            "no renumber into a blocked code: {:?}",
+            plan.ops
+        );
+        let chain = |municipality, old: &str, new: &str| ReviewItem {
+            kind: ReviewKind::MunicipalitySplitOrMerge,
+            school: None,
+            other_school: None,
+            municipality,
+            details: vec![
+                ("reason", "unresolved_chain".into()),
+                ("old_code", old.into()),
+                ("old_name", "Testby".into()),
+                ("new_code", new.into()),
+                ("new_name", "Testby".into()),
+            ],
+        };
+        assert_eq!(
+            plan.reviews,
+            [
+                chain(None, "1234", "5501"),
+                chain(Some(Ref::Existing(1)), "5001", "1234"),
+            ]
+        );
+        assert_eq!(
+            plan.state.blocked_numbers,
+            BTreeSet::from(["1234".into(), "5001".into(), "5501".into()])
+        );
+        assert_eq!(plan.state.blocked_ids, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn an_applied_chain_is_skipped_on_the_next_run() {
+        // The fixed lookback shows the chain again once 5501 holds it: nothing to do.
+        let testby = municipality(1, &record("5501", "Testby", "50", "Testfylke"));
+        let records = [record("5501", "Testby", "50", "Testfylke")];
+        for d2 in [date(2024, 1, 1), date(2025, 1, 1)] {
+            let changes = [
+                change("1234", "Testby", "5501", "Testby", d2),
+                change("5001", "Testby", "1234", "Testby", date(2024, 1, 1)),
+            ];
+            let plan = run(
+                &snapshot(vec![testby.clone()]),
+                &records,
+                &changes,
+                &[],
+                RunKind::Sync,
+            );
+            assert!(plan.ops.is_empty() && plan.reviews.is_empty(), "{plan:?}");
+            assert!(plan.state.blocked_numbers.is_empty());
+        }
+    }
+
+    /// Part 4 de-duplicates review items on (`kind`, `school`, `other_school`,
+    /// `municipality`) plus a discriminator from `details`: `reason` and `number` or
+    /// `old_code` for this kind. Every reason the municipality planner raises carries them.
+    #[test]
+    fn every_split_or_merge_item_carries_the_dedup_discriminator() {
+        let d = date(2024, 1, 1);
+        let m = |id, n: &str, name: &str| municipality(id, &record(n, name, "50", "F"));
+        type Scenario = (
+            Vec<MunicipalitySnapshot<u32>>,
+            Vec<MunicipalityRecord>,
+            Vec<CodeChange>,
+            RunKind,
+        );
+        let scenarios: Vec<Scenario> = vec![
+            // split
+            (
+                vec![m(1, "1507", "A")],
+                vec![
+                    record("1508", "A", "50", "F"),
+                    record("1580", "B", "50", "F"),
+                ],
+                vec![
+                    change("1507", "A", "1508", "A", d),
+                    change("1507", "A", "1580", "B", d),
+                ],
+                RunKind::Sync,
+            ),
+            // merge
+            (
+                vec![m(1, "1571", "A"), m(2, "5011", "B")],
+                vec![record("5055", "C", "50", "F")],
+                vec![
+                    change("1571", "A", "5055", "C", d),
+                    change("5011", "B", "5055", "C", d),
+                ],
+                RunKind::Sync,
+            ),
+            // target_in_use
+            (
+                vec![m(1, "5001", "A"), m(2, "5002", "B")],
+                vec![record("5001", "A", "50", "F")],
+                vec![change("5002", "B", "5001", "A", d)],
+                RunKind::Sync,
+            ),
+            // unsluggable renumber, unsluggable record, unknown_number, absent_from_kartverket
+            (
+                vec![m(1, "5001", "A"), m(2, "5003", "C")],
+                vec![
+                    record("5002", "Школа", "50", "F"),
+                    record("5009", "Школа", "50", "F"),
+                    record("5010", "D", "50", "F"),
+                ],
+                vec![change("5001", "A", "5002", "Школа", d)],
+                RunKind::Sync,
+            ),
+            // unsluggable on a seed
+            (
+                vec![],
+                vec![record("5009", "Школа", "50", "F")],
+                vec![],
+                RunKind::Seed,
+            ),
+            // unresolved_chain
+            (
+                vec![m(1, "5001", "A")],
+                vec![record("5501", "A", "50", "F")],
+                vec![
+                    change("1234", "A", "5501", "A", d),
+                    change("5001", "A", "1234", "A", d),
+                ],
+                RunKind::Sync,
+            ),
+        ];
+        let mut reasons = BTreeSet::new();
+        for (rows, records, changes, kind) in scenarios {
+            let plan = run(&snapshot(rows), &records, &changes, &[], kind);
+            for item in &plan.reviews {
+                assert_eq!(item.kind, ReviewKind::MunicipalitySplitOrMerge);
+                let key = |k: &str| item.details.iter().any(|(name, _)| *name == k);
+                assert!(key("reason"), "{item:?}");
+                assert!(key("number") || key("old_code"), "{item:?}");
+                reasons.insert(item.details[0].1.clone());
+            }
+        }
+        assert_eq!(
+            reasons,
+            BTreeSet::from(
+                [
+                    "absent_from_kartverket",
+                    "merge",
+                    "split",
+                    "target_in_use",
+                    "unknown_number",
+                    "unresolved_chain",
+                    "unsluggable",
+                ]
+                .map(str::to_owned)
+            ),
+            "every reason is exercised"
+        );
     }
 
     #[test]

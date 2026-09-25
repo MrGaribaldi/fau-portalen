@@ -448,12 +448,16 @@ pub(super) fn apply(
             MunicipalityOp::Renumber {
                 id,
                 to,
+                name,
                 old_slug,
                 new_slug,
                 ..
             } => {
                 let m = municipality_mut(&mut out, *id);
                 m.number = to.clone();
+                if let Some(name) = name {
+                    m.name = name.clone();
+                }
                 m.slug = new_slug.clone();
                 out.municipality_slug_history.push((old_slug.clone(), *id));
             }

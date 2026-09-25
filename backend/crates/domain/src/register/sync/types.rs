@@ -221,11 +221,15 @@ pub enum MunicipalityOp<Id> {
         source: MunicipalitySource,
     },
     /// A one-to-one SSB change (§2.4 case 1). The old number's validity ends on `valid_from`.
+    /// A Norwegian-name change in the same run is folded in: `name` is the new name when it
+    /// changed, and `new_slug` is minted once from the new number and the name the municipality
+    /// ends up with. No separate `Rename` follows for it in the same plan.
     Renumber {
         id: Id,
         from: String,
         to: String,
         valid_from: Date,
+        name: Option<String>,
         old_slug: String,
         new_slug: String,
     },

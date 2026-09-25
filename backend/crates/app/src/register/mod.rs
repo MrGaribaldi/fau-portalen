@@ -9,6 +9,9 @@
 //! - 3: the planner aborted it (an empty source or the circuit breaker, §5.3);
 //! - 4: another run holds the lock;
 //! - 5: refused: `--seed` on a register that is not empty, or a sync on an empty one.
+//! - 101: a panic, which is unexpected: treat it as failed.
+//!
+//! `export` exits only 0 or 1 (or clap's 2).
 
 mod export;
 mod fetch;

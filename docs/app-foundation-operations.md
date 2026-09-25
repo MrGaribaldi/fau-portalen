@@ -281,6 +281,7 @@ pickable schools as CSV for the prospect register (§9, #3431). Both run as `fau
 | --- | --- | --- |
 | `REGISTER_DATABASE_URL` | yes | A `postgres://` URL for the `fau_register` role. Errors name the variable, never the value. |
 | `REGISTER_NSR_URL`, `REGISTER_KARTVERKET_URL`, `REGISTER_SSB_URL` | no | Base URLs that replace the public APIs, for tests. http or https, with a host and no userinfo. |
+| `REGISTER_SOURCE_RETRY_DELAYS_MS` | no | The waits before a source request's second and third attempt, as two comma-separated milliseconds, each at most 60000. Default `1000,4000`. Tests shorten it; production leaves it unset. |
 | `LOG_LEVEL` | no | As for `serve`; `info` when unset. |
 
 | Command | What it does |
@@ -289,7 +290,8 @@ pickable schools as CSV for the prospect register (§9, #3431). Both run as `fau
 | `fau register sync --seed` | The first run, on an empty register. Refuses a register that already holds a municipality or a school. |
 | `fau register sync --dry-run` | Plans a sync and prints it. |
 | `fau register sync` | The weekly sync. Refuses an empty register. |
-| `fau register export > register.csv` | `school_id,orgnr,municipality_number,display_name,path,fau_orgnr`, one row per pickable school, ordered by municipality number and id. |
+| `fau register sync --accept-mass-change` | A sync that applies a plan the mass-change circuit breaker stopped. See "Overriding the circuit breaker" below. Refused together with `--seed` (exit 2). |
+| `fau register export > register.csv` | `school_id,orgnr,municipality_number,display_name,path,fau_orgnr`, one row per pickable school, ordered by municipality number and id. A field that starts with `=`, `+`, `@`, a tab or a CR gets a leading `'`, so a spreadsheet shows it as text instead of running it as a formula. A leading `-` is left alone. |
 
 | Exit code | Meaning |
 | --- | --- |
@@ -299,6 +301,31 @@ pickable schools as CSV for the prospect register (§9, #3431). Both run as `fau
 | 3 | Aborted by the planner: a source returned nothing, or the circuit breaker tripped (§5.3). The run is recorded as `aborted`, and `register.sync_aborted` is queued to `fau@ewb-solutions.as`. |
 | 4 | Another run holds the register's advisory lock (`0x4641553000003441`) |
 | 5 | Refused: `--seed` on a non-empty register, or a sync on an empty one |
+| 101 | A panic. This is unexpected: treat it as failed. The run row may be left with no `finished_at`. |
+
+`fau register export` exits only 0 or 1 (or 2 for bad arguments). Codes 3, 4 and 5 belong to
+`sync`.
+
+**Retries and timeouts.** A source request that answers 5xx or fails in transport is tried three
+times in total, 1 s and then 4 s apart. A 4xx, or a response that does not parse, fails at once.
+A failed detail fetch is logged with the unit's orgnr and the error's source and kind, and never
+the URL or the body. The detail pass logs its progress every 500 units and once when it finishes,
+in counts only. Every register connection sets `statement_timeout = 60s` and
+`lock_timeout = 10s`, so a run blocked by another session's lock fails with exit 1. It is
+recorded as `failed` with `abort_reason = 'database_timeout'`, instead of hanging until the
+CronJob's deadline. Other database failures record `database_error`, and a failed apply records
+`apply_error`.
+
+**Overriding the circuit breaker.** A sync aborts (exit 3, `register.sync_aborted`) when more than
+2% of active schools would close, or more than 5% would be renamed or lose an attribute (§5.3).
+To see what tripped it, run `fau register sync --dry-run`. An aborted dry run still exits 3, and
+prints the abort reason and counts together with every op and review item of the plan it stopped.
+If the change is real, for example a municipality merger or a genuine NSR clean-up, run
+`fau register sync --accept-mass-change` once. It applies that plan and nothing else changes: an
+empty source still aborts, and the flag only acts when the breaker would have stopped the run.
+The run logs `mass change accepted by --accept-mass-change`, and its `register.sync_applied` audit
+entry carries `"mass_change_accepted": true` and the abort text under `"mass_change"`. Never put
+the flag in the CronJob. It is an operator's decision about one plan.
 
 **Seeding an environment.** After `fau migrate`, run `fau register sync --seed --dry-run` and read
 the plan, then `fau register sync --seed` once. The seed sends one `register.seed_summary` mail; later
@@ -312,6 +339,21 @@ lookback starts on the seed's date, so a sync on a register with no applied seed
 Brreg). The advisory lock keeps a manual run and the CronJob apart as well. Each run leaves one
 `register_sync_runs` row, which is the alert source (#3442): `aborted` or `failed`, or a row with no
 `finished_at` from a run that died.
+
+A checklist for #3424's CronJob manifest:
+
+- [ ] `backoffLimit: 0`, or a `podFailurePolicy` whose `FailJob` rule matches exit codes 3, 4 and 5.
+  An abort, a held lock or a refusal must not be retried: a retry would repeat the abort mail or
+  race the run that holds the lock. Exit 1 and 101 may be retried if #3424 wants it.
+- [ ] `activeDeadlineSeconds`, well above a normal run (about a minute of detail fetches, plus
+  the apply) and below the next schedule. A run killed at the deadline leaves its row with no
+  `finished_at`.
+- [ ] `REGISTER_DATABASE_URL` from a Secret (`secretKeyRef`), never a literal in the manifest.
+- [ ] An egress allowlist: `data-nsr.udir.no`, `api.kartverket.no` and `data.ssb.no` (and
+  `data.brreg.no` once part 5 reads Brreg), plus the database.
+- [ ] #3442's alerting on `register_sync_runs`: `outcome in ('aborted', 'failed')`, and a row whose
+  `finished_at` is still null after `started_at` plus the deadline.
+- [ ] No `--accept-mass-change`, no `--seed` and no `--dry-run` in the Job's arguments.
 
 Against the local Compose stack, from the host:
 

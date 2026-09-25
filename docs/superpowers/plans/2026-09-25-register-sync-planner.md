@@ -5051,6 +5051,9 @@ git commit -m "Wire the sync planner with its circuit breaker, proven idempotent
     `valid_from`, and always writes the slug history. When `name` is `Some`, it also sets the
     Norwegian name: a same-run rename is folded in, `new_slug` is already minted from the new
     number and name, and no separate `Rename` follows for that municipality;
+  - **a new number's `valid_from` is clamped** to `max(date, previous valid_from + 1 day)`, so it
+    may be a day later than SSB's date: a number first seen on or after its renumber's date
+    cannot close before it opened;
   - **slug-history `valid_from`** is the entity's last history row's `valid_until`, or else its
     `created_at` (a municipality, or a school created Listed) or `verified_at` (a school that got
     its slug on verification). A school that gets its first slug through a `Rename`

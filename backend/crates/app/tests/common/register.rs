@@ -2,6 +2,8 @@
 //! database, because neither the runtime role nor the harness's usual pools may
 //! write listed schools (D9, RLS in 0004).
 
+use std::time::Duration;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -61,4 +63,15 @@ pub async fn listed_school(admin: &PgPool, id: Uuid, label: &str) -> Uuid {
     .await
     .expect("insert a listed test school");
     id
+}
+
+/// Runs `fau register <args>` with a clean environment plus `env`, bounded to a minute, and
+/// returns its output.
+pub async fn run_fau_register(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = super::fau_command("register", env);
+    cmd.args(args).kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .expect("fau register did not exit within a minute")
+        .expect("run fau register")
 }

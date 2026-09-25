@@ -220,6 +220,12 @@ impl TestDb {
         self.role_url("fau_migrate")
     }
 
+    /// A `REGISTER_DATABASE_URL` for the register role `fau_register`, pointed at this
+    /// database. Same caveat as [`TestDb::url`].
+    pub fn register_url(&self) -> String {
+        self.role_url("fau_register")
+    }
+
     fn role_url(&self, role: &str) -> String {
         role_url(&self.admin_url, &self.name, role)
     }

@@ -549,6 +549,7 @@ dependencies = [
  "clap",
  "fau-domain",
  "fau-persistence",
+ "fau-register-sources",
  "jiff",
  "nix",
  "reqwest",

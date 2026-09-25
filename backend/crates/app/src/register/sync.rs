@@ -206,9 +206,14 @@ async fn execute(
             tx.rollback().await?;
             // `record_aborted` writes the run row and its mail as two statements: wrapped in
             // its own transaction here (controller hand-off) so they commit together, never
-            // one without the other.
+            // one without the other. Rolled back explicitly on its own failure too, awaited
+            // before `conn` is next used -- the same reasoning as `apply_and_stage`'s error
+            // arm below, never `Transaction`'s drop glue.
             let mut record_tx = conn.begin().await?;
-            record_aborted(&mut record_tx, run, kind, &reason, &counts, at).await?;
+            if let Err(e) = record_aborted(&mut record_tx, run, kind, &reason, &counts, at).await {
+                let _ = record_tx.rollback().await;
+                return Err(SyncError::Database(e));
+            }
             record_tx.commit().await?;
             tracing::error!(
                 run_id = %run,

@@ -369,7 +369,8 @@ mod tests {
     #[test]
     fn production_rejects_a_plaintext_base_url() {
         let url = Url::parse("http://fau.example").unwrap();
-        assert!(validate_public_base_url(&url, AppEnv::Production).is_err());
+        let e = validate_public_base_url(&url, AppEnv::Production).unwrap_err();
+        assert_eq!(e.problem, ConfigProblem::NotPermitted);
     }
 
     #[test]
@@ -389,7 +390,8 @@ mod tests {
         // The localhost convenience is for development/test only; production must
         // never accept plaintext, not even to the loopback address.
         let url = Url::parse("http://localhost:8000").unwrap();
-        assert!(validate_public_base_url(&url, AppEnv::Production).is_err());
+        let e = validate_public_base_url(&url, AppEnv::Production).unwrap_err();
+        assert_eq!(e.problem, ConfigProblem::NotPermitted);
     }
 
     #[test]
@@ -433,6 +435,7 @@ mod tests {
     #[test]
     fn development_rejects_a_non_loopback_plaintext_url() {
         let url = Url::parse("http://example.org").unwrap();
-        assert!(validate_public_base_url(&url, AppEnv::Development).is_err());
+        let e = validate_public_base_url(&url, AppEnv::Development).unwrap_err();
+        assert_eq!(e.problem, ConfigProblem::NotPermitted);
     }
 }

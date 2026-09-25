@@ -671,12 +671,11 @@ pub fn audit_actor_kind_codes() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    /// Guards against `USABLE_ACCOUNT` drifting apart from its two named conjuncts
-    /// (fix round 1, task 10): a caller like `access::effective_access` that needs
-    /// them apart reads `MEMBERSHIP_NOT_REVOKED` and `ACCOUNT_USABLE` rather than
-    /// retyping the SQL, so this test is what keeps all three in sync.
     /// `ActorKind::ALL` names every variant: adding one without listing it fails to
-    /// compile here (the exhaustive match) or fails the count.
+    /// compile here (the exhaustive match) or fails the count. Uniqueness is checked
+    /// with a `HashSet`, not `Vec::dedup` (minor finding 8): `dedup` only removes
+    /// *adjacent* duplicates, so a repeated code that is not adjacent in `ALL`'s own
+    /// order would have passed silently.
     #[test]
     fn all_lists_every_variant() {
         let count = |k: ActorKind| match k {
@@ -688,11 +687,14 @@ mod tests {
             | ActorKind::RecoverySchoolRep => 1,
         };
         assert_eq!(ActorKind::ALL.iter().map(|k| count(*k)).sum::<usize>(), 6);
-        let mut codes: Vec<_> = ActorKind::ALL.iter().map(|k| k.code()).collect();
-        codes.dedup();
+        let codes: std::collections::HashSet<_> = ActorKind::ALL.iter().map(|k| k.code()).collect();
         assert_eq!(codes.len(), 6);
     }
 
+    /// Guards against `USABLE_ACCOUNT` drifting apart from its two named conjuncts
+    /// (fix round 1, task 10): a caller like `access::effective_access` that needs
+    /// them apart reads `MEMBERSHIP_NOT_REVOKED` and `ACCOUNT_USABLE` rather than
+    /// retyping the SQL, so this test is what keeps all three in sync.
     #[test]
     fn usable_account_is_the_conjunction_of_its_two_parts() {
         assert_eq!(

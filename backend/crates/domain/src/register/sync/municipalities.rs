@@ -88,8 +88,27 @@ pub(super) fn plan_municipalities<Id: RowId>(
         }
     }
 
+    // Controller ruling: a chain of renumbers (5001 -> 1234 -> 5501) must apply in the order it
+    // actually happened, not in old-code order, or an intermediate code can be processed before
+    // the change that creates it. A group's position is its earliest `occurred_on`, ties broken
+    // by old code for a stable order.
+    let mut ordered_groups: Vec<(&str, Vec<&CodeChange>)> = groups.into_iter().collect();
+    ordered_groups.sort_by(|(a_code, a_changes), (b_code, b_changes)| {
+        let a_min = a_changes
+            .iter()
+            .map(|c| c.occurred_on)
+            .min()
+            .expect("a group is never empty");
+        let b_min = b_changes
+            .iter()
+            .map(|c| c.occurred_on)
+            .min()
+            .expect("a group is never empty");
+        a_min.cmp(&b_min).then_with(|| a_code.cmp(b_code))
+    });
+
     let mut blocked_numbers: BTreeSet<String> = BTreeSet::new();
-    for (old, changes) in &groups {
+    for (old, changes) in &ordered_groups {
         let targets: BTreeMap<&str, &str> = changes
             .iter()
             .map(|c| (c.new_code.as_str(), c.new_name.as_str()))
@@ -151,9 +170,12 @@ pub(super) fn plan_municipalities<Id: RowId>(
         });
     }
 
-    // Kartverket against the municipality holding each number.
+    // Kartverket against the municipality holding each number. Sorted by number first, so
+    // `Create`'s order and `new` indices never depend on the API's own ordering.
+    let mut sorted_records: Vec<&MunicipalityRecord> = inputs.municipalities.iter().collect();
+    sorted_records.sort_by(|a, b| a.number.cmp(&b.number));
     let mut next_new = 0u32;
-    for r in inputs.municipalities {
+    for r in sorted_records {
         if blocked_numbers.contains(&r.number) {
             continue;
         }
@@ -480,6 +502,119 @@ mod tests {
             RunKind::Sync,
         );
         assert!(again.ops.is_empty() && again.reviews.is_empty());
+    }
+
+    #[test]
+    fn a_merger_into_a_surviving_code_is_target_in_use() {
+        // 5002 B is gone from Kartverket, folded into 5001 A, which is still current: the
+        // target number is already held by another active municipality.
+        let a = municipality(1, &record("5001", "A", "50", "Femtylke"));
+        let b = municipality(2, &record("5002", "B", "50", "Femtylke"));
+        let records = [record("5001", "A", "50", "Femtylke")];
+        let changes = [change("5002", "B", "5001", "A", date(2024, 1, 1))];
+        let plan = run(
+            &snapshot(vec![a, b]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert_eq!(
+            plan.reviews,
+            [ReviewItem {
+                kind: ReviewKind::MunicipalitySplitOrMerge,
+                school: None,
+                other_school: None,
+                municipality: Some(Ref::Existing(2)),
+                details: vec![
+                    ("reason", "target_in_use".into()),
+                    ("old_code", "5002".into()),
+                    ("old_name", "B".into()),
+                    ("new_codes", "5001".into()),
+                    ("new_names", "A".into()),
+                ],
+            }]
+        );
+        assert_eq!(
+            plan.state.blocked_numbers,
+            BTreeSet::from(["5001".into(), "5002".into()])
+        );
+        assert_eq!(plan.state.blocked_ids, BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn a_chain_of_renumbers_is_applied_in_date_order_not_code_order() {
+        // Controller ruling: a chain must apply in the order it actually happened. Code order
+        // would process "1234" before "5001" (lexically smaller), which is backwards here.
+        let testby = municipality(1, &record("5001", "Testby", "50", "Testfylke"));
+        let records = [record("5501", "Testby", "50", "Testfylke")];
+        let changes = [
+            change("1234", "Testby", "5501", "Testby", date(2025, 1, 1)),
+            change("5001", "Testby", "1234", "Testby", date(2024, 1, 1)),
+        ];
+        let plan = run(
+            &snapshot(vec![testby]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert_eq!(
+            plan.ops,
+            [
+                MunicipalityOp::Renumber {
+                    id: 1,
+                    from: "5001".into(),
+                    to: "1234".into(),
+                    valid_from: date(2024, 1, 1),
+                    old_slug: "5001-testby".into(),
+                    new_slug: "1234-testby".into(),
+                },
+                MunicipalityOp::Renumber {
+                    id: 1,
+                    from: "1234".into(),
+                    to: "5501".into(),
+                    valid_from: date(2025, 1, 1),
+                    old_slug: "1234-testby".into(),
+                    new_slug: "5501-testby".into(),
+                },
+            ]
+        );
+        assert!(
+            plan.reviews.is_empty(),
+            "no unknown_number, no absent_from_kartverket: {:?}",
+            plan.reviews
+        );
+        assert_eq!(
+            plan.state.by_number,
+            BTreeMap::from([("5501".to_owned(), Ref::Existing(1))])
+        );
+    }
+
+    #[test]
+    fn kartverket_records_are_sorted_before_planning() {
+        let baerum = record("3201", "Bærum", "32", "Akershus");
+        let stange = record("3413", "Stange", "34", "Innlandet");
+        let forward = run(
+            &RegisterSnapshot::default(),
+            &[baerum.clone(), stange.clone()],
+            &[],
+            &[],
+            RunKind::Seed,
+        );
+        let reversed = run(
+            &RegisterSnapshot::default(),
+            &[stange, baerum],
+            &[],
+            &[],
+            RunKind::Seed,
+        );
+        assert!(!forward.ops.is_empty());
+        assert_eq!(
+            forward.ops, reversed.ops,
+            "Create order and indices must not depend on API order"
+        );
     }
 
     #[test]

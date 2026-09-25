@@ -2641,3 +2641,55 @@ followed. The agent's rulings, with the cost if wrong:
     (practically unreachable);
   - NSR's `Utgaattype` is optional in the parser, so closure codes vanishing upstream would not
     fail loudly.
+
+## Register apply and CLI built: rulings for Erik's review (#3441) — 25 September 2026
+
+Part 4 of the register was built on `school-register-3441`, following
+docs/superpowers/plans/2026-09-25-register-apply-and-cli.md:
+- the SQL applier for the sync plans, running as `fau_register`;
+- run bookkeeping, the advisory lock, audit and outbox mail;
+- `fau register sync [--seed] [--dry-run] [--accept-mass-change]` and `fau register export`.
+
+Nothing has run against the dev `fau` database or a live API; every test uses throwaway databases
+and an in-process fixture server. The agent's rulings, with the cost if wrong:
+
+- **Each run plans inside the transaction that applies it.** The first snapshot only decides what
+  to fetch. The plan comes from a second snapshot under REPEATABLE READ, and apply, staging, the run
+  row, the audit entry and the mail commit together.
+- **Failures are recorded on a fresh connection, with a fixed code.** Examples are `source_error`,
+  `apply_error`, `database_error` and `database_timeout`. Neither an error's text nor a URL is
+  recorded. So a run killed by a broken connection still ends as `failed`.
+- **The lock sits on its own connection,** so it is released on every exit path, including a crash.
+- **Exit codes:**
+  - 0 done;
+  - 1 failed;
+  - 2 usage;
+  - 3 aborted by the circuit breaker;
+  - 4 another run holds the lock;
+  - 5 refused (`--seed` on a non-empty register, or a sync on an empty one).
+
+  A sync with no applied seed fails.
+- **Sources are retried,** three attempts with a 1 s then 4 s wait, on server errors and network
+  failures only, never on a 4xx or a parse error. A failed record is logged with its orgnr. The
+  database connections have a 60 s statement timeout and a 10 s lock timeout.
+- **There is a way past the circuit breaker (new).** `fau register sync --accept-mass-change`
+  applies a sync that the breaker would stop. It works only when given explicitly, and it is
+  logged and recorded in the audit entry. `--dry-run` shows the full list of changes for a stopped
+  plan, so an operator can see what tripped it first. The cost: an operator can override the
+  breaker, which is intended and audited.
+- **The export guards against spreadsheet formulas.** A field starting with `=`, `+`, `@`, a tab
+  or a carriage return gets a leading `'`. A leading `-` is left alone, since real names may start
+  with one. This replaces the plan's first choice not to rewrite values, because #3431's file is
+  opened by people in spreadsheets. The cost: a stray apostrophe if #3431 ever imports it by
+  program. #3431 is told.
+- **Staging is written only when a run applies.** A dry run records `no_change`. Mail goes to
+  `fau@ewb-solutions.as`:
+  - one `register.review_item` per new review on a sync;
+  - one `register.seed_summary` per seed;
+  - `register.sync_aborted` when a run aborts.
+- **Before the #3424 CronJob** (in the ops doc):
+  - `backoffLimit: 0`, or a failure policy for exits 3–5;
+  - `activeDeadlineSeconds`;
+  - the database URL from a Secret;
+  - an egress allowlist;
+  - #3442 alerting on `outcome in ('aborted','failed')` and on runs left unfinished.

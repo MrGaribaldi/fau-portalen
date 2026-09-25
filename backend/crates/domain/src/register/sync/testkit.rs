@@ -6,11 +6,14 @@ use jiff::civil::Date;
 use jiff::Timestamp;
 
 use crate::register::slug::municipality_slug;
-use crate::register::source::{CodeChange, MunicipalityRecord, NsrAddress, NsrUnit, OfficialName};
+use crate::register::source::{
+    CodeChange, MunicipalityRecord, NsrAddress, NsrClosure, NsrUnit, OfficialName,
+};
 use crate::time::Moment;
 
 use super::types::{
-    MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, RunKind, SyncInputs,
+    MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, Origin, RunKind,
+    SchoolAttributes, SchoolSnapshot, SchoolStatus, SyncInputs, Verification,
 };
 
 pub(super) fn ts(s: &str) -> Timestamp {
@@ -110,5 +113,258 @@ pub(super) fn inputs<'a>(
         units,
         kind,
         at: at(),
+    }
+}
+
+pub(super) fn address(street: &str, postcode: &str, post_town: &str) -> NsrAddress {
+    NsrAddress {
+        street: Some(street.into()),
+        postcode: Some(postcode.into()),
+        post_town: Some(post_town.into()),
+    }
+}
+
+/// The Kartverket records of the fixture units' municipalities, in Kartverket's shape.
+pub(super) fn fixture_records() -> Vec<MunicipalityRecord> {
+    vec![
+        record("3201", "Bærum", "32", "Akershus"),
+        record("3314", "Øvre Eiker", "33", "Buskerud"),
+        record("3907", "Sandefjord", "39", "Vestfold"),
+        record("3222", "Lørenskog", "32", "Akershus"),
+        record("3107", "Fredrikstad", "31", "Østfold"),
+        record("4649", "Stad", "46", "Vestland"),
+        record("5055", "Heim", "50", "Trøndelag"),
+        record("5026", "Holtålen", "50", "Trøndelag"),
+        record("3413", "Stange", "34", "Innlandet"),
+    ]
+}
+
+/// Hosle skole, 974552124: an ordinary public school in 3201 Bærum.
+pub(super) fn hosle() -> NsrUnit {
+    NsrUnit {
+        website: Some("www.hosle.no".into()),
+        visiting: address("Bispeveien 73", "1362", "HOSLE"),
+        postal: address("Postboks 700", "1304", "SANDVIKA"),
+        changed_at: Some(ts("2026-09-13T01:05:43.46Z")),
+        ..unit("974552124", "Hosle skole", "3201")
+    }
+}
+
+/// Norges Toppidrettsgymnas ungdomsskole Bærum AS, 990672938: private.
+pub(super) fn ntg() -> NsrUnit {
+    NsrUnit {
+        is_private: true,
+        category_ids: vec!["1".into(), "4".into(), "16".into(), "32".into()],
+        grade_from: Some(8),
+        grade_to: Some(10),
+        website: Some("www.ntg.no".into()),
+        visiting: address("Hans Burums vei 30", "1357", "BEKKESTUA"),
+        postal: address("Postboks 134", "1319", "BEKKESTUA"),
+        changed_at: Some(ts("2026-09-13T01:38:47.433Z")),
+        ..unit(
+            "990672938",
+            "Norges Toppidrettsgymnas ungdomsskole Bærum AS",
+            "3201",
+        )
+    }
+}
+
+/// Lerberg skole og kompetansesenter, 998516897: combined, 85.201 then 85.310.
+pub(super) fn lerberg() -> NsrUnit {
+    NsrUnit {
+        category_ids: vec!["1".into(), "2".into(), "3".into(), "6".into(), "32".into()],
+        nace: vec![(1, "85.201".into()), (2, "85.310".into())],
+        grade_from: Some(8),
+        grade_to: Some(10),
+        visiting: address("Ringeriksveien 2", "3303", "HOKKSUND"),
+        postal: address("Postboks 117", "3301", "HOKKSUND"),
+        changed_at: Some(ts("2026-09-13T01:39:57.313Z")),
+        ..unit("998516897", "Lerberg skole og kompetansesenter", "3314")
+    }
+}
+
+/// Signo Grunn- og videregående skole AS, 998666783: a special school (85.202).
+pub(super) fn signo() -> NsrUnit {
+    NsrUnit {
+        is_private: true,
+        category_ids: vec![
+            "1".into(),
+            "2".into(),
+            "4".into(),
+            "16".into(),
+            "32".into(),
+            "12".into(),
+        ],
+        nace: vec![
+            (1, "85.202".into()),
+            (2, "85.310".into()),
+            (3, "85.201".into()),
+        ],
+        grade_to: Some(10),
+        website: Some("www.signo.no".into()),
+        visiting: address("Molandveien 29", "3158", "ANDEBU"),
+        changed_at: Some(ts("2026-09-13T01:39:59.673Z")),
+        ..unit("998666783", "Signo Grunn- og videregående skole AS", "3907")
+    }
+}
+
+/// Lørenskog voksenopplæring, 999038182: adult education. Out of scope, so only the facts
+/// the filter reads are copied.
+pub(super) fn lorenskog_adult() -> NsrUnit {
+    NsrUnit {
+        category_ids: vec![
+            "1".into(),
+            "3".into(),
+            "5".into(),
+            "32".into(),
+            "10".into(),
+            "25".into(),
+        ],
+        nace: vec![(1, "85.593".into()), (2, "85.201".into())],
+        ..unit("999038182", "Lørenskog voksenopplæring", "3222")
+    }
+}
+
+/// Wang Fredrikstad AS, 986779795: upper secondary as its primary NACE code. Out of scope.
+pub(super) fn wang() -> NsrUnit {
+    NsrUnit {
+        is_private: true,
+        nace: vec![(1, "85.310".into()), (2, "85.201".into())],
+        ..unit("986779795", "Wang Fredrikstad AS", "3107")
+    }
+}
+
+/// Den norske skole - Gran Canaria, U90099017: abroad (2599). Out of scope.
+pub(super) fn gran_canaria() -> NsrUnit {
+    NsrUnit {
+        is_private: true,
+        ..unit("U90099017", "Den norske skole - Gran Canaria", "2599")
+    }
+}
+
+/// Longyearbyen skole grunnskole, 974795655: Svalbard (2100).
+pub(super) fn longyearbyen() -> NsrUnit {
+    NsrUnit {
+        category_ids: vec!["1".into(), "2".into(), "3".into(), "5".into(), "32".into()],
+        nace: vec![(1, "85.201".into()), (2, "85.310".into())],
+        grade_to: Some(10),
+        visiting: address("Vei 500 156", "9170", "LONGYEARBYEN"),
+        postal: address("Postboks 350", "9171", "LONGYEARBYEN"),
+        changed_at: Some(ts("2026-09-13T01:28:40.183Z")),
+        ..unit("974795655", "Longyearbyen skole grunnskole", "2100")
+    }
+}
+
+/// Kjølsdalen montessoriskule SA, 998245508: Nynorsk, private.
+pub(super) fn kjolsdalen() -> NsrUnit {
+    NsrUnit {
+        is_private: true,
+        category_ids: vec!["1".into(), "4".into(), "16".into(), "32".into()],
+        grade_to: Some(10),
+        language: Some("nn".into()),
+        website: Some("www.kjolsdalenmontessori.no".into()),
+        visiting: address("Daltunvegen 19", "6776", "KJØLSDALEN"),
+        changed_at: Some(ts("2026-09-13T01:39:54.1Z")),
+        ..unit("998245508", "Kjølsdalen montessoriskule SA", "4649")
+    }
+}
+
+/// Halsa barne- og ungdomsskole, 998670799: no website.
+pub(super) fn halsa() -> NsrUnit {
+    NsrUnit {
+        grade_to: Some(10),
+        visiting: address("Glåmsmyrvegen 63", "6683", "VÅGLAND"),
+        postal: address("Trondheimsveien 1", "7200", "KYRKSÆTERØRA"),
+        changed_at: Some(ts("2026-09-13T01:40:00.23Z")),
+        ..unit("998670799", "Halsa barne- og ungdomsskole", "5055")
+    }
+}
+
+/// Holtålen kommune Haltdalen oppvekstsenter avd skole, 974554682: the municipality in the
+/// name.
+pub(super) fn haltdalen() -> NsrUnit {
+    NsrUnit {
+        website: Some("www.holtalenskolene.no".into()),
+        visiting: address("Knuten 121", "7383", "HALTDALEN"),
+        changed_at: Some(ts("2026-09-13T01:23:55.68Z")),
+        ..unit(
+            "974554682",
+            "Holtålen kommune Haltdalen oppvekstsenter avd skole",
+            "5026",
+        )
+    }
+}
+
+/// Stange ungdomsskole's old number, 975270920: closed as "Slettet for sammenslåing".
+pub(super) fn stange_old() -> NsrUnit {
+    NsrUnit {
+        is_active: false,
+        grade_from: None,
+        grade_to: None,
+        website: Some("www.stange.kommune.no".into()),
+        visiting: address("Kongsvegen 12", "2335", "STANGE"),
+        postal: address("Postboks 214", "2336", "STANGE"),
+        closure: Some(NsrClosure {
+            code: "F".into(),
+            at: Some(ts("2024-08-25T01:15:10.91Z")),
+        }),
+        changed_at: Some(ts("2026-03-18T13:24:18.55Z")),
+        ..unit("975270920", "Stange ungdomsskole", "3413")
+    }
+}
+
+/// Stange ungdomsskole's new number, 933181995.
+pub(super) fn stange_new() -> NsrUnit {
+    NsrUnit {
+        grade_from: Some(8),
+        grade_to: Some(10),
+        visiting: address("Ljøstadvegen 7", "2335", "STANGE"),
+        postal: address("Postboks 214", "2336", "STANGE"),
+        changed_at: Some(ts("2026-09-13T01:19:29.99Z")),
+        ..unit("933181995", "Stange ungdomsskole", "3413")
+    }
+}
+
+/// Every fixture unit, in the README's order.
+pub(super) fn fixture_units() -> Vec<NsrUnit> {
+    vec![
+        hosle(),
+        ntg(),
+        lerberg(),
+        signo(),
+        lorenskog_adult(),
+        wang(),
+        gran_canaria(),
+        longyearbyen(),
+        kjolsdalen(),
+        halsa(),
+        haltdalen(),
+        stange_old(),
+        stange_new(),
+    ]
+}
+
+/// The listed, active register row a seed would have made from `unit`.
+pub(super) fn school(
+    id: u32,
+    municipality_id: u32,
+    unit: &NsrUnit,
+    slug: &str,
+) -> SchoolSnapshot<u32> {
+    SchoolSnapshot {
+        id,
+        municipality_id,
+        origin: Origin::Register,
+        orgnr: Some(unit.orgnr.clone()),
+        register_name: Some(unit.name.clone()),
+        display_name: unit.name.clone(),
+        display_name_curated: false,
+        slug: Some(slug.into()),
+        verification: Verification::Listed,
+        status: SchoolStatus::Active,
+        in_scope: true,
+        scope_override: None,
+        has_live_fau: false,
+        attributes: SchoolAttributes::from_unit(unit),
     }
 }

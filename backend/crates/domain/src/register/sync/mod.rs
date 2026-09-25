@@ -6,6 +6,9 @@
 // Wired into `plan()` in Task 5; until then only its tests call it.
 #[allow(dead_code)]
 mod municipalities;
+// Wired into `plan()` in Task 5; until then only its tests call it.
+#[allow(dead_code)]
+mod schools;
 mod similarity;
 #[cfg(test)]
 mod testkit;

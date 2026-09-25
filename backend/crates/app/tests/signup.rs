@@ -751,3 +751,66 @@ async fn activating_with_a_disabled_account_is_refused() {
     assert_eq!(status, "pending", "a refused activation changes nothing");
     assert_eq!(count(&pool, "select count(*) from memberships").await, 0);
 }
+
+/// Coverage gap (audit section 5): `MembershipError::EmptyPeriod` (`signup.rs:364`).
+/// No legitimate signup can reach this -- `create_pending_tenant` already validates
+/// `admin_ends_on_exclusive` against *its own* today via `validate_admin_end`, and
+/// `activate_tenant`'s own `SignupExpired` check (a handful of days, `PENDING_
+/// SIGNUP_DAYS`) fires long before enough time could pass for that same today to
+/// catch up with an end date at least a month out -- so this is a defence-in-depth
+/// check against a row no persistence function can produce, arranged directly with
+/// the superuser pool (the same convention `roles.rs`'s `ended_admin_with_live_grant`
+/// and `requests.rs`'s `handover_only_actor` use for the identical reason).
+#[tokio::test]
+async fn activation_refuses_a_signup_whose_admin_end_is_not_after_today() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let admin = db.admin_pool();
+    let t0 = at(T0);
+
+    let school_id = school(&pool, "empty-period-activation").await;
+    let tenant_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into tenants (id, name, status, school_id) values ($1, 'FAU', 'pending', $2)",
+    )
+    .bind(tenant_id)
+    .bind(school_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into tenant_signups
+           (tenant_id, registrant_email, leader_email, admin_ends_on_exclusive, expires_at)
+         values ($1, $2, $2, $3::date, now() + interval '1 day')",
+    )
+    .bind(tenant_id)
+    .bind("reg@example.test")
+    // Equal to t0's own today (2026-09-23): `Period::new` requires a strict `<`, so
+    // this empties the period activation would otherwise build, while the row still
+    // passes every table CHECK on its own (no constraint relates admin_ends_on_
+    // exclusive to today at write time).
+    .bind(t0.today().to_string())
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let err = activate_tenant(
+        &pool,
+        Activation {
+            tenant_id,
+            registrant: verified("reg@example.test"),
+        },
+        t0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, MembershipError::EmptyPeriod);
+
+    let status: String = sqlx::query_scalar("select status from tenants where id = $1")
+        .bind(tenant_id)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending", "a refused activation changes nothing");
+    assert_eq!(count(&pool, "select count(*) from memberships").await, 0);
+}

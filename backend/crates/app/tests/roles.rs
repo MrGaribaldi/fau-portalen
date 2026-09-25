@@ -502,6 +502,11 @@ async fn revoking_an_admin_whose_term_is_covered_needs_no_confirmation() {
     )
     .await
     .expect("the remaining admin covers the same term");
+    // Minor finding 7: `.expect()` on the call under test proved only that the
+    // function returned `Ok`, never that it actually revoked anything -- a
+    // no-op success would have passed silently.
+    assert!(revoked(&pool, "role_assignments", other.assignment_ids[0]).await);
+    assert_eq!(audit_count(&pool, "role.revoked").await, 1);
 }
 
 /// Review carry-over 1: `AdminState`'s queries filter on `USABLE_ACCOUNT` and on
@@ -1005,4 +1010,69 @@ async fn two_admins_revoking_each_other_at_once_never_leave_the_fau_without_an_a
         .unwrap();
         assert!(admins_left >= 1, "round {round}: no admin left");
     }
+}
+
+/// Coverage gap (audit section 5): the admin-side "unknown id" branches, never
+/// exercised until now. All three are one-line lookups a random `Uuid::now_v7()`
+/// cannot match, reached only once authority has already been granted -- they
+/// matter because that ordering is what keeps an unauthorised actor from learning
+/// whether an id exists at all (see `a_member_targeting_an_unknown_assignment_gets_not_authorized`
+/// above, which pins the non-admin side of the same ordering).
+#[tokio::test]
+async fn an_admin_targeting_an_unknown_membership_or_assignment_gets_unknown() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+
+    let err = grant_role(
+        &pool,
+        GrantRole {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: Uuid::now_v7(),
+            role: new_role("Kasserer", CapabilityClass::Member),
+            period: period(day(2026, 10, 1), day(2027, 10, 1)),
+        },
+        t0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, MembershipError::UnknownMembership, "grant_role");
+
+    let err = revoke_membership(
+        &pool,
+        RevokeMembership {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: Uuid::now_v7(),
+            confirm_no_admin: false,
+        },
+        t0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, MembershipError::UnknownMembership, "revoke_membership");
+
+    // An admin, unlike a member, may target anyone -- so an admin actor with an
+    // unknown assignment id learns `UnknownAssignment`, not `NotAuthorized` (the
+    // non-admin variant `a_member_targeting_an_unknown_assignment_gets_not_authorized`
+    // above pins).
+    let err = revoke_role_assignment(
+        &pool,
+        RevokeAssignment {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            assignment_id: Uuid::now_v7(),
+            confirm_no_admin: true,
+        },
+        t0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        MembershipError::UnknownAssignment,
+        "revoke_role_assignment"
+    );
 }

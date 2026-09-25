@@ -907,3 +907,30 @@ async fn request_structs_never_print_addresses_in_debug() {
     let debug = format!("{proposal:?}");
     assert!(!debug.contains("hemmelig-etterfolger@example.test"));
 }
+
+/// Coverage gap (audit section 5): `UnknownRequest`, reached only once the actor's
+/// admin authority is already established -- a three-line lookup a random
+/// `Uuid::now_v7()` cannot match, on both decision paths.
+#[tokio::test]
+async fn an_admin_deciding_an_unknown_request_gets_unknown_request() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+
+    let decision = |request_id| RequestDecision {
+        tenant_id: fau.tenant_id,
+        actor_membership_id: fau.admin_membership_id,
+        request_id,
+    };
+
+    let err = approve_request(&pool, decision(Uuid::now_v7()), vec![], t0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, MembershipError::UnknownRequest, "approve_request");
+
+    let err = decline_request(&pool, decision(Uuid::now_v7()), t0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, MembershipError::UnknownRequest, "decline_request");
+}

@@ -262,7 +262,8 @@ pub(super) fn plan_schools<Id: RowId>(
 
     // Re-registrations and submission matches first, so a successor gets its predecessor's
     // slug before any rename can take it (§4.5). Every candidate is assigned at once (fix
-    // round 1: a global best match, not whichever candidate `place_all` happens to see first).
+    // round 1: a global best match, not whichever candidate the old per-unit `place` happened
+    // to see first).
     let placements = place_all(
         &candidates,
         snapshot,
@@ -419,8 +420,9 @@ enum PredKind {
 /// similarity descending, then the candidate's orgnr, then — for a tie on both — the FAU
 /// predecessor before a non-FAU one (the existing preference, since a human sees it either
 /// way), then the predecessor's own orgnr. Assigning in that order and taking each candidate's
-/// and each closing predecessor's *first* (i.e. best) match makes the outcome independent of
-/// `inputs.units`'s order.
+/// and each closing predecessor's *first* (i.e. best) match makes predecessor assignment
+/// independent of input order; `plan()` normalises `inputs.units`'s order for everything else
+/// (create order, `Ref::New` numbering and slug minting).
 ///
 /// A closing (non-FAU) predecessor gives its slug and successor link to its single best match;
 /// any other candidate that also matched it gets nothing from it (§4.5 rule 1, one successor

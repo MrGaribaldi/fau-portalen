@@ -2,6 +2,8 @@
 //! crates/register-sources/tests/fixtures/ (see its README); the domain cannot depend on
 //! that crate, so they are written out by hand.
 
+use std::collections::{HashMap, HashSet};
+
 use jiff::civil::Date;
 use jiff::Timestamp;
 
@@ -12,8 +14,9 @@ use crate::register::source::{
 use crate::time::Moment;
 
 use super::types::{
-    MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, Origin, RunKind,
-    SchoolAttributes, SchoolSnapshot, SchoolStatus, SyncInputs, Verification,
+    CreateVerification, MunicipalityOp, MunicipalitySnapshot, MunicipalitySource,
+    MunicipalityStatus, Origin, Ref, RegisterSnapshot, RunKind, SchoolAttributes, SchoolOp,
+    SchoolSnapshot, SchoolStatus, SlugChange, SyncInputs, SyncPlan, Verification,
 };
 
 pub(super) fn ts(s: &str) -> Timestamp {
@@ -367,4 +370,206 @@ pub(super) fn school(
         has_live_fau: false,
         attributes: SchoolAttributes::from_unit(unit),
     }
+}
+
+/// Applies a plan to a snapshot as the persistence applier (part 4) must: every `Ref::New`
+/// gets its id before any op runs, so a `Close` can name a successor created after it; then
+/// the ops run in order. A close moves the slug to history and clears it. The executable
+/// specification the SQL applier has to match.
+pub(super) fn apply(
+    snapshot: &RegisterSnapshot<u32>,
+    plan: &SyncPlan<u32>,
+) -> RegisterSnapshot<u32> {
+    let mut next = snapshot
+        .municipalities
+        .iter()
+        .map(|m| m.id)
+        .chain(snapshot.schools.iter().map(|s| s.id))
+        .max()
+        .map_or(1, |id| id + 1);
+    let mut fresh = || {
+        next += 1;
+        next - 1
+    };
+    let new_municipalities: HashMap<u32, u32> = plan
+        .municipality_ops
+        .iter()
+        .filter_map(|op| match op {
+            MunicipalityOp::Create { new, .. } => Some((*new, fresh())),
+            _ => None,
+        })
+        .collect();
+    let new_schools: HashMap<u32, u32> = plan
+        .school_ops
+        .iter()
+        .filter_map(|op| match op {
+            SchoolOp::Create { new, .. } => Some((*new, fresh())),
+            _ => None,
+        })
+        .collect();
+    let municipality_id = |r: &Ref<u32>| match r {
+        Ref::Existing(id) => *id,
+        Ref::New(n) => new_municipalities[n],
+    };
+
+    let mut out = snapshot.clone();
+    for op in &plan.municipality_ops {
+        match op {
+            MunicipalityOp::Create {
+                new,
+                number,
+                name,
+                official_name,
+                county_number,
+                county_name,
+                slug,
+                names,
+                source,
+            } => out.municipalities.push(MunicipalitySnapshot {
+                id: new_municipalities[new],
+                number: number.clone(),
+                name: name.clone(),
+                official_name: official_name.clone(),
+                county_number: county_number.clone(),
+                county_name: county_name.clone(),
+                slug: slug.clone(),
+                status: MunicipalityStatus::Active,
+                source: *source,
+                names: names.clone(),
+            }),
+            MunicipalityOp::Renumber {
+                id,
+                to,
+                old_slug,
+                new_slug,
+                ..
+            } => {
+                let m = municipality_mut(&mut out, *id);
+                m.number = to.clone();
+                m.slug = new_slug.clone();
+                out.municipality_slug_history.push((old_slug.clone(), *id));
+            }
+            MunicipalityOp::Rename {
+                id,
+                name,
+                old_slug,
+                new_slug,
+            } => {
+                let m = municipality_mut(&mut out, *id);
+                m.name = name.clone();
+                if old_slug != new_slug {
+                    m.slug = new_slug.clone();
+                    out.municipality_slug_history.push((old_slug.clone(), *id));
+                }
+            }
+            MunicipalityOp::UpdateDetails {
+                id,
+                official_name,
+                county_number,
+                county_name,
+                names,
+            } => {
+                let m = municipality_mut(&mut out, *id);
+                m.official_name = official_name.clone();
+                m.county_number = county_number.clone();
+                m.county_name = county_name.clone();
+                m.names = names.clone();
+            }
+        }
+    }
+    for op in &plan.school_ops {
+        match op {
+            SchoolOp::Close { id, .. } => {
+                let s = school_mut(&mut out, *id);
+                s.status = SchoolStatus::Closed;
+                let released = s.slug.take().map(|slug| (s.municipality_id, slug, *id));
+                out.school_slug_history.extend(released);
+            }
+            SchoolOp::Create {
+                new,
+                municipality,
+                orgnr,
+                register_name,
+                display_name,
+                slug,
+                verification,
+                in_scope,
+                attributes,
+                ..
+            } => out.schools.push(SchoolSnapshot {
+                id: new_schools[new],
+                municipality_id: municipality_id(municipality),
+                origin: Origin::Register,
+                orgnr: Some(orgnr.clone()),
+                register_name: Some(register_name.clone()),
+                display_name: display_name.clone(),
+                display_name_curated: false,
+                slug: slug.clone(),
+                verification: match verification {
+                    CreateVerification::Listed => Verification::Listed,
+                    CreateVerification::Held => Verification::Held,
+                },
+                status: SchoolStatus::Active,
+                in_scope: *in_scope,
+                scope_override: None,
+                has_live_fau: false,
+                attributes: attributes.clone(),
+            }),
+            SchoolOp::Rename {
+                id,
+                register_name,
+                display_name,
+                slug,
+            } => {
+                let s = school_mut(&mut out, *id);
+                s.register_name = Some(register_name.clone());
+                if let Some(name) = display_name {
+                    s.display_name = name.clone();
+                }
+                if let Some(SlugChange { old, new }) = slug {
+                    s.slug = Some(new.clone());
+                    let m = s.municipality_id;
+                    out.school_slug_history.push((m, old.clone(), *id));
+                }
+            }
+            SchoolOp::UpdateAttributes { id, attributes } => {
+                school_mut(&mut out, *id).attributes = attributes.clone();
+            }
+            SchoolOp::Move { id, from, to, slug } => {
+                let s = school_mut(&mut out, *id);
+                s.municipality_id = municipality_id(to);
+                if let Some(SlugChange { old, new }) = slug {
+                    s.slug = Some(new.clone());
+                    out.school_slug_history.push((*from, old.clone(), *id));
+                }
+            }
+        }
+    }
+
+    // The database's own rules: one current slug per municipality, none on a held row.
+    let mut seen = HashSet::new();
+    for s in &out.schools {
+        if let Some(slug) = &s.slug {
+            assert!(s.verification != Verification::Held, "held row with a slug");
+            assert!(
+                seen.insert((s.municipality_id, slug.clone())),
+                "duplicate slug {slug}"
+            );
+        }
+    }
+    out
+}
+
+fn municipality_mut(out: &mut RegisterSnapshot<u32>, id: u32) -> &mut MunicipalitySnapshot<u32> {
+    out.municipalities
+        .iter_mut()
+        .find(|m| m.id == id)
+        .expect("the plan names an existing municipality")
+}
+
+fn school_mut(out: &mut RegisterSnapshot<u32>, id: u32) -> &mut SchoolSnapshot<u32> {
+    out.schools
+        .iter_mut()
+        .find(|s| s.id == id)
+        .expect("the plan names an existing school")
 }

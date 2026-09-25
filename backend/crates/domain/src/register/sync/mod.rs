@@ -49,12 +49,13 @@ pub fn plan<Id: RowId>(
     let schools = plan_schools(snapshot, inputs, &municipalities.state);
     let mut reviews = municipalities.reviews;
     reviews.extend(schools.reviews);
-    let counts = tally(
+    let mut counts = tally(
         &municipalities.ops,
         &schools.ops,
         reviews.len(),
         schools.skipped,
     );
+    counts.attribute_losses = attribute_losses(snapshot, &schools.ops);
 
     if inputs.kind == RunKind::Sync {
         if let Some(reason) = mass_change(snapshot, &counts) {
@@ -72,8 +73,9 @@ pub fn plan<Id: RowId>(
     })
 }
 
-/// §5.3's circuit breaker: more than 2% of active schools closing, or more than 5% renamed.
-/// Integer arithmetic, so 2 of 100 passes and 3 of 100 does not.
+/// §5.3's circuit breaker: more than 2% of active schools closing, more than 5% renamed, or
+/// (controller ruling) more than 5% losing an attribute. Integer arithmetic, so 2 of 100
+/// closing passes and 3 of 100 does not.
 fn mass_change<Id>(snapshot: &RegisterSnapshot<Id>, counts: &Counts) -> Option<AbortReason> {
     let active = snapshot
         .schools
@@ -87,12 +89,55 @@ fn mass_change<Id>(snapshot: &RegisterSnapshot<Id>, counts: &Counts) -> Option<A
         })
         .count();
     let (closes, renames) = (counts.schools_closed, counts.schools_renamed);
-    let tripped = active > 0 && (closes * 100 > active * 2 || renames * 100 > active * 5);
+    let losses = counts.attribute_losses;
+    let tripped = active > 0
+        && (closes * 100 > active * 2 || renames * 100 > active * 5 || losses * 100 > active * 5);
     tripped.then_some(AbortReason::MassChange {
         closes,
         renames,
+        attribute_losses: counts.attribute_losses,
         active,
     })
+}
+
+/// Schools whose `UpdateAttributes` turns any field from `Some` into `None`. A source that
+/// silently stops sending a field would otherwise blank it across the register unnoticed.
+fn attribute_losses<Id: RowId>(snapshot: &RegisterSnapshot<Id>, ops: &[SchoolOp<Id>]) -> usize {
+    ops.iter()
+        .filter(|op| match op {
+            SchoolOp::UpdateAttributes { id, attributes } => snapshot
+                .schools
+                .iter()
+                .find(|s| s.id == *id)
+                .is_some_and(|s| loses_a_field(&s.attributes, attributes)),
+            _ => false,
+        })
+        .count()
+}
+
+fn loses_a_field(old: &SchoolAttributes, new: &SchoolAttributes) -> bool {
+    fn lost<T>(a: &Option<T>, b: &Option<T>) -> bool {
+        a.is_some() && b.is_none()
+    }
+    // Destructured, so a new field cannot be forgotten here.
+    let SchoolAttributes {
+        ownership,
+        grade_from,
+        grade_to,
+        language,
+        website,
+        street_address,
+        postcode,
+        post_town,
+    } = old;
+    lost(ownership, &new.ownership)
+        || lost(grade_from, &new.grade_from)
+        || lost(grade_to, &new.grade_to)
+        || lost(language, &new.language)
+        || lost(website, &new.website)
+        || lost(street_address, &new.street_address)
+        || lost(postcode, &new.postcode)
+        || lost(post_town, &new.post_town)
 }
 
 fn tally<Id>(
@@ -566,6 +611,7 @@ mod tests {
                     AbortReason::MassChange {
                         closes: 3,
                         renames: 0,
+                        attribute_losses: 0,
                         active: 100
                     }
                 );
@@ -585,6 +631,7 @@ mod tests {
                 reason: AbortReason::MassChange {
                     closes: 0,
                     renames: 6,
+                    attribute_losses: 0,
                     active: 100
                 },
                 counts: Counts {
@@ -592,6 +639,172 @@ mod tests {
                     ..Counts::default()
                 },
             }
+        );
+    }
+
+    /// Controller ruling: the breaker sees mass attribute loss. 100 schools with a website;
+    /// the first `lose` of them lose it in NSR.
+    fn run_losing_websites(lose: usize) -> SyncOutcome<u32> {
+        let with_site = |u: NsrUnit| NsrUnit {
+            website: Some(format!("www.{}.no", u.orgnr)),
+            ..u
+        };
+        let (_, units) = bystanders(1, "3201", 100);
+        let units: Vec<NsrUnit> = units.into_iter().map(with_site).collect();
+        let schools = units
+            .iter()
+            .zip(0..)
+            .map(|(u, i)| school(1000 + i, 1, u, &format!("skole-{i}")))
+            .collect();
+        let snapshot = RegisterSnapshot {
+            municipalities: vec![municipality(1, &record("3201", "Bærum", "32", "Akershus"))],
+            schools,
+            ..RegisterSnapshot::default()
+        };
+        let units: Vec<NsrUnit> = units
+            .into_iter()
+            .enumerate()
+            .map(|(i, u)| {
+                if i < lose {
+                    NsrUnit { website: None, ..u }
+                } else {
+                    u
+                }
+            })
+            .collect();
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        super::plan(&snapshot, &inputs(&records, &[], &units, RunKind::Sync))
+    }
+
+    #[test]
+    fn five_percent_losing_an_attribute_passes_and_six_percent_aborts() {
+        let plan = applied(run_losing_websites(5));
+        assert_eq!(plan.counts.schools_updated, 5);
+        assert_eq!(plan.counts.attribute_losses, 5);
+        assert_eq!(
+            run_losing_websites(6),
+            SyncOutcome::Abort {
+                reason: AbortReason::MassChange {
+                    closes: 0,
+                    renames: 0,
+                    attribute_losses: 6,
+                    active: 100
+                },
+                counts: Counts {
+                    schools_updated: 6,
+                    attribute_losses: 6,
+                    ..Counts::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_gained_or_changed_attribute_is_no_loss() {
+        // Every school's website changes (Some -> other Some): updates, but no loss.
+        let (snapshot, units) = hundred_schools();
+        let units: Vec<NsrUnit> = units
+            .into_iter()
+            .map(|u| NsrUnit {
+                website: Some("www.ny.no".into()),
+                ..u
+            })
+            .collect();
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        let plan = applied(super::plan(
+            &snapshot,
+            &inputs(&records, &[], &units, RunKind::Sync),
+        ));
+        assert_eq!(plan.counts.schools_updated, 100);
+        assert_eq!(plan.counts.attribute_losses, 0);
+    }
+
+    fn two_hosle_schools() -> RegisterSnapshot<u32> {
+        RegisterSnapshot {
+            municipalities: vec![
+                municipality(1, &record("3201", "Bærum", "32", "Akershus")),
+                municipality(2, &record("3413", "Stange", "34", "Innlandet")),
+            ],
+            schools: vec![
+                school(10, 1, &hosle(), "hosle-skole"),
+                school(11, 1, &ntg(), "ntg"),
+            ],
+            ..RegisterSnapshot::default()
+        }
+    }
+
+    fn plan_of(
+        municipality_ops: Vec<MunicipalityOp<u32>>,
+        school_ops: Vec<SchoolOp<u32>>,
+    ) -> SyncPlan<u32> {
+        SyncPlan {
+            municipality_ops,
+            school_ops,
+            reviews: Vec::new(),
+            counts: Counts::default(),
+        }
+    }
+
+    /// The test applier checks the database's rules after every op, so a plan whose order
+    /// only works out at the end still fails: here 11 takes 10's slug before 10 gives it up.
+    #[test]
+    #[should_panic(expected = "duplicate school slug")]
+    fn the_test_applier_rejects_a_slug_taken_before_it_is_released() {
+        let rename = |id, old: &str, new: &str| SchoolOp::Rename {
+            id,
+            register_name: "x".into(),
+            display_name: None,
+            slug: Some(SlugChange {
+                old: Some(old.into()),
+                new: new.into(),
+            }),
+        };
+        apply(
+            &two_hosle_schools(),
+            &plan_of(
+                vec![],
+                vec![
+                    rename(11, "ntg", "hosle-skole"),
+                    rename(10, "hosle-skole", "hosle-ny"),
+                ],
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate municipality slug")]
+    fn the_test_applier_rejects_a_duplicate_municipality_slug() {
+        apply(
+            &two_hosle_schools(),
+            &plan_of(
+                vec![MunicipalityOp::Rename {
+                    id: 2,
+                    name: "Bærum".into(),
+                    old_slug: "3413-stange".into(),
+                    new_slug: "3201-baerum".into(),
+                }],
+                vec![],
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "two current holders of number 3201")]
+    fn the_test_applier_rejects_two_holders_of_one_number() {
+        apply(
+            &two_hosle_schools(),
+            &plan_of(
+                vec![MunicipalityOp::Renumber {
+                    id: 2,
+                    from: "3413".into(),
+                    to: "3201".into(),
+                    valid_from: date(2027, 1, 1),
+                    name: None,
+                    old_slug: "3413-stange".into(),
+                    new_slug: "3201-stange".into(),
+                }],
+                vec![],
+            ),
         );
     }
 

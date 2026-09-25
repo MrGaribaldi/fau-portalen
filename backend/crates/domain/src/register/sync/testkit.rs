@@ -375,8 +375,9 @@ pub(super) fn school(
 /// Applies a plan to a snapshot as the persistence applier (part 4) must: every `Ref::New`
 /// gets its id before any op runs, so a `Close` can name a successor created after it; then
 /// the ops run in order. A close moves the slug to history and clears it, sets `in_scope =
-/// false` when the reason is `OutOfScope`, and resolves its successor. The executable
-/// specification the SQL applier has to match.
+/// false` when the reason is `OutOfScope`, and resolves its successor. After every op it checks
+/// 0004's uniqueness rules ([`check_invariants`]), so a plan must be valid at every step, not
+/// only at the end. The executable specification the SQL applier has to match.
 ///
 /// Returns the applied snapshot plus every closed school's resolved successor id (closed id ->
 /// successor id), i.e. what `schools.successor_id` would hold. This is tracked test-side rather
@@ -488,6 +489,7 @@ pub(super) fn apply(
                 m.names = names.clone();
             }
         }
+        check_invariants(&out, op);
     }
     // Closed school id -> its plan's successor `Ref`, resolved and validated only once every
     // `Create` op below has run: a `Close` can name a successor that is created later in this
@@ -575,6 +577,7 @@ pub(super) fn apply(
                 }
             }
         }
+        check_invariants(&out, op);
     }
 
     // Now that every `Create` has run, resolve and validate each closed school's successor:
@@ -607,18 +610,42 @@ pub(super) fn apply(
         successors.insert(closed_id, successor_id);
     }
 
-    // The database's own rules: one current slug per municipality, none on a held row.
+    (out, successors)
+}
+
+/// The database's own rules (0004), checked after every op, since the SQL applier runs the ops
+/// one by one against live constraints: one current slug per municipality among schools, none
+/// on a held row, unique municipality slugs, and one active holder per municipality number.
+fn check_invariants(out: &RegisterSnapshot<u32>, after: &impl std::fmt::Debug) {
     let mut seen = HashSet::new();
     for s in &out.schools {
         if let Some(slug) = &s.slug {
-            assert!(s.verification != Verification::Held, "held row with a slug");
+            assert!(
+                s.verification != Verification::Held,
+                "held row with a slug after {after:?}"
+            );
             assert!(
                 seen.insert((s.municipality_id, slug.clone())),
-                "duplicate slug {slug}"
+                "duplicate school slug {slug} after {after:?}"
             );
         }
     }
-    (out, successors)
+    let mut slugs = HashSet::new();
+    let mut numbers = HashSet::new();
+    for m in &out.municipalities {
+        assert!(
+            slugs.insert(m.slug.clone()),
+            "duplicate municipality slug {} after {after:?}",
+            m.slug
+        );
+        if m.status == MunicipalityStatus::Active {
+            assert!(
+                numbers.insert(m.number.clone()),
+                "two current holders of number {} after {after:?}",
+                m.number
+            );
+        }
+    }
 }
 
 fn municipality_mut(out: &mut RegisterSnapshot<u32>, id: u32) -> &mut MunicipalitySnapshot<u32> {

@@ -1996,7 +1996,7 @@ mod tests {
         let mut schools = vec![a, b];
         let forward = run(
             &with_schools(schools.clone()),
-            &[fornebu.clone()],
+            std::slice::from_ref(&fornebu),
             &baerum(),
         );
         schools.reverse();

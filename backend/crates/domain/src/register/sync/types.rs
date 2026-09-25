@@ -412,6 +412,9 @@ pub struct Counts {
     /// Register-name changes: the circuit breaker's renames.
     pub schools_renamed: usize,
     pub schools_updated: usize,
+    /// Schools whose `UpdateAttributes` turns any field from `Some` into `None`: the circuit
+    /// breaker's attribute losses.
+    pub attribute_losses: usize,
     pub schools_moved: usize,
     pub schools_closed: usize,
     pub schools_held: usize,
@@ -434,10 +437,12 @@ pub struct SyncPlan<Id> {
 pub enum AbortReason {
     /// Kartverket or NSR returned nothing: an outage, not a country without schools.
     EmptySource { source: &'static str },
-    /// §5.3: more than 2% of active schools closing, or more than 5% renamed.
+    /// §5.3: more than 2% of active schools closing, more than 5% renamed, or (controller
+    /// ruling) more than 5% losing an attribute.
     MassChange {
         closes: usize,
         renames: usize,
+        attribute_losses: usize,
         active: usize,
     },
 }

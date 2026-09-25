@@ -2,6 +2,17 @@
 
 mod common;
 use common::TestDb;
+use uuid::Uuid;
+
+/// The Postgres SQLSTATE code, if the error is a database error at all -- pins down
+/// *which* rule refused the statement (42501, insufficient privilege) rather than
+/// accepting any failure, including a syntax error, as proof of the guard (minor
+/// finding 4).
+fn sqlstate(err: &sqlx::Error) -> Option<String> {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c.into_owned())
+}
 
 #[tokio::test]
 async fn runtime_role_cannot_perform_ddl() {
@@ -10,8 +21,13 @@ async fn runtime_role_cannot_perform_ddl() {
 
     let err = sqlx::query("create table sneaky (id int)")
         .execute(&pool)
-        .await;
-    assert!(err.is_err(), "runtime role must not have DDL rights");
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "runtime role must not have DDL rights: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -23,6 +39,22 @@ async fn runtime_role_can_read_and_write_the_spine() {
         .await
         .expect("runtime role must read accounts");
     assert_eq!(n, 0);
+
+    // The name promises both read and write (minor finding 5); the read alone was
+    // proven above, so an insert through the same runtime pool is what actually
+    // pins "write" -- a name that would otherwise pass on a read-only grant.
+    let id = Uuid::now_v7();
+    sqlx::query("insert into accounts (id, email) values ($1, $2)")
+        .bind(id)
+        .bind(format!("{id}@example.test"))
+        .execute(&pool)
+        .await
+        .expect("runtime role must write accounts");
+    let n: i64 = sqlx::query_scalar("select count(*) from accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[tokio::test]
@@ -32,10 +64,12 @@ async fn runtime_role_cannot_create_temp_tables() {
 
     let err = sqlx::query("create temporary table sneaky_temp (id int)")
         .execute(&pool)
-        .await;
-    assert!(
-        err.is_err(),
-        "runtime role must not have TEMP rights on the database"
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "runtime role must not have TEMP rights on the database: {err:?}"
     );
 }
 

@@ -2,7 +2,7 @@
 //! crates/register-sources/tests/fixtures/ (see its README); the domain cannot depend on
 //! that crate, so they are written out by hand.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use jiff::civil::Date;
 use jiff::Timestamp;
@@ -14,7 +14,7 @@ use crate::register::source::{
 use crate::time::Moment;
 
 use super::types::{
-    CreateVerification, MunicipalityOp, MunicipalitySnapshot, MunicipalitySource,
+    ClosureReason, CreateVerification, MunicipalityOp, MunicipalitySnapshot, MunicipalitySource,
     MunicipalityStatus, Origin, Ref, RegisterSnapshot, RunKind, SchoolAttributes, SchoolOp,
     SchoolSnapshot, SchoolStatus, SlugChange, SyncInputs, SyncPlan, Verification,
 };
@@ -374,12 +374,20 @@ pub(super) fn school(
 
 /// Applies a plan to a snapshot as the persistence applier (part 4) must: every `Ref::New`
 /// gets its id before any op runs, so a `Close` can name a successor created after it; then
-/// the ops run in order. A close moves the slug to history and clears it. The executable
+/// the ops run in order. A close moves the slug to history and clears it, sets `in_scope =
+/// false` when the reason is `OutOfScope`, and resolves its successor. The executable
 /// specification the SQL applier has to match.
+///
+/// Returns the applied snapshot plus every closed school's resolved successor id (closed id ->
+/// successor id), i.e. what `schools.successor_id` would hold. This is tracked test-side rather
+/// than added to `SchoolSnapshot`: the plan's "Building the snapshot" list (what the applier
+/// must read back for the planner) never mentions `successor_id`, because the planner itself
+/// never reads a school's successor back from the snapshot — only `testkit::apply`'s callers
+/// need it, to check the handover contract.
 pub(super) fn apply(
     snapshot: &RegisterSnapshot<u32>,
     plan: &SyncPlan<u32>,
-) -> RegisterSnapshot<u32> {
+) -> (RegisterSnapshot<u32>, BTreeMap<u32, u32>) {
     let mut next = snapshot
         .municipalities
         .iter()
@@ -477,13 +485,30 @@ pub(super) fn apply(
             }
         }
     }
+    // Closed school id -> its plan's successor `Ref`, resolved and validated only once every
+    // `Create` op below has run: a `Close` can name a successor that is created later in this
+    // same plan (see the doc comment above), so the successor row is not yet in `out.schools`
+    // while `school_ops` is still being applied.
+    let mut pending_successors: Vec<(u32, Ref<u32>)> = Vec::new();
+
     for op in &plan.school_ops {
         match op {
-            SchoolOp::Close { id, .. } => {
+            SchoolOp::Close {
+                id,
+                reason,
+                successor,
+                ..
+            } => {
                 let s = school_mut(&mut out, *id);
                 s.status = SchoolStatus::Closed;
+                if *reason == ClosureReason::OutOfScope {
+                    s.in_scope = false;
+                }
                 let released = s.slug.take().map(|slug| (s.municipality_id, slug, *id));
                 out.school_slug_history.extend(released);
+                if let Some(successor) = successor {
+                    pending_successors.push((*id, *successor));
+                }
             }
             SchoolOp::Create {
                 new,
@@ -546,6 +571,36 @@ pub(super) fn apply(
         }
     }
 
+    // Now that every `Create` has run, resolve and validate each closed school's successor:
+    // the handover contract (part 4) is that it names a school that exists, is not Held, and
+    // shares the closed school's municipality.
+    let mut successors = BTreeMap::new();
+    for (closed_id, successor) in pending_successors {
+        let successor_id = match successor {
+            Ref::Existing(id) => {
+                assert!(
+                    out.schools.iter().any(|s| s.id == id),
+                    "successor {id} names no school in the snapshot"
+                );
+                id
+            }
+            Ref::New(n) => *new_schools.get(&n).unwrap_or_else(|| {
+                panic!("successor names Ref::New({n}), which no Create op in this plan makes")
+            }),
+        };
+        let closed_municipality = school_ref(&out, closed_id).municipality_id;
+        let successor_school = school_ref(&out, successor_id);
+        assert!(
+            successor_school.verification != Verification::Held,
+            "successor {successor_id} is a held row"
+        );
+        assert_eq!(
+            successor_school.municipality_id, closed_municipality,
+            "successor {successor_id} is not in the closed school {closed_id}'s municipality"
+        );
+        successors.insert(closed_id, successor_id);
+    }
+
     // The database's own rules: one current slug per municipality, none on a held row.
     let mut seen = HashSet::new();
     for s in &out.schools {
@@ -557,7 +612,7 @@ pub(super) fn apply(
             );
         }
     }
-    out
+    (out, successors)
 }
 
 fn municipality_mut(out: &mut RegisterSnapshot<u32>, id: u32) -> &mut MunicipalitySnapshot<u32> {
@@ -570,6 +625,13 @@ fn municipality_mut(out: &mut RegisterSnapshot<u32>, id: u32) -> &mut Municipali
 fn school_mut(out: &mut RegisterSnapshot<u32>, id: u32) -> &mut SchoolSnapshot<u32> {
     out.schools
         .iter_mut()
+        .find(|s| s.id == id)
+        .expect("the plan names an existing school")
+}
+
+fn school_ref(out: &RegisterSnapshot<u32>, id: u32) -> &SchoolSnapshot<u32> {
+    out.schools
+        .iter()
         .find(|s| s.id == id)
         .expect("the plan names an existing school")
 }

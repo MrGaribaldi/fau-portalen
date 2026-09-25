@@ -135,6 +135,8 @@ fn tally<Id>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use jiff::civil::date;
 
     use super::testkit::{
@@ -169,25 +171,26 @@ mod tests {
         (schools, units)
     }
 
-    /// Plans, applies, and checks that the very same inputs then change nothing.
+    /// Plans, applies, and checks that the very same inputs then change nothing. Also returns
+    /// every closed school's resolved successor (closed id -> successor id).
     fn apply_and_rerun(
         snapshot: &RegisterSnapshot<u32>,
         records: &[MunicipalityRecord],
         changes: &[CodeChange],
         units: &[NsrUnit],
         kind: RunKind,
-    ) -> (SyncPlan<u32>, RegisterSnapshot<u32>) {
+    ) -> (SyncPlan<u32>, RegisterSnapshot<u32>, BTreeMap<u32, u32>) {
         let plan = applied(super::plan(
             snapshot,
             &inputs(records, changes, units, kind),
         ));
-        let after = apply(snapshot, &plan);
+        let (after, successors) = apply(snapshot, &plan);
         assert_eq!(
             super::plan(&after, &inputs(records, changes, units, RunKind::Sync)),
             SyncOutcome::NoChange,
             "a second run on the same sources writes nothing"
         );
-        (plan, after)
+        (plan, after, successors)
     }
 
     #[test]
@@ -217,7 +220,7 @@ mod tests {
 
     #[test]
     fn a_seed_from_the_fixtures_then_a_sync_changes_nothing() {
-        let (plan, after) = apply_and_rerun(
+        let (plan, after, _) = apply_and_rerun(
             &RegisterSnapshot::default(),
             &fixture_records(),
             &[],
@@ -281,7 +284,7 @@ mod tests {
         };
         let records = [record("3201", "Bærum", "32", "Akershus")];
         let changes = [change("3024", "Bærum", "3201", "Bærum", date(2024, 1, 1))];
-        let (plan, after) =
+        let (plan, after, _) =
             apply_and_rerun(&snapshot, &records, &changes, &[hosle()], RunKind::Sync);
         assert!(plan.school_ops.is_empty(), "{:?}", plan.school_ops);
         assert_eq!(
@@ -364,7 +367,7 @@ mod tests {
             schools,
             ..RegisterSnapshot::default()
         };
-        let (plan, after) = apply_and_rerun(&snapshot, &[baerum], &[], &units, RunKind::Sync);
+        let (plan, after, _) = apply_and_rerun(&snapshot, &[baerum], &[], &units, RunKind::Sync);
         assert_eq!(plan.counts.schools_renamed, 1);
         assert_eq!(after.schools[0].slug.as_deref(), Some("hosle-barneskole"));
         assert_eq!(
@@ -384,7 +387,8 @@ mod tests {
             schools,
             ..RegisterSnapshot::default()
         };
-        let (plan, after) = apply_and_rerun(&snapshot, &[stange], &[], &units, RunKind::Sync);
+        let (plan, after, successors) =
+            apply_and_rerun(&snapshot, &[stange], &[], &units, RunKind::Sync);
         assert_eq!(
             plan.counts,
             Counts {
@@ -402,6 +406,11 @@ mod tests {
         assert_eq!(
             after.school_slug_history,
             [(20, "stange-ungdomsskole".to_owned(), 30)]
+        );
+        assert_eq!(
+            successors.get(&old.id),
+            Some(&new.id),
+            "the closed school's resolved successor is the new school"
         );
     }
 
@@ -495,7 +504,9 @@ mod tests {
     /// caller's order (and duplicates, which the caller's merge of two sources can produce)
     /// never affect the outcome. A realistic mix: several new schools including two sharing a
     /// name in one municipality, one rename and one close, plus enough unchanged bystanders to
-    /// stay under the circuit breaker.
+    /// stay under the circuit breaker. The duplicate orgnr carries two different names (as a
+    /// stale second source read might), so the test also pins down *which* one the planner
+    /// keeps: whichever is first in the caller's own order, in both orderings tried here.
     #[test]
     fn unit_order_and_duplicates_do_not_affect_the_outcome() {
         let baerum = record("3201", "Bærum", "32", "Akershus");
@@ -506,6 +517,13 @@ mod tests {
         };
         let ntg_closed = inactive(ntg());
         let a = unit("974000001", "Ås skole", "3201");
+        // Same orgnr as `a`, but a different name: the caller's merge of "every active
+        // grunnskole" with "every orgnr the register holds" can read the same unit twice from
+        // sources that disagree, e.g. a stale name from one of them.
+        let a_stale = NsrUnit {
+            name: "Ås skole (feilregistrert)".into(),
+            ..a.clone()
+        };
         let b = unit("974000002", "Ås skole", "3201");
         let mut units_in_order = vec![
             hosle_renamed.clone(),
@@ -514,13 +532,12 @@ mod tests {
             b.clone(),
         ];
         units_in_order.extend(bystander_units.iter().cloned());
-        // A different caller order, plus a duplicate orgnr (the same unit appearing twice, as
-        // the caller's merge of "every active grunnskole" with "every orgnr the register
-        // holds" can produce): the first occurrence must win and the outcome must not change.
+        // A different caller order. `a` still comes before `a_stale` here, as it must in both
+        // orderings for the two plans to agree on which one wins; everything else is shuffled.
         let mut units_reordered = vec![
             b.clone(),
             a.clone(),
-            a.clone(),
+            a_stale.clone(),
             ntg_closed.clone(),
             hosle_renamed.clone(),
         ];
@@ -557,8 +574,96 @@ mod tests {
         ));
         assert_eq!(plan_a, plan_b);
 
-        let after_a = apply(&snapshot, &plan_a);
-        let after_b = apply(&snapshot, &plan_b);
+        let (after_a, successors_a) = apply(&snapshot, &plan_a);
+        let (after_b, successors_b) = apply(&snapshot, &plan_b);
         assert_eq!(after_a, after_b);
+        assert_eq!(successors_a, successors_b);
+
+        // The first-supplied `a` wins over the later `a_stale`, in both orderings.
+        let created_name = |after: &RegisterSnapshot<u32>| {
+            after
+                .schools
+                .iter()
+                .find(|s| s.orgnr.as_deref() == Some("974000001"))
+                .expect("Ås skole is created")
+                .register_name
+                .clone()
+        };
+        assert_eq!(created_name(&after_a), Some(a.name.clone()));
+        assert_eq!(created_name(&after_b), Some(a.name.clone()));
+    }
+
+    /// Controller ruling: an out-of-scope close is applied as the part 4 handover says — the
+    /// closed school's `in_scope` also goes false, not just its status.
+    #[test]
+    fn an_out_of_scope_close_sets_in_scope_false() {
+        let baerum = record("3201", "Bærum", "32", "Akershus");
+        let (bystander_schools, bystander_units) = bystanders(1, "3201", 60);
+        let mut schools = vec![school(10, 1, &hosle(), "hosle-skole")];
+        schools.extend(bystander_schools);
+        let snapshot = RegisterSnapshot {
+            municipalities: vec![municipality(1, &baerum)],
+            schools,
+            ..RegisterSnapshot::default()
+        };
+        let adult = NsrUnit {
+            category_ids: vec!["10".into()],
+            ..hosle()
+        };
+        let mut units = vec![adult];
+        units.extend(bystander_units);
+
+        let plan = applied(super::plan(
+            &snapshot,
+            &inputs(std::slice::from_ref(&baerum), &[], &units, RunKind::Sync),
+        ));
+        assert_eq!(plan.counts.schools_closed, 1);
+        let (after, _) = apply(&snapshot, &plan);
+        let closed = after
+            .schools
+            .iter()
+            .find(|s| s.id == 10)
+            .expect("hosle is still in the snapshot, closed");
+        assert_eq!(closed.status, SchoolStatus::Closed);
+        assert!(
+            !closed.in_scope,
+            "an out-of-scope close must clear in_scope"
+        );
+    }
+
+    /// §5.3's breaker only fires on a Sync with `active > 0`: a snapshot with no active Listed
+    /// or Verified school must not abort even when every op it does produce would, by raw
+    /// percentage, look enormous against zero.
+    #[test]
+    fn no_active_schools_does_not_trip_the_breaker() {
+        let baerum = record("3201", "Bærum", "32", "Akershus");
+        let held = SchoolSnapshot {
+            verification: Verification::Held,
+            slug: None,
+            ..school(10, 1, &hosle(), "hosle-skole")
+        };
+        let snapshot = RegisterSnapshot {
+            municipalities: vec![municipality(1, &baerum)],
+            schools: vec![held],
+            ..RegisterSnapshot::default()
+        };
+        let renamed_hosle = NsrUnit {
+            name: "Hosle barneskole".into(),
+            ..hosle()
+        };
+        let a = unit("974000001", "Ås skole", "3201");
+        let outcome = super::plan(
+            &snapshot,
+            &inputs(
+                std::slice::from_ref(&baerum),
+                &[],
+                &[renamed_hosle, a],
+                RunKind::Sync,
+            ),
+        );
+        assert!(
+            matches!(outcome, SyncOutcome::Apply(_)),
+            "expected a plan with no active schools to apply, got {outcome:?}"
+        );
     }
 }

@@ -3,8 +3,8 @@
 //! fields it changes rather than their values.
 
 use fau_domain::register::sync::{
-    MunicipalityOp, Ref, RegisterSnapshot, ReviewItem, RunKind, SchoolAttributes, SchoolOp,
-    SlugChange, SyncOutcome,
+    AbortReason, MunicipalityOp, Ref, RegisterSnapshot, ReviewItem, RunKind, SchoolAttributes,
+    SchoolOp, SlugChange, SyncOutcome, SyncPlan,
 };
 use fau_persistence::register::{abort_reason_text, counts_json};
 use serde_json::{json, Map, Value};
@@ -179,26 +179,52 @@ fn review(item: &ReviewItem<Uuid>) -> Value {
     })
 }
 
+/// What a dry run prints. `stopped` is the plan the mass-change breaker aborted, printed in
+/// full with the abort so the operator can see what tripped it (final review, item 4);
+/// `accepted` is the abort `--accept-mass-change` overrode, printed next to the plan it let
+/// through.
 pub(super) fn plan_json(
     kind: RunKind,
     outcome: &SyncOutcome<Uuid>,
     snapshot: &RegisterSnapshot<Uuid>,
+    stopped: Option<&SyncPlan<Uuid>>,
+    accepted: Option<&AbortReason>,
 ) -> Value {
     let kind = match kind {
         RunKind::Seed => "seed",
         RunKind::Sync => "sync",
     };
+    let ops = |out: &mut Value, plan: &SyncPlan<Uuid>| {
+        out["municipality_ops"] = plan.municipality_ops.iter().map(municipality_op).collect();
+        out["school_ops"] = plan
+            .school_ops
+            .iter()
+            .map(|op| school_op(op, snapshot))
+            .collect();
+        out["reviews"] = plan.reviews.iter().map(review).collect();
+    };
     match outcome {
         SyncOutcome::NoChange => json!({ "kind": kind, "outcome": "no_change" }),
-        SyncOutcome::Abort { reason, counts } => json!({
-            "kind": kind, "outcome": "abort", "abort_reason": abort_reason_text(reason),
-            "counts": counts_json(counts),
-        }),
-        SyncOutcome::Apply(plan) => json!({
-            "kind": kind, "outcome": "apply", "counts": counts_json(&plan.counts),
-            "municipality_ops": plan.municipality_ops.iter().map(municipality_op).collect::<Vec<_>>(),
-            "school_ops": plan.school_ops.iter().map(|op| school_op(op, snapshot)).collect::<Vec<_>>(),
-            "reviews": plan.reviews.iter().map(review).collect::<Vec<_>>(),
-        }),
+        SyncOutcome::Abort { reason, counts } => {
+            let mut out = json!({
+                "kind": kind, "outcome": "abort", "abort_reason": abort_reason_text(reason),
+                "counts": counts_json(counts),
+            });
+            if let Some(plan) = stopped {
+                ops(&mut out, plan);
+            }
+            out
+        }
+        SyncOutcome::Apply(plan) => {
+            let mut out = json!({
+                "kind": kind, "outcome": "apply", "counts": counts_json(&plan.counts),
+            });
+            if let Some(reason) = accepted {
+                out["mass_change_accepted"] = json!(true);
+                out["abort_reason"] = json!(abort_reason_text(reason));
+            }
+            ops(&mut out, plan);
+            out
+        }
     }
 }

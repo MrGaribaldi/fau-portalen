@@ -44,7 +44,7 @@ async fn run(
         &testkit::inputs(&fixture_records(), &[], units, kind),
     ));
     let counts = apply_plan(&mut tx, &plan, at).await.unwrap();
-    record_applied(&mut tx, id, kind, &counts, at.now())
+    record_applied(&mut tx, id, kind, &counts, None, at.now())
         .await
         .unwrap();
     tx.commit().await.unwrap();

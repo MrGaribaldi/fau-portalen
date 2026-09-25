@@ -22,6 +22,31 @@ pub fn plan<Id: RowId>(
     snapshot: &RegisterSnapshot<Id>,
     inputs: &SyncInputs<'_>,
 ) -> SyncOutcome<Id> {
+    plan_with(snapshot, inputs, Breaker::Enforce)
+}
+
+/// [`plan`] without §5.3's mass-change breaker: the operator's `--accept-mass-change`
+/// (final review, item 4), once they have read what tripped it. Where `plan` would abort with
+/// `MassChange`, this returns the plan that was stopped; everything else, an empty source's
+/// abort included, is exactly what `plan` returns.
+pub fn plan_accepting_mass_change<Id: RowId>(
+    snapshot: &RegisterSnapshot<Id>,
+    inputs: &SyncInputs<'_>,
+) -> SyncOutcome<Id> {
+    plan_with(snapshot, inputs, Breaker::Accept)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Breaker {
+    Enforce,
+    Accept,
+}
+
+fn plan_with<Id: RowId>(
+    snapshot: &RegisterSnapshot<Id>,
+    inputs: &SyncInputs<'_>,
+    breaker: Breaker,
+) -> SyncOutcome<Id> {
     for (empty, source) in [
         (inputs.municipalities.is_empty(), "kartverket"),
         (inputs.units.is_empty(), "nsr"),
@@ -57,7 +82,7 @@ pub fn plan<Id: RowId>(
     );
     counts.attribute_losses = attribute_losses(snapshot, &schools.ops);
 
-    if inputs.kind == RunKind::Sync {
+    if inputs.kind == RunKind::Sync && breaker == Breaker::Enforce {
         if let Some(reason) = mass_change(snapshot, &counts) {
             return SyncOutcome::Abort { reason, counts };
         }
@@ -619,6 +644,52 @@ mod tests {
             }
             other => panic!("expected an abort, got {other:?}"),
         }
+    }
+
+    /// Final review, item 4: `--accept-mass-change` plans the same run without the mass-change
+    /// breaker: the plan it returns is the one the breaker stopped, counts included. An empty
+    /// source still aborts, and a run under the breaker plans exactly as `plan` does.
+    #[test]
+    fn accepting_a_mass_change_returns_the_plan_the_breaker_stopped() {
+        let (snapshot, units) = hundred_schools();
+        let units: Vec<NsrUnit> = units
+            .into_iter()
+            .enumerate()
+            .map(|(i, u)| if i < 3 { inactive(u) } else { u })
+            .collect();
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        let inputs = inputs(&records, &[], &units, RunKind::Sync);
+        let SyncOutcome::Abort { counts, .. } = super::plan(&snapshot, &inputs) else {
+            panic!("three of a hundred closing trips the breaker");
+        };
+        let accepted = applied(super::plan_accepting_mass_change(&snapshot, &inputs));
+        assert_eq!(accepted.counts, counts);
+        assert_eq!(accepted.school_ops.len(), 3);
+
+        let under = run_hundred(2, inactive, RunKind::Sync);
+        let (snapshot, units) = hundred_schools();
+        let units: Vec<NsrUnit> = units
+            .into_iter()
+            .enumerate()
+            .map(|(i, u)| if i < 2 { inactive(u) } else { u })
+            .collect();
+        assert_eq!(
+            super::plan_accepting_mass_change(
+                &snapshot,
+                &super::testkit::inputs(&records, &[], &units, RunKind::Sync)
+            ),
+            under
+        );
+        assert!(matches!(
+            super::plan_accepting_mass_change(
+                &snapshot,
+                &super::testkit::inputs(&records, &[], &[], RunKind::Sync)
+            ),
+            SyncOutcome::Abort {
+                reason: AbortReason::EmptySource { source: "nsr" },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -231,12 +231,14 @@ pub async fn record_aborted(
 /// An applied run, inside the transaction that applied it: the run row, one audit entry, and
 /// the mail. A seed sends one `register.seed_summary` with the counts rather than a mail per
 /// review item (Erik, 24 September 2026); a sync sends one `register.review_item` per item it
-/// wrote.
+/// wrote. `accepted_mass_change` is the breaker's abort that `--accept-mass-change` overrode:
+/// the audit entry then carries `mass_change_accepted: true` and the abort's text.
 pub async fn record_applied(
     conn: &mut PgConnection,
     run: Uuid,
     kind: RunKind,
     applied: &AppliedCounts,
+    accepted_mass_change: Option<&AbortReason>,
     finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
     let mut counts = counts_json(&applied.counts);
@@ -246,6 +248,10 @@ pub async fn record_applied(
 
     let mut params = counts.clone();
     params["kind"] = json!(kind_code(kind));
+    if let Some(reason) = accepted_mass_change {
+        params["mass_change_accepted"] = json!(true);
+        params["mass_change"] = json!(abort_reason_text(reason));
+    }
     sqlx::query(
         "insert into audit_events
            (id, tenant_id, actor_kind, action, subject_type, subject_id, occurred_at, params)

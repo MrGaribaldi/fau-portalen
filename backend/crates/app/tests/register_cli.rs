@@ -72,6 +72,12 @@ fn nsr_list() -> Value {
     })
 }
 
+fn rename_if_hosle(unit: &mut Value) {
+    if unit["Organisasjonsnummer"] == json!("974552124") {
+        unit["Navn"] = json!("Hosle barneskole");
+    }
+}
+
 /// The in-process sources. `empty_nsr` makes NSR answer with an empty list; `fail_detail`
 /// makes every NSR detail request answer 500 (controller hand-off: a mid-run source failure
 /// must still release the advisory lock); `ssb_queries` records every SSB `(from, to)`.
@@ -93,6 +99,9 @@ struct Sources {
     flaky_detail: Arc<Mutex<HashSet<String>>>,
     /// Every NSR detail request, by orgnr.
     detail_hits: Arc<Mutex<Vec<String>>>,
+    /// NSR calls Hosle skole "Hosle barneskole", in the list and the detail: one rename of
+    /// nine schools, which trips the 5% rename breaker.
+    rename_hosle: Arc<AtomicBool>,
 }
 
 impl Sources {
@@ -108,6 +117,8 @@ impl Sources {
         let flaky_detail = Arc::new(Mutex::new(HashSet::new()));
         let detail_hits = Arc::new(Mutex::new(Vec::new()));
         let (flaky, hits) = (flaky_detail.clone(), detail_hits.clone());
+        let rename_hosle = Arc::new(AtomicBool::new(false));
+        let (rename_list, rename_detail) = (rename_hosle.clone(), rename_hosle.clone());
         let (empty, queries) = (empty_nsr.clone(), ssb_queries.clone());
         let fail = fail_detail.clone();
         let (pause, entered, released) = (pause_kartverket.clone(), paused.clone(), resume.clone());
@@ -116,6 +127,7 @@ impl Sources {
                 "/nsr/v4/enheter",
                 get(move || {
                     let empty = empty.load(Ordering::SeqCst);
+                    let rename = rename_list.load(Ordering::SeqCst);
                     async move {
                         let body = if empty {
                             json!({
@@ -123,7 +135,13 @@ impl Sources {
                                 "TotaltAntallEnheter": 0, "EnhetListe": [],
                             })
                         } else {
-                            nsr_list()
+                            let mut list = nsr_list();
+                            if rename {
+                                for unit in list["EnhetListe"].as_array_mut().unwrap() {
+                                    rename_if_hosle(unit);
+                                }
+                            }
+                            list
                         };
                         serde_json::to_vec(&body).unwrap()
                     }
@@ -135,6 +153,7 @@ impl Sources {
                     let fail = fail.load(Ordering::SeqCst);
                     hits.lock().unwrap().push(orgnr.clone());
                     let flaky = flaky.lock().unwrap().remove(&orgnr);
+                    let rename = rename_detail.load(Ordering::SeqCst);
                     async move {
                         if fail {
                             return (StatusCode::INTERNAL_SERVER_ERROR, Vec::new());
@@ -143,6 +162,11 @@ impl Sources {
                             return (StatusCode::SERVICE_UNAVAILABLE, Vec::new());
                         }
                         match std::fs::read(format!("{FIXTURES}/nsr/enhet-{orgnr}.json")) {
+                            Ok(body) if rename => {
+                                let mut unit: Value = serde_json::from_slice(&body).unwrap();
+                                rename_if_hosle(&mut unit);
+                                (StatusCode::OK, serde_json::to_vec(&unit).unwrap())
+                            }
                             Ok(body) => (StatusCode::OK, body),
                             Err(_) => (StatusCode::NOT_FOUND, Vec::new()),
                         }
@@ -189,6 +213,7 @@ impl Sources {
             slow_kartverket_ms,
             flaky_detail,
             detail_hits,
+            rename_hosle,
         }
     }
 
@@ -908,4 +933,103 @@ async fn a_sync_blocked_on_a_lock_fails_with_database_timeout() {
             Some("database_timeout".into())
         )]
     );
+}
+
+/// Final review, item 4: a Sync the breaker aborts stays aborted without the flag; its dry
+/// run prints every op and review so the operator can see what tripped it, and still exits 3;
+/// with `--accept-mass-change` the same plan applies, and the run's audit entry says so.
+#[tokio::test]
+async fn accept_mass_change_applies_what_the_breaker_stopped() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    let env = sources.env(&db.register_url());
+    let seed = fau(&["sync", "--seed"], &env).await;
+    assert_eq!(seed.status.code(), Some(0), "{}", stderr(&seed));
+    sources.rename_hosle.store(true, Ordering::SeqCst);
+
+    let aborted = fau(&["sync"], &env).await;
+    assert_eq!(aborted.status.code(), Some(3), "{}", stderr(&aborted));
+
+    let dry = fau(&["sync", "--dry-run"], &env).await;
+    assert_eq!(dry.status.code(), Some(3), "{}", stderr(&dry));
+    let printed: Value = serde_json::from_slice(&dry.stdout).expect("the dry run prints JSON");
+    assert_eq!(printed["outcome"], json!("abort"));
+    assert_eq!(
+        printed["abort_reason"],
+        json!("mass_change:closes=0,renames=1,attribute_losses=0,active=9")
+    );
+    let renames: Vec<&Value> = printed["school_ops"]
+        .as_array()
+        .expect("an aborted dry run lists its ops")
+        .iter()
+        .filter(|op| op["op"] == json!("rename_school"))
+        .collect();
+    assert_eq!(renames.len(), 1, "{printed}");
+    assert_eq!(renames[0]["register_name"], json!("Hosle barneskole"));
+    assert!(printed["reviews"].is_array(), "{printed}");
+    assert!(printed["municipality_ops"].is_array(), "{printed}");
+
+    let accepted = fau(&["sync", "--accept-mass-change"], &env).await;
+    assert_eq!(accepted.status.code(), Some(0), "{}", stderr(&accepted));
+    assert!(
+        stderr(&accepted).contains("mass change accepted"),
+        "{}",
+        stderr(&accepted)
+    );
+    assert_eq!(
+        runs(&admin).await,
+        [
+            ("seed".into(), Some("applied".into()), None),
+            (
+                "sync".into(),
+                Some("aborted".into()),
+                Some("mass_change:closes=0,renames=1,attribute_losses=0,active=9".into())
+            ),
+            (
+                "dry_run".into(),
+                Some("no_change".into()),
+                Some("mass_change:closes=0,renames=1,attribute_losses=0,active=9".into())
+            ),
+            ("sync".into(), Some("applied".into()), None),
+        ]
+    );
+    let params: Value = sqlx::query_scalar(
+        "select a.params from audit_events a
+           join register_sync_runs r on r.id = a.subject_id
+          where r.kind = 'sync'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(params["mass_change_accepted"], json!(true), "{params}");
+    assert_eq!(
+        params["mass_change"],
+        json!("mass_change:closes=0,renames=1,attribute_losses=0,active=9")
+    );
+    let name: String =
+        sqlx::query_scalar("select register_name from schools where orgnr = '974552124'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(name, "Hosle barneskole");
+}
+
+/// The override is never honoured on a seed, which has no breaker: clap refuses the pair.
+#[tokio::test]
+async fn accept_mass_change_is_refused_on_a_seed() {
+    let db = TestDb::migrated().await;
+    let sources = Sources::start().await;
+    let out = fau(
+        &["sync", "--seed", "--accept-mass-change"],
+        &sources.env(&db.register_url()),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot be used with"),
+        "a conflict, not an unknown flag: {}",
+        stderr(&out)
+    );
+    assert!(runs(&db.admin_pool()).await.is_empty());
 }

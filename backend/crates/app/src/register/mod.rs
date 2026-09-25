@@ -30,6 +30,11 @@ pub(crate) enum RegisterCommand {
         /// The first run, on an empty register: creates every municipality and school.
         #[arg(long)]
         seed: bool,
+        /// Apply a plan the mass-change circuit breaker stopped (§5.3), once its dry run has
+        /// been read. Logged, and recorded in the run's audit entry. Never on a seed, which
+        /// has no breaker.
+        #[arg(long, conflicts_with = "seed")]
+        accept_mass_change: bool,
     },
     /// Print every pickable school as CSV on stdout, for the prospect register (#3431).
     Export,
@@ -64,7 +69,11 @@ pub(crate) fn run(command: RegisterCommand, service_version: &'static str) -> Ex
     let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for `register`");
     let exit = rt.block_on(async {
         match command {
-            RegisterCommand::Sync { dry_run, seed } => sync::sync(&config, dry_run, seed).await,
+            RegisterCommand::Sync {
+                dry_run,
+                seed,
+                accept_mass_change,
+            } => sync::sync(&config, dry_run, seed, accept_mass_change).await,
             RegisterCommand::Export => export::export(&config).await,
         }
     });

@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use fau_domain::register::source::NsrUnit;
-use fau_domain::register::sync::{plan, RunKind, SyncInputs, SyncOutcome, SyncPlan};
+use fau_domain::register::sync::{
+    plan, plan_accepting_mass_change, AbortReason, RunKind, SyncInputs, SyncOutcome, SyncPlan,
+};
 use fau_domain::time::Moment;
 use fau_persistence::register::{
     abort_reason_text, apply_plan, connect, load_snapshot, record_aborted, record_applied,
@@ -84,7 +86,12 @@ impl From<FetchError> for SyncError {
     }
 }
 
-pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> Exit {
+pub(super) async fn sync(
+    config: &RegisterConfig,
+    dry_run: bool,
+    seed: bool,
+    accept_mass_change: bool,
+) -> Exit {
     // The register's own rules, and `started_at`, run on this one instant. Every finish time
     // is read from the clock when the run actually finishes (final review, item 1).
     let at = Moment::at(Timestamp::now());
@@ -101,7 +108,19 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
         }
     };
     match begin(&mut conn, kind, dry_run, at).await {
-        Ok(Begun::Run(run)) => match execute(&mut conn, config, kind, dry_run, run, at).await {
+        Ok(Begun::Run(run)) => match execute(
+            &mut conn,
+            config,
+            Run {
+                id: run,
+                kind,
+                dry_run,
+                accept_mass_change,
+                at,
+            },
+        )
+        .await
+        {
             Ok(exit) => exit,
             Err(e) => {
                 tracing::error!(run_id = %run, error = %e, "register sync failed");
@@ -177,14 +196,29 @@ async fn begin(
     }
 }
 
+/// One started run: its row's id, and what the operator asked for.
+#[derive(Clone, Copy)]
+struct Run {
+    id: Uuid,
+    kind: RunKind,
+    dry_run: bool,
+    /// `--accept-mass-change`: a Sync's `MassChange` abort is applied instead.
+    accept_mass_change: bool,
+    at: Moment,
+}
+
 async fn execute(
     conn: &mut PgConnection,
     config: &RegisterConfig,
-    kind: RunKind,
-    dry_run: bool,
-    run: Uuid,
-    at: Moment,
+    run: Run,
 ) -> Result<Exit, SyncError> {
+    let Run {
+        id: run_id,
+        kind,
+        dry_run,
+        at,
+        ..
+    } = run;
     let ssb_from = match kind {
         RunKind::Seed => None,
         RunKind::Sync => Some(seed_date(conn).await?.ok_or(SyncError::NoSeed)?),
@@ -196,7 +230,7 @@ async fn execute(
     let fetched = fetch(client, &held, kind, ssb_from, at.today()).await?;
     if fetched.absent_from_list > 0 {
         tracing::warn!(
-            run_id = %run,
+            run_id = %run_id,
             count = fetched.absent_from_list,
             "register orgnrs absent from the NSR list are left untouched"
         );
@@ -215,26 +249,57 @@ async fn execute(
         .execute(&mut *tx)
         .await?;
     let snapshot = load_snapshot(&mut tx).await?;
-    let outcome = plan(&snapshot, &inputs);
+    let (outcome, accepted) = match plan(&snapshot, &inputs) {
+        SyncOutcome::Abort {
+            reason: reason @ AbortReason::MassChange { .. },
+            ..
+        } if run.accept_mass_change && kind == RunKind::Sync => {
+            tracing::warn!(
+                run_id = %run_id,
+                abort_reason = %abort_reason_text(&reason),
+                "mass change accepted by --accept-mass-change: applying the plan the breaker stopped"
+            );
+            (plan_accepting_mass_change(&snapshot, &inputs), Some(reason))
+        }
+        outcome => (outcome, None),
+    };
 
     if dry_run {
+        // An aborted mass change prints the plan it stopped, so the operator can see what
+        // tripped the breaker before deciding on --accept-mass-change.
+        let stopped = match &outcome {
+            SyncOutcome::Abort {
+                reason: AbortReason::MassChange { .. },
+                ..
+            } => match plan_accepting_mass_change(&snapshot, &inputs) {
+                SyncOutcome::Apply(plan) => Some(plan),
+                _ => None,
+            },
+            _ => None,
+        };
         println!(
             "{}",
-            serde_json::to_string_pretty(&plan_json(kind, &outcome, &snapshot))
-                .expect("a JSON value always serialises")
+            serde_json::to_string_pretty(&plan_json(
+                kind,
+                &outcome,
+                &snapshot,
+                stopped.as_ref(),
+                accepted.as_ref()
+            ))
+            .expect("a JSON value always serialises")
         );
         tx.rollback().await?;
         return Ok(match &outcome {
             SyncOutcome::Abort { reason, counts } => {
-                record_dry_run(conn, run, counts, Some(reason), Timestamp::now()).await?;
+                record_dry_run(conn, run_id, counts, Some(reason), Timestamp::now()).await?;
                 Exit::Aborted
             }
             SyncOutcome::Apply(plan) => {
-                record_dry_run(conn, run, &plan.counts, None, Timestamp::now()).await?;
+                record_dry_run(conn, run_id, &plan.counts, None, Timestamp::now()).await?;
                 Exit::Done
             }
             SyncOutcome::NoChange => {
-                record_dry_run(conn, run, &Default::default(), None, Timestamp::now()).await?;
+                record_dry_run(conn, run_id, &Default::default(), None, Timestamp::now()).await?;
                 Exit::Done
             }
         });
@@ -243,8 +308,8 @@ async fn execute(
     match outcome {
         SyncOutcome::NoChange => {
             tx.rollback().await?;
-            record_no_change(conn, run, Timestamp::now()).await?;
-            tracing::info!(run_id = %run, outcome = "no_change", "register sync finished");
+            record_no_change(conn, run_id, Timestamp::now()).await?;
+            tracing::info!(run_id = %run_id, outcome = "no_change", "register sync finished");
             Ok(Exit::Done)
         }
         SyncOutcome::Abort { reason, counts } => {
@@ -257,7 +322,7 @@ async fn execute(
             let mut record_tx = conn.begin().await?;
             if let Err(e) = record_aborted(
                 &mut record_tx,
-                run,
+                run_id,
                 kind,
                 &reason,
                 &counts,
@@ -270,20 +335,20 @@ async fn execute(
             }
             record_tx.commit().await?;
             tracing::error!(
-                run_id = %run,
+                run_id = %run_id,
                 abort_reason = %abort_reason_text(&reason),
                 "register sync aborted"
             );
             Ok(Exit::Aborted)
         }
         SyncOutcome::Apply(plan) => {
-            match apply_and_stage(&mut tx, &plan, fetched.units, run, kind, at).await {
+            match apply_and_stage(&mut tx, &plan, fetched.units, run, accepted.as_ref()).await {
                 Ok(applied) if applied.wrote_nothing() => {
                     // Every review deduplicated away and there was no op: nothing to keep.
                     tx.rollback().await?;
-                    record_no_change(conn, run, Timestamp::now()).await?;
+                    record_no_change(conn, run_id, Timestamp::now()).await?;
                     tracing::info!(
-                        run_id = %run,
+                        run_id = %run_id,
                         outcome = "no_change",
                         reviews_deduplicated = applied.deduplicated_reviews,
                         "register sync finished"
@@ -293,11 +358,12 @@ async fn execute(
                 Ok(applied) => {
                     tx.commit().await?;
                     tracing::info!(
-                        run_id = %run,
+                        run_id = %run_id,
                         outcome = "applied",
                         ops = applied.ops,
                         reviews_written = applied.new_reviews.len(),
                         reviews_deduplicated = applied.deduplicated_reviews,
+                        mass_change_accepted = accepted.is_some(),
                         "register sync finished"
                     );
                     Ok(Exit::Done)
@@ -324,11 +390,10 @@ async fn apply_and_stage(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     plan: &SyncPlan<Uuid>,
     units: Vec<(NsrUnit, Vec<u8>)>,
-    run: Uuid,
-    kind: RunKind,
-    at: Moment,
+    run: Run,
+    accepted_mass_change: Option<&AbortReason>,
 ) -> Result<AppliedCounts, RegisterError> {
-    let applied = apply_plan(tx, plan, at).await?;
+    let applied = apply_plan(tx, plan, run.at).await?;
     if applied.wrote_nothing() {
         return Ok(applied);
     }
@@ -336,7 +401,15 @@ async fn apply_and_stage(
         .into_iter()
         .map(|(unit, body)| NsrPayload::new(&unit, body))
         .collect();
-    stage_payloads(tx, &payloads, at).await?;
-    record_applied(tx, run, kind, &applied, Timestamp::now()).await?;
+    stage_payloads(tx, &payloads, run.at).await?;
+    record_applied(
+        tx,
+        run.id,
+        run.kind,
+        &applied,
+        accepted_mass_change,
+        Timestamp::now(),
+    )
+    .await?;
     Ok(applied)
 }

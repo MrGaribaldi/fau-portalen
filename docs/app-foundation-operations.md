@@ -270,6 +270,60 @@ default `cargo test` run; `--test-threads=1` matters for the acceptance test
 specifically, since its test functions each drive the same `fau-acceptance` project
 and would otherwise race each other's `up`/`down`.
 
+## The school register: `fau register sync` and `fau register export`
+
+`fau register sync` seeds the school register from NSR, Kartverket and SSB, and then keeps it in
+step with them (docs/school-register-design.md §5, #3441). `fau register export` prints the register's
+pickable schools as CSV for the prospect register (§9, #3431). Both run as `fau_register`, never as
+`fau_app`, and both log JSON lines on **stderr**: stdout carries only a dry run's plan or the CSV.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `REGISTER_DATABASE_URL` | yes | A `postgres://` URL for the `fau_register` role. Errors name the variable, never the value. |
+| `REGISTER_NSR_URL`, `REGISTER_KARTVERKET_URL`, `REGISTER_SSB_URL` | no | Base URLs that replace the public APIs, for tests. http or https, with a host and no userinfo. |
+| `LOG_LEVEL` | no | As for `serve`; `info` when unset. |
+
+| Command | What it does |
+| --- | --- |
+| `fau register sync --seed --dry-run` | Plans the first run and prints it as JSON. Writes only a `dry_run` row to `register_sync_runs`. |
+| `fau register sync --seed` | The first run, on an empty register. Refuses a register that already holds a municipality or a school. |
+| `fau register sync --dry-run` | Plans a sync and prints it. |
+| `fau register sync` | The weekly sync. Refuses an empty register. |
+| `fau register export > register.csv` | `school_id,orgnr,municipality_number,display_name,path,fau_orgnr`, one row per pickable school, ordered by municipality number and id. |
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Done: applied, nothing to change, a dry run printed, or the export written |
+| 1 | Failed: configuration, the database or a source. A started run is recorded as `failed`. |
+| 2 | Bad arguments |
+| 3 | Aborted by the planner: a source returned nothing, or the circuit breaker tripped (§5.3). The run is recorded as `aborted`, and `register.sync_aborted` is queued to `fau@ewb-solutions.as`. |
+| 4 | Another run holds the register's advisory lock (`0x4641553000003441`) |
+| 5 | Refused: `--seed` on a non-empty register, or a sync on an empty one |
+
+**Seeding an environment.** After `fau migrate`, run `fau register sync --seed --dry-run` and read
+the plan, then `fau register sync --seed` once. The seed sends one `register.seed_summary` mail; later
+syncs send one `register.review_item` per new review item. Seed in full before the first sync is
+scheduled: with fewer than 50 active schools, a single closure trips the 2% circuit breaker. The SSB
+lookback starts on the seed's date, so a sync on a register with no applied seed fails.
+
+**The weekly CronJob** belongs to #3424: `fau register sync`, Mondays 04:30 with
+`timeZone: Europe/Oslo`, `concurrencyPolicy: Forbid`, the same image, and egress to
+`data-nsr.udir.no`, `api.kartverket.no` and `data.ssb.no` (and `data.brreg.no` once part 5 reads
+Brreg). The advisory lock keeps a manual run and the CronJob apart as well. Each run leaves one
+`register_sync_runs` row, which is the alert source (#3442): `aborted` or `failed`, or a row with no
+`finished_at` from a run that died.
+
+Against the local Compose stack, from the host:
+
+```
+cd backend
+REGISTER_DATABASE_URL="postgres://fau_register:${FAU_REGISTER_PASSWORD:-fau_register}@localhost:${FAU_DB_PORT:-5433}/fau" \
+  cargo run -q -p fau-app --bin fau -- register sync --seed --dry-run
+```
+
+This calls the live public APIs. The test suites never do: `tests/register_cli.rs` serves the
+recorded fixtures from a local server instead.
+
 ## Port variables
 
 Every published port is parameterised, defaulting to what a plain checkout expects:

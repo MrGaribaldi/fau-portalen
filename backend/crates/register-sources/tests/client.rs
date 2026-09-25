@@ -293,6 +293,25 @@ async fn a_failed_bulk_download_leaves_no_dest_and_no_partial_file() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The rename is the last step: when it fails (here `dest` is a non-empty directory, which
+/// a file cannot replace), the `.partial` file is removed like on any other failure.
+#[tokio::test]
+async fn a_failed_final_rename_leaves_no_partial_file() {
+    let (c, hits) = client().await;
+    let dir = std::env::temp_dir().join(format!("fau-brreg-rename-test-{}", std::process::id()));
+    let dest = dir.join("enheter.json.gz");
+    std::fs::create_dir_all(dest.join("occupied")).unwrap();
+    let err = c.download_brreg_bulk(&dest).await.unwrap_err();
+    assert_eq!((err.source, err.kind), (Source::Brreg, SourceErrorKind::Io));
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the download itself ran");
+    assert!(
+        !dir.join("enheter.json.gz.partial").exists(),
+        "the partial file must not survive a failed rename"
+    );
+    assert!(dest.join("occupied").is_dir(), "dest is left as it was");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn an_unreachable_source_is_a_transport_error() {
     let dead = SourceUrls {

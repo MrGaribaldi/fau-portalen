@@ -42,7 +42,7 @@ enum Command {
     Serve,
     /// Apply pending migrations and exit.
     Migrate,
-    /// The school register (#3441): sync it from its public sources.
+    /// The school register (#3441): sync it from its public sources, or export it.
     Register {
         #[command(subcommand)]
         command: register::RegisterCommand,

@@ -180,8 +180,8 @@ impl SourceClient {
 
     /// Streams the gzipped bulk file to `dest` (about 210 MB) without holding it in memory.
     /// Written first to `dest` with `.partial` appended, renamed to `dest` only once the write
-    /// has flushed successfully. On any error the partial file is removed (best effort) and
-    /// `dest` is never created or overwritten.
+    /// has flushed successfully. On any error, the final rename's included, the partial file
+    /// is removed (best effort) and `dest` is never created or overwritten.
     pub async fn download_brreg_bulk(&self, dest: &Path) -> Result<u64, SourceError> {
         let url = format!("{}/enheter/lastned", self.urls.brreg);
         let transport = |_| SourceError::new(Source::Brreg, SourceErrorKind::Transport);
@@ -213,16 +213,19 @@ impl SourceClient {
             Ok(written)
         }
         .await;
-        match result {
-            Ok(written) => {
-                tokio::fs::rename(&partial, dest).await.map_err(io)?;
-                Ok(written)
-            }
-            Err(err) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                Err(err)
-            }
+        // The rename is the last step that can fail, so it is covered by the same cleanup:
+        // a `.partial` file never outlives a failed download (part 2's carried-over gap).
+        let result = match result {
+            Ok(written) => tokio::fs::rename(&partial, dest)
+                .await
+                .map(|()| written)
+                .map_err(io),
+            Err(err) => Err(err),
+        };
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&partial).await;
         }
+        result
     }
 }
 

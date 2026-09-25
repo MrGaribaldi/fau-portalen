@@ -1,6 +1,6 @@
-//! `fau register ...` (#3441, docs/school-register-design.md §5.1): the weekly sync and its
-//! seed. It runs as `fau_register` (D9), logs JSON to stderr, and keeps stdout for its own
-//! output.
+//! `fau register ...` (#3441, docs/school-register-design.md §5.1, §9): the weekly sync, its
+//! seed, and the export. It runs as `fau_register` (D9), logs JSON to stderr, and keeps
+//! stdout for its own output.
 //!
 //! Exit codes, which the CronJob (#3424) and an operator read:
 //! - 0: the run finished: applied, no change, or a dry run printed;
@@ -10,6 +10,7 @@
 //! - 4: another run holds the lock;
 //! - 5: refused: `--seed` on a register that is not empty, or a sync on an empty one.
 
+mod export;
 mod fetch;
 mod render;
 mod sync;
@@ -30,6 +31,8 @@ pub(crate) enum RegisterCommand {
         #[arg(long)]
         seed: bool,
     },
+    /// Print every pickable school as CSV on stdout, for the prospect register (#3431).
+    Export,
 }
 
 /// How a register command ended. The numbers are the process exit code.
@@ -62,6 +65,7 @@ pub(crate) fn run(command: RegisterCommand, service_version: &'static str) -> Ex
     let exit = rt.block_on(async {
         match command {
             RegisterCommand::Sync { dry_run, seed } => sync::sync(&config, dry_run, seed).await,
+            RegisterCommand::Export => export::export(&config).await,
         }
     });
     exit.into()

@@ -5,6 +5,7 @@
 
 mod apply;
 mod error;
+mod export;
 mod reviews;
 mod runs;
 mod school_ops;
@@ -14,6 +15,7 @@ mod staging;
 
 pub use apply::{apply_plan, AppliedCounts};
 pub use error::RegisterError;
+pub use export::{export_rows, ExportRow};
 pub use reviews::NewReview;
 pub use runs::{
     abort_reason_text, counts_json, record_aborted, record_applied, record_dry_run, record_failed,

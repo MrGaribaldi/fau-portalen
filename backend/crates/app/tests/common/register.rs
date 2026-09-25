@@ -75,3 +75,17 @@ pub async fn run_fau_register(args: &[&str], env: &[(&str, &str)]) -> std::proce
         .expect("fau register did not exit within a minute")
         .expect("run fau register")
 }
+
+/// As [`run_fau_register`], but returns the still-running child instead of waiting for it to
+/// exit -- for a test that needs to act while the process is in flight (e.g. pausing it at a
+/// controlled point via a fixture server, then breaking its database connection from the
+/// admin pool). Piped stdout/stderr and `kill_on_drop`, so a panicking test never leaves it
+/// behind; the caller collects the final output with `child.wait_with_output()`.
+pub fn spawn_fau_register(args: &[&str], env: &[(&str, &str)]) -> tokio::process::Child {
+    let mut cmd = super::fau_command("register", env);
+    cmd.args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.spawn().expect("spawn fau register")
+}

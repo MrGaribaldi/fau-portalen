@@ -21,7 +21,7 @@ use fau_register_sources::SourceError;
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
-use super::fetch::{fetch, source_urls};
+use super::fetch::{fetch, source_urls, FetchError};
 use super::render::plan_json;
 use super::Exit;
 use crate::config::RegisterConfig;
@@ -44,6 +44,11 @@ enum SyncError {
     /// schedule and can race a query issued right after (controller hand-off).
     #[error("apply error ({0})")]
     Apply(RegisterError),
+    /// One of the detail-fetch pool's workers panicked or was cancelled instead of returning
+    /// a [`SourceError`] -- see [`FetchError`]. Never the panic payload: whatever it was, it
+    /// stays inside the worker task tokio already isolated it to.
+    #[error("an internal detail-fetch worker panicked")]
+    WorkerPanicked,
     #[error("the register has no applied seed run to start the SSB lookback from")]
     NoSeed,
 }
@@ -56,6 +61,7 @@ impl SyncError {
             SyncError::Database(_) => "database_error",
             SyncError::Source(_) => "source_error",
             SyncError::Apply(_) => "apply_error",
+            SyncError::WorkerPanicked => "worker_panicked",
             SyncError::NoSeed => "no_seed",
         }
     }
@@ -64,6 +70,15 @@ impl SyncError {
 impl From<sqlx::Error> for SyncError {
     fn from(e: sqlx::Error) -> Self {
         SyncError::Database(e.into())
+    }
+}
+
+impl From<FetchError> for SyncError {
+    fn from(e: FetchError) -> Self {
+        match e {
+            FetchError::Source(e) => SyncError::Source(e),
+            FetchError::WorkerPanicked => SyncError::WorkerPanicked,
+        }
     }
 }
 
@@ -86,9 +101,12 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
             Ok(exit) => exit,
             Err(e) => {
                 tracing::error!(run_id = %run, error = %e, "register sync failed");
-                if let Err(record) = record_failed(&mut conn, run, e.code(), at).await {
-                    tracing::error!(run_id = %run, error = %record, "could not record the failure");
-                }
+                // `conn` -- and the lock it holds -- stays open, right here, for the rest of
+                // this call: only the write below uses a fresh connection (controller
+                // hand-off). If the apply failed because `conn` itself broke (an io error, or
+                // its backend killed, e.g. by a Postgres restart), reusing it to record the
+                // failure would fail the same way and leave the run row unfinished forever.
+                record_run_failure(config, run, e.code(), at).await;
                 Exit::Failed
             }
         },
@@ -97,6 +115,24 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
             tracing::error!(error = %e, "register sync failed before it started");
             Exit::Failed
         }
+    }
+}
+
+/// Records `run` as `failed`, on a brand-new connection -- never the one the failed run held
+/// (controller hand-off, see [`sync`]). If even this fresh connection cannot be made or
+/// cannot write, a fixed-text error goes to stderr and the caller still exits 1; the run row
+/// is then left unfinished for real, which is what #3442's alerting on a stuck run watches
+/// for.
+async fn record_run_failure(config: &RegisterConfig, run: Uuid, reason: &'static str, at: Moment) {
+    let mut fresh = match PgConnection::connect(config.database_url.expose()).await {
+        Ok(fresh) => fresh,
+        Err(_) => {
+            tracing::error!(run_id = %run, "could not connect to record the run as failed");
+            return;
+        }
+    };
+    if record_failed(&mut fresh, run, reason, at).await.is_err() {
+        tracing::error!(run_id = %run, "could not record the run as failed");
     }
 }
 
@@ -251,8 +287,10 @@ async fn execute(
                 Err(e) => {
                     // The apply transaction failed, possibly after some of its statements
                     // already ran: roll it back explicitly and await that rollback -- never
-                    // rely on `Transaction`'s drop glue -- before the caller reuses `conn` to
-                    // record the failure (controller hand-off).
+                    // rely on `Transaction`'s drop glue -- before `conn` is touched again (its
+                    // isolation-level setting, `begin`/`rollback` etc. are all on `conn`
+                    // itself, not the dead `tx`). The failure itself is then recorded on yet
+                    // another, fresh connection by `sync`'s caller (controller hand-off).
                     let _ = tx.rollback().await;
                     Err(SyncError::Apply(e))
                 }

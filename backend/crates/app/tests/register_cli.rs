@@ -13,11 +13,13 @@ use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
-use common::register::run_fau_register;
+use common::register::{listed_school, run_fau_register, spawn_fau_register};
 use common::TestDb;
 use fau_persistence::register::try_lock;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::sync::Notify;
+use uuid::Uuid;
 
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -73,11 +75,18 @@ fn nsr_list() -> Value {
 /// The in-process sources. `empty_nsr` makes NSR answer with an empty list; `fail_detail`
 /// makes every NSR detail request answer 500 (controller hand-off: a mid-run source failure
 /// must still release the advisory lock); `ssb_queries` records every SSB `(from, to)`.
+/// `pause_kartverket`/`paused`/`resume` let a test freeze the run right after it has fetched
+/// nothing yet but already inserted its run row and taken the lock (Kartverket is the first
+/// thing a seed fetches), so it can break the run's own database connection from outside at a
+/// known point rather than racing it.
 struct Sources {
     base: String,
     empty_nsr: Arc<AtomicBool>,
     fail_detail: Arc<AtomicBool>,
     ssb_queries: Arc<Mutex<Vec<(String, String)>>>,
+    pause_kartverket: Arc<AtomicBool>,
+    paused: Arc<Notify>,
+    resume: Arc<Notify>,
 }
 
 impl Sources {
@@ -85,8 +94,12 @@ impl Sources {
         let empty_nsr = Arc::new(AtomicBool::new(false));
         let fail_detail = Arc::new(AtomicBool::new(false));
         let ssb_queries = Arc::new(Mutex::new(Vec::new()));
+        let pause_kartverket = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
         let (empty, queries) = (empty_nsr.clone(), ssb_queries.clone());
         let fail = fail_detail.clone();
+        let (pause, entered, released) = (pause_kartverket.clone(), paused.clone(), resume.clone());
         let app = Router::new()
             .route(
                 "/nsr/v4/enheter",
@@ -122,7 +135,17 @@ impl Sources {
             )
             .route(
                 "/kv/fylkerkommuner",
-                get(|| async { fixture("kartverket/fylkerkommuner.json") }),
+                get(move || {
+                    let (pause, entered, released) =
+                        (pause.clone(), entered.clone(), released.clone());
+                    async move {
+                        if pause.load(Ordering::SeqCst) {
+                            entered.notify_one();
+                            released.notified().await;
+                        }
+                        fixture("kartverket/fylkerkommuner.json")
+                    }
+                }),
             )
             .route(
                 "/ssb/classifications/131/changes",
@@ -142,6 +165,9 @@ impl Sources {
             empty_nsr,
             fail_detail,
             ssb_queries,
+            pause_kartverket,
+            paused,
+            resume,
         }
     }
 
@@ -160,6 +186,12 @@ impl Sources {
 async fn fau(args: &[&str], env: &[(&'static str, String)]) -> std::process::Output {
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     run_fau_register(args, &env).await
+}
+
+/// As [`fau`], but spawns without waiting -- see [`spawn_fau_register`].
+fn fau_spawn(args: &[&str], env: &[(&'static str, String)]) -> tokio::process::Child {
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    spawn_fau_register(args, &env)
 }
 
 fn stderr(out: &std::process::Output) -> String {
@@ -426,10 +458,11 @@ async fn configuration_errors_name_the_variable_and_never_its_value() {
 }
 
 /// Controller hand-off on Task 4's review: the advisory lock is taken on a dedicated
-/// connection (`PgConnection::connect`), never a pooled one, so closing that connection on
-/// any exit path -- including a source failure well after the lock was taken -- releases the
-/// lock. A run that fails mid-fetch (NSR's detail endpoint answering 500) must not leave the
-/// next run finding the lock still held.
+/// connection (`PgConnection::connect`), never a pooled one. This proves the consequence, not
+/// anything the code does explicitly to release the lock: a run that fails mid-fetch (NSR's
+/// detail endpoint answering 500) exits, its process-local connection drops, and *that* --
+/// the connection closing, which running to completion (however it ends) always does -- is
+/// what releases the lock, so the next run does not find it still held.
 #[tokio::test]
 async fn a_run_that_fails_mid_fetch_releases_the_lock_for_the_next_one() {
     let db = TestDb::migrated().await;
@@ -469,12 +502,14 @@ async fn a_run_that_fails_mid_fetch_releases_the_lock_for_the_next_one() {
 
 /// Controller hand-off on Task 4's review: when the apply transaction itself fails -- here,
 /// `record_applied`'s own audit-event insert, denied by revoking the privilege fau_register
-/// otherwise has -- the run must be recorded as `failed` on a separate connection or
-/// transaction *after* the rollback, with a fixed reason code, never the database error's
-/// text. Proves both halves: the whole transaction (including the municipality/school rows
-/// `apply_plan` already wrote) rolls back, and the run row is still written correctly
-/// afterwards -- which only works if the rollback was awaited before `conn` was reused, not
-/// left to `Transaction`'s drop glue.
+/// otherwise has -- the run must be recorded as `failed` with a fixed reason code, never the
+/// database error's text, after the transaction is rolled back. Proves both halves: the whole
+/// transaction (including the municipality/school rows `apply_plan` already wrote) rolls
+/// back, and the run row is still written correctly afterwards -- which only works if the
+/// rollback was awaited before the connection used to record the failure was opened, not left
+/// to `Transaction`'s drop glue. The retried seed afterwards proves the lock is gone too, but
+/// that is the process exiting and its connection closing, same as any other run -- nothing
+/// this test does releases it explicitly.
 #[tokio::test]
 async fn an_apply_failure_rolls_back_and_records_a_fixed_reason() {
     let db = TestDb::migrated().await;
@@ -519,9 +554,159 @@ async fn an_apply_failure_rolls_back_and_records_a_fixed_reason() {
     assert_eq!(
         retried.status.code(),
         Some(0),
-        "the failed run's connection released the lock, and the register is still empty: {}",
+        "the failed run's process exited and its connection closed, so the lock is gone and \
+         the register is still empty: {}",
         stderr(&retried)
     );
     assert_eq!(count(&admin, "municipalities").await, 358);
     assert_eq!(count(&admin, "schools").await, 9);
+}
+
+/// Controller hand-off, fix round 1: when the run's own database connection breaks -- an io
+/// error, or its backend killed, e.g. by a Postgres restart -- recording it as `failed` must
+/// happen on a *fresh* connection, never the broken one, or the write fails too and the run
+/// row is left `started_at` set, `finished_at` null, forever (the CronJob's and #3442's
+/// alerting would never see it as done).
+///
+/// Paused right after the run has taken the lock and inserted its row (Kartverket is the
+/// first thing a seed fetches, so pausing there lands after `begin()` but before any other
+/// database work), so the backend can be killed from the admin pool at a known point instead
+/// of racing it. The kill lands before the run's next database operation (opening the apply
+/// transaction), which is what actually surfaces the break -- not literally inside
+/// `apply_plan` itself, but the same code path handles a break at either point identically.
+#[tokio::test]
+async fn a_connection_broken_after_the_run_row_exists_still_finishes_it_as_failed() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    let env = sources.env(&db.register_url());
+
+    sources.pause_kartverket.store(true, Ordering::SeqCst);
+    let child = fau_spawn(&["sync", "--seed"], &env);
+    sources.paused.notified().await;
+
+    // `pg_stat_activity` is cluster-wide, not scoped to this test's own database, so every
+    // condition here matters: without `datname`, this would terminate another concurrently
+    // running test's `fau_register` connection too.
+    sqlx::query(
+        "select pg_terminate_backend(pid) from pg_stat_activity
+          where usename = 'fau_register' and datname = $1 and pid <> pg_backend_pid()",
+    )
+    .bind(&db.name)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sources.resume.notify_one();
+
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("fau register did not exit within 30s after its connection was killed")
+        .expect("wait for fau register");
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{log}");
+    assert_eq!(
+        runs(&admin).await,
+        [(
+            "seed".into(),
+            Some("failed".into()),
+            Some("database_error".into())
+        )],
+        "the run row must still be finished -- on a fresh connection, since the one the run \
+         held is dead -- never left unfinished forever"
+    );
+    assert_eq!(count(&admin, "municipalities").await, 0);
+
+    // The dead connection's session, and the lock with it, is gone the moment Postgres
+    // notices the backend killed -- nothing this test does releases it explicitly. The pause
+    // is disarmed first, or the retried run's own Kartverket fetch would block forever on the
+    // same gate with nothing left to resume it.
+    sources.pause_kartverket.store(false, Ordering::SeqCst);
+    let retried = fau(&["sync", "--seed"], &env).await;
+    assert_eq!(retried.status.code(), Some(0), "{}", stderr(&retried));
+    assert_eq!(count(&admin, "municipalities").await, 358);
+    assert_eq!(count(&admin, "schools").await, 9);
+}
+
+/// Controller hand-off, fix round 1: `record_aborted` writes the run row and its
+/// `register.sync_aborted` mail as two statements, wrapped in one transaction so they commit
+/// together. Revoking `insert` on `outbox` from `fau_register` makes the second statement
+/// fail; the whole abort-recording transaction must then roll back rather than leave a run
+/// row with no mail, and the run must still end as `failed` with a fixed reason, on the
+/// pattern of `an_apply_failure_rolls_back_and_records_a_fixed_reason`.
+#[tokio::test]
+async fn an_abort_recording_failure_rolls_back_and_still_records_failed() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    sources.empty_nsr.store(true, Ordering::SeqCst);
+    let env = sources.env(&db.register_url());
+
+    sqlx::query("revoke insert on outbox from fau_register")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let out = fau(&["sync", "--seed"], &env).await;
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        runs(&admin).await,
+        [(
+            "seed".into(),
+            Some("failed".into()),
+            Some("database_error".into())
+        )],
+        "a fixed code, never the database error's own text"
+    );
+    assert_eq!(
+        count(&admin, "outbox").await,
+        0,
+        "the run row and its mail must commit together: neither one alone"
+    );
+    assert_eq!(count(&admin, "municipalities").await, 0);
+}
+
+/// Pins the exit code for a sync with no applied seed run to start its SSB lookback from --
+/// a register made non-empty directly (bypassing `--seed` entirely), so `register_is_empty`
+/// lets a plain `sync` proceed but `seed_date` finds no applied `seed` row.
+#[tokio::test]
+async fn a_sync_with_no_applied_seed_exits_1_with_a_fixed_reason() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    listed_school(&admin, Uuid::now_v7(), "Direkte Skole").await;
+    let sources = Sources::start().await;
+    let env = sources.env(&db.register_url());
+
+    let out = fau(&["sync"], &env).await;
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        runs(&admin).await,
+        [("sync".into(), Some("failed".into()), Some("no_seed".into()))]
+    );
+}
+
+/// Pins the exit code for a dry run whose plan would abort: `record_dry_run` always records
+/// `no_change` (a dry run changes nothing), carrying the would-be abort reason, but the
+/// process itself must still exit 3, the same code a real aborted run exits with.
+#[tokio::test]
+async fn a_dry_run_that_would_abort_exits_3() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    sources.empty_nsr.store(true, Ordering::SeqCst);
+
+    let out = fau(
+        &["sync", "--seed", "--dry-run"],
+        &sources.env(&db.register_url()),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert_eq!(
+        runs(&admin).await,
+        [(
+            "dry_run".into(),
+            Some("no_change".into()),
+            Some("empty_source:nsr".into())
+        )]
+    );
+    assert_eq!(count(&admin, "municipalities").await, 0);
 }

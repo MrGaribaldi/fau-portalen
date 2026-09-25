@@ -27,6 +27,18 @@ pub(super) struct Fetched {
     pub absent_from_list: usize,
 }
 
+/// A genuine source error, or one of [`DETAIL_FETCHES_IN_PARALLEL`]'s workers panicking (or
+/// being cancelled) instead of returning one. Either way the run must still record `failed`
+/// and exit normally -- never let the panic itself reach the top of the process and crash it
+/// with an unhandled exit code, leaving the run row unfinished.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum FetchError {
+    #[error(transparent)]
+    Source(#[from] SourceError),
+    #[error("an internal detail-fetch worker panicked")]
+    WorkerPanicked,
+}
+
 pub(super) fn source_urls(config: &RegisterConfig) -> SourceUrls {
     let base = |url: &Option<Url>, default: String| {
         url.as_ref()
@@ -52,7 +64,7 @@ pub(super) async fn fetch(
     kind: RunKind,
     ssb_from: Option<Date>,
     today: Date,
-) -> Result<Fetched, SourceError> {
+) -> Result<Fetched, FetchError> {
     let municipalities = client.municipalities().await?;
     let code_changes = match (kind, ssb_from) {
         (RunKind::Sync, Some(from)) => client.code_changes(from, today).await?,
@@ -90,11 +102,13 @@ pub(super) async fn fetch(
 }
 
 /// [`DETAIL_FETCHES_IN_PARALLEL`] workers draining one queue. The first error ends the run:
-/// a partial detail pass is never planned from (§5.3).
+/// a partial detail pass is never planned from (§5.3). A worker panicking (or being
+/// cancelled) is reported the same way, rather than panicking this task too -- see
+/// [`FetchError`].
 async fn details(
     client: Arc<SourceClient>,
     orgnrs: Vec<String>,
-) -> Result<Vec<(NsrUnit, Vec<u8>)>, SourceError> {
+) -> Result<Vec<(NsrUnit, Vec<u8>)>, FetchError> {
     let queue = Arc::new(Mutex::new(orgnrs.into_iter()));
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..DETAIL_FETCHES_IN_PARALLEL {
@@ -102,7 +116,14 @@ async fn details(
         workers.spawn(async move {
             let mut fetched = Vec::new();
             loop {
-                let next = queue.lock().expect("the detail queue lock").next();
+                // A previous worker panicking while holding this lock is not credible (the
+                // critical section is a plain iterator advance, nothing that can panic), but
+                // recovering a poisoned lock instead of `.expect`ing it is free, so it costs
+                // nothing to never add a second panic path here.
+                let next = queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .next();
                 let Some(orgnr) = next else {
                     return Ok::<_, SourceError>(fetched);
                 };
@@ -112,7 +133,11 @@ async fn details(
     }
     let mut all = Vec::new();
     while let Some(joined) = workers.join_next().await {
-        all.extend(joined.expect("a detail fetch worker panicked")?);
+        let items = match joined {
+            Ok(result) => result?,
+            Err(_join_error) => return Err(FetchError::WorkerPanicked),
+        };
+        all.extend(items);
     }
     all.sort_by(|a, b| a.0.orgnr.cmp(&b.0.orgnr));
     Ok(all)

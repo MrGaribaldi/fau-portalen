@@ -2693,3 +2693,11 @@ and an in-process fixture server. The agent's rulings, with the cost if wrong:
   - the database URL from a Secret;
   - an egress allowlist;
   - #3442 alerting on `outcome in ('aborted','failed')` and on runs left unfinished.
+- **Known gaps carried forward from the final review:**
+  - #3424's CronJob deadline must allow for retries. The worst case is about an hour; a normal run
+    takes about a minute.
+  - The ops doc should say that `--accept-mass-change` re-plans from live sources. It does not
+    apply the exact plan an earlier dry run showed.
+  - A dry run given `--accept-mass-change` records no abort reason.
+  - sqlx logs the value of an unrecognised query parameter in `REGISTER_DATABASE_URL`. That is not
+    the password, but the config could reject unknown parameters.

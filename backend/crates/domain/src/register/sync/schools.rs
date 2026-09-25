@@ -10,9 +10,11 @@ use crate::register::source::NsrUnit;
 use crate::time::{oslo_today, Moment};
 
 use super::municipalities::MunicipalityState;
+use super::similarity::{similarity, REREGISTRATION_THRESHOLD, SUBMISSION_MATCH_THRESHOLD};
 use super::types::{
-    ClosureReason, CreateVerification, Ref, RegisterSnapshot, ReviewItem, ReviewKind, RowId,
-    SchoolAttributes, SchoolOp, SchoolSnapshot, SchoolStatus, SlugChange, SyncInputs, Verification,
+    ClosureReason, CreateVerification, Origin, Ref, RegisterSnapshot, ReviewItem, ReviewKind,
+    RowId, SchoolAttributes, SchoolOp, SchoolSnapshot, SchoolStatus, SlugChange, SyncInputs,
+    Verification,
 };
 
 /// At most this many orgnrs are listed in one `unknown_municipality_number` item, so the
@@ -32,14 +34,20 @@ struct Closing<'a, Id> {
     school: &'a SchoolSnapshot<Id>,
     reason: ClosureReason,
     closed_on: Date,
+    /// See [`reregistrable`].
+    reregistrable: bool,
     successor: Option<Ref<Id>>,
 }
 
 /// A school with an FAU whose unit closed or left scope: reviewed, never closed (D8).
 struct FauClosing<'a, Id> {
     school: &'a SchoolSnapshot<Id>,
+    /// See [`reregistrable`].
+    reregistrable: bool,
     reason: ClosureReason,
     closed_on: Date,
+    /// A new unit in this run is its possible re-registration.
+    reregistered: bool,
 }
 
 /// An active, in-scope unit with no school, in a resolved municipality. Every candidate is
@@ -47,6 +55,18 @@ struct FauClosing<'a, Id> {
 struct Candidate<'a, Id> {
     unit: &'a NsrUnit,
     municipality: Ref<Id>,
+}
+
+/// How a candidate is created (§4.5).
+enum Placement {
+    /// Takes over a closing school's slug. `None` if that school had none.
+    Successor(Option<String>),
+    /// Held: a school with an FAU may be the same school.
+    HeldReregistration,
+    /// Held: a submitted school may be the same school.
+    HeldSubmission,
+    /// Listed, with a freshly minted slug.
+    Listed,
 }
 
 enum Resolved<Id> {
@@ -204,14 +224,17 @@ pub(super) fn plan_schools<Id: RowId>(
             if school.has_live_fau {
                 fau_closings.push(FauClosing {
                     school,
+                    reregistrable: reregistrable(unit),
                     reason,
                     closed_on,
+                    reregistered: false,
                 });
             } else {
                 closings.push(Closing {
                     school,
                     reason,
                     closed_on,
+                    reregistrable: reregistrable(unit),
                     successor: None,
                 });
             }
@@ -237,6 +260,25 @@ pub(super) fn plan_schools<Id: RowId>(
 
     let mut reviews = Vec::new();
 
+    // Re-registrations and submission matches first, so a successor gets its predecessor's
+    // slug before any rename can take it (§4.5).
+    let mut placements = Vec::with_capacity(candidates.len());
+    for (i, cand) in candidates.iter().enumerate() {
+        let me = Ref::New(new_number(i));
+        let placement = place(
+            cand,
+            me,
+            snapshot,
+            &mut closings,
+            &mut fau_closings,
+            &mut reviews,
+        );
+        if let Placement::Successor(Some(slug)) = &placement {
+            book.take(cand.municipality, slug, me);
+        }
+        placements.push(placement);
+    }
+
     let mut update_ops = Vec::new();
     for (school, unit, to) in updates {
         plan_update(school, unit, to, &mut book, &mut update_ops);
@@ -251,18 +293,27 @@ pub(super) fn plan_schools<Id: RowId>(
             successor: c.successor,
         })
         .collect();
-    for (i, cand) in candidates.iter().enumerate() {
+    for (i, (cand, placement)) in candidates.iter().zip(placements).enumerate() {
         let me = Ref::New(new_number(i));
         let attributes = SchoolAttributes::from_unit(cand.unit);
-        // A name with nothing sluggable gets no slug; D5 curation fixes it.
-        let slug = slugify(&cand.unit.name).ok().map(|base| {
-            book.mint(
-                cand.municipality,
-                &base,
-                attributes.post_town.as_deref(),
-                me,
-            )
-        });
+        let (verification, slug) = match placement {
+            Placement::Successor(Some(slug)) => (CreateVerification::Listed, Some(slug)),
+            Placement::HeldReregistration | Placement::HeldSubmission => {
+                (CreateVerification::Held, None)
+            }
+            Placement::Successor(None) | Placement::Listed => (
+                CreateVerification::Listed,
+                // A name with nothing sluggable gets no slug; D5 curation fixes it.
+                slugify(&cand.unit.name).ok().map(|base| {
+                    book.mint(
+                        cand.municipality,
+                        &base,
+                        attributes.post_town.as_deref(),
+                        me,
+                    )
+                }),
+            ),
+        };
         ops.push(SchoolOp::Create {
             new: new_number(i),
             municipality: cand.municipality,
@@ -270,7 +321,7 @@ pub(super) fn plan_schools<Id: RowId>(
             register_name: cand.unit.name.clone(),
             display_name: cand.unit.name.clone(),
             slug,
-            verification: CreateVerification::Listed,
+            verification,
             // Only an in-scope unit becomes a candidate.
             in_scope: true,
             attributes,
@@ -280,18 +331,20 @@ pub(super) fn plan_schools<Id: RowId>(
     ops.extend(update_ops);
 
     for f in &fau_closings {
-        reviews.push(ReviewItem {
-            kind: ReviewKind::ClosureWithFau,
-            school: Some(Ref::Existing(f.school.id)),
-            other_school: None,
-            municipality: Some(Ref::Existing(f.school.municipality_id)),
-            details: vec![
-                ("orgnr", f.school.orgnr.clone().unwrap_or_default()),
-                ("name", f.school.display_name.clone()),
-                ("reason", f.reason.code().to_owned()),
-                ("closed_on", f.closed_on.to_string()),
-            ],
-        });
+        if !f.reregistered {
+            reviews.push(ReviewItem {
+                kind: ReviewKind::ClosureWithFau,
+                school: Some(Ref::Existing(f.school.id)),
+                other_school: None,
+                municipality: Some(Ref::Existing(f.school.municipality_id)),
+                details: vec![
+                    ("orgnr", f.school.orgnr.clone().unwrap_or_default()),
+                    ("name", f.school.display_name.clone()),
+                    ("reason", f.reason.code().to_owned()),
+                    ("closed_on", f.closed_on.to_string()),
+                ],
+            });
+        }
     }
     for (number, orgnrs) in unknown {
         reviews.push(ReviewItem {
@@ -345,6 +398,124 @@ fn closure_facts(unit: &NsrUnit, at: Moment) -> (ClosureReason, Date) {
         .map(oslo_today)
         .unwrap_or_else(|| at.today());
     (reason, closed_on)
+}
+
+/// §4.5: only a unit closed as "Slettet for sammenslåing" (F) or "Slettet" (S) can have
+/// re-registered under a new number.
+fn reregistrable(unit: &NsrUnit) -> bool {
+    !unit.is_active
+        && unit
+            .closure
+            .as_ref()
+            .is_some_and(|c| c.code == "F" || c.code == "S")
+}
+
+/// §4.5: a re-registration of a school closing in this run, else a possible match with a
+/// submitted school, else an ordinary listed school.
+fn place<Id: RowId>(
+    cand: &Candidate<'_, Id>,
+    me: Ref<Id>,
+    snapshot: &RegisterSnapshot<Id>,
+    closings: &mut [Closing<'_, Id>],
+    fau_closings: &mut [FauClosing<'_, Id>],
+    reviews: &mut Vec<ReviewItem<Id>>,
+) -> Placement {
+    let name = cand.unit.name.as_str();
+    let in_municipality =
+        |s: &SchoolSnapshot<Id>| Ref::Existing(s.municipality_id) == cand.municipality;
+
+    let best_closing = best(
+        closings
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.reregistrable && c.successor.is_none() && in_municipality(c.school)),
+        |(_, c)| similarity(&c.school.display_name, name),
+        REREGISTRATION_THRESHOLD,
+    );
+    let best_fau = best(
+        fau_closings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.reregistrable && !f.reregistered && in_municipality(f.school)),
+        |(_, f)| similarity(&f.school.display_name, name),
+        REREGISTRATION_THRESHOLD,
+    );
+    // The more similar predecessor wins; on a tie, the one with an FAU, which a human sees.
+    let pick_fau = match (&best_closing, &best_fau) {
+        (Some((_, c)), Some((_, f))) => f >= c,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if pick_fau {
+        let ((i, _), sim) = best_fau.expect("pick_fau implies a match");
+        let f = &mut fau_closings[i];
+        f.reregistered = true;
+        reviews.push(ReviewItem {
+            kind: ReviewKind::PossibleReregistration,
+            school: Some(Ref::Existing(f.school.id)),
+            other_school: Some(me),
+            municipality: Some(cand.municipality),
+            details: vec![
+                ("old_orgnr", f.school.orgnr.clone().unwrap_or_default()),
+                ("new_orgnr", cand.unit.orgnr.clone()),
+                ("old_name", f.school.display_name.clone()),
+                ("new_name", cand.unit.name.clone()),
+                ("similarity", format!("{sim:.2}")),
+            ],
+        });
+        return Placement::HeldReregistration;
+    }
+    if let Some(((i, _), _)) = best_closing {
+        let c = &mut closings[i];
+        c.successor = Some(me);
+        return Placement::Successor(c.school.slug.clone());
+    }
+
+    let submitted = best(
+        snapshot.schools.iter().filter(|s| {
+            s.origin == Origin::Submitted
+                && s.status == SchoolStatus::Active
+                && matches!(
+                    s.verification,
+                    Verification::Pending | Verification::Verified
+                )
+                && in_municipality(s)
+        }),
+        |s| similarity(&s.display_name, name),
+        SUBMISSION_MATCH_THRESHOLD,
+    );
+    if let Some((p, sim)) = submitted {
+        reviews.push(ReviewItem {
+            kind: ReviewKind::PossibleSubmissionMatch,
+            school: Some(Ref::Existing(p.id)),
+            other_school: Some(me),
+            municipality: Some(cand.municipality),
+            details: vec![
+                ("orgnr", cand.unit.orgnr.clone()),
+                ("register_name", cand.unit.name.clone()),
+                ("submitted_name", p.display_name.clone()),
+                ("similarity", format!("{sim:.2}")),
+            ],
+        });
+        return Placement::HeldSubmission;
+    }
+    Placement::Listed
+}
+
+/// The most similar item at or above `threshold`; the first one on a tie.
+fn best<T>(
+    items: impl Iterator<Item = T>,
+    score: impl Fn(&T) -> f32,
+    threshold: f32,
+) -> Option<(T, f32)> {
+    let mut found: Option<(T, f32)> = None;
+    for item in items {
+        let s = score(&item);
+        if s >= threshold && found.as_ref().is_none_or(|(_, best)| s > *best) {
+            found = Some((item, s));
+        }
+    }
+    found
 }
 
 /// A continuing school: rename, new attributes, and a move between municipality entities.
@@ -418,7 +589,8 @@ mod tests {
     use jiff::civil::date;
 
     use super::super::testkit::{
-        address, at, fixture_records, fixture_units, gran_canaria, hosle, inputs, school, ts, unit,
+        address, at, fixture_records, fixture_units, gran_canaria, hosle, inputs, school,
+        stange_new, stange_old, ts, unit,
     };
     use super::super::types::RunKind;
     use super::*;
@@ -993,5 +1165,295 @@ mod tests {
             &baerum(),
         );
         assert_eq!(slugs(&plan), [("900000010".into(), Ref::Existing(1), None)]);
+    }
+
+    /// Stange is municipality 20 in these tests.
+    fn stange() -> MunicipalityState<u32> {
+        state(&[("3413", Ref::Existing(20))])
+    }
+
+    fn stange_row(has_live_fau: bool) -> SchoolSnapshot<u32> {
+        SchoolSnapshot {
+            has_live_fau,
+            ..school(30, 20, &stange_old(), "stange-ungdomsskole")
+        }
+    }
+
+    fn stange_create(slug: Option<&str>, verification: CreateVerification) -> SchoolOp<u32> {
+        SchoolOp::Create {
+            new: 0,
+            municipality: Ref::Existing(20),
+            orgnr: "933181995".into(),
+            register_name: "Stange ungdomsskole".into(),
+            display_name: "Stange ungdomsskole".into(),
+            slug: slug.map(str::to_owned),
+            verification,
+            in_scope: true,
+            attributes: SchoolAttributes::from_unit(&stange_new()),
+            source_changed_at: Some(ts("2026-09-13T01:19:29.99Z")),
+        }
+    }
+
+    #[test]
+    fn a_reregistration_without_an_fau_hands_over_the_slug() {
+        // 975270920 closed as "Slettet for sammenslåing" on 25 August 2024; 933181995 is the
+        // same school under a new number.
+        let plan = run(
+            &with_schools(vec![stange_row(false)]),
+            &[stange_old(), stange_new()],
+            &stange(),
+        );
+        assert_eq!(
+            plan.ops,
+            [
+                SchoolOp::Close {
+                    id: 30,
+                    reason: ClosureReason::Merged,
+                    closed_on: date(2024, 8, 25),
+                    successor: Some(Ref::New(0)),
+                },
+                stange_create(Some("stange-ungdomsskole"), CreateVerification::Listed),
+            ]
+        );
+        assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+    }
+
+    #[test]
+    fn a_reregistration_with_an_fau_is_held_for_review() {
+        let plan = run(
+            &with_schools(vec![stange_row(true)]),
+            &[stange_old(), stange_new()],
+            &stange(),
+        );
+        assert_eq!(
+            plan.ops,
+            [stange_create(None, CreateVerification::Held)],
+            "no close, and a held row has no slug"
+        );
+        assert_eq!(
+            plan.reviews,
+            [ReviewItem {
+                kind: ReviewKind::PossibleReregistration,
+                school: Some(Ref::Existing(30)),
+                other_school: Some(Ref::New(0)),
+                municipality: Some(Ref::Existing(20)),
+                details: vec![
+                    ("old_orgnr", "975270920".into()),
+                    ("new_orgnr", "933181995".into()),
+                    ("old_name", "Stange ungdomsskole".into()),
+                    ("new_name", "Stange ungdomsskole".into()),
+                    ("similarity", "1.00".into()),
+                ],
+            }],
+            "instead of closure_with_fau"
+        );
+    }
+
+    #[test]
+    fn an_fau_school_that_only_left_scope_is_no_reregistration() {
+        // Still active in NSR, but marked out of scope: the new unit is its own school.
+        let out = SchoolSnapshot {
+            scope_override: Some(false),
+            ..stange_row(true)
+        };
+        let still_active_old = NsrUnit {
+            is_active: true,
+            closure: None,
+            ..stange_old()
+        };
+        let plan = run(
+            &with_schools(vec![out]),
+            &[still_active_old, stange_new()],
+            &stange(),
+        );
+        assert_eq!(
+            plan.ops,
+            [stange_create(
+                Some("stange-ungdomsskole-stange"),
+                CreateVerification::Listed
+            )],
+            "the FAU school keeps its slug, so the new one takes its post town"
+        );
+        assert_eq!(plan.reviews.len(), 1);
+        assert_eq!(plan.reviews[0].kind, ReviewKind::ClosureWithFau);
+        assert_eq!(
+            plan.reviews[0].details[2],
+            ("reason", "out_of_scope".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_closing_school_below_the_threshold_gets_no_successor() {
+        // similarity("Stange skole", "Stange ungdomsskole") is 0.5238, below 0.6.
+        let old = SchoolSnapshot {
+            display_name: "Stange skole".into(),
+            register_name: Some("Stange skole".into()),
+            ..school(30, 20, &stange_old(), "stange-skole")
+        };
+        let old_unit = NsrUnit {
+            name: "Stange skole".into(),
+            ..stange_old()
+        };
+        let plan = run(
+            &with_schools(vec![old]),
+            &[old_unit, stange_new()],
+            &stange(),
+        );
+        assert_eq!(
+            plan.ops,
+            [
+                SchoolOp::Close {
+                    id: 30,
+                    reason: ClosureReason::Merged,
+                    closed_on: date(2024, 8, 25),
+                    successor: None,
+                },
+                stange_create(Some("stange-ungdomsskole"), CreateVerification::Listed),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_an_f_or_s_closure_is_a_reregistration() {
+        let closed_as = |code: &str| NsrUnit {
+            closure: Some(NsrClosure {
+                code: code.into(),
+                at: Some(ts("2024-08-25T01:15:10.91Z")),
+            }),
+            ..stange_old()
+        };
+        let successor = |plan: &SchoolPlan<u32>| match &plan.ops[0] {
+            SchoolOp::Close { successor, .. } => *successor,
+            other => panic!("expected a close first, got {other:?}"),
+        };
+        for code in ["F", "S"] {
+            let plan = run(
+                &with_schools(vec![stange_row(false)]),
+                &[closed_as(code), stange_new()],
+                &stange(),
+            );
+            assert_eq!(successor(&plan), Some(Ref::New(0)), "{code}");
+        }
+        for code in ["D", "N", "O", "U"] {
+            let plan = run(
+                &with_schools(vec![stange_row(false)]),
+                &[closed_as(code), stange_new()],
+                &stange(),
+            );
+            assert_eq!(successor(&plan), None, "{code}");
+            assert_eq!(
+                plan.ops[1],
+                stange_create(Some("stange-ungdomsskole"), CreateVerification::Listed),
+                "a fresh mint: the closing school released the slug"
+            );
+
+            let plan = run(
+                &with_schools(vec![stange_row(true)]),
+                &[closed_as(code), stange_new()],
+                &stange(),
+            );
+            assert_eq!(
+                plan.ops,
+                [stange_create(
+                    Some("stange-ungdomsskole-stange"),
+                    CreateVerification::Listed
+                )],
+                "{code}: the FAU school is reviewed and keeps its slug"
+            );
+            assert_eq!(plan.reviews[0].kind, ReviewKind::ClosureWithFau);
+        }
+    }
+
+    fn fornebu_submission(verification: Verification, municipality_id: u32) -> SchoolSnapshot<u32> {
+        SchoolSnapshot {
+            id: 40,
+            municipality_id,
+            origin: Origin::Submitted,
+            orgnr: None,
+            register_name: None,
+            display_name: "Fornebu".into(),
+            display_name_curated: false,
+            slug: None,
+            verification,
+            status: SchoolStatus::Active,
+            in_scope: true,
+            scope_override: None,
+            has_live_fau: true,
+            attributes: SchoolAttributes::default(),
+        }
+    }
+
+    #[test]
+    fn a_unit_similar_to_a_submitted_school_is_held() {
+        // similarity("Fornebu", "Fornebu skole") is 0.5714: at least 0.45.
+        let fornebu = unit("900000011", "Fornebu skole", "3201");
+        for verification in [Verification::Pending, Verification::Verified] {
+            let plan = run(
+                &with_schools(vec![fornebu_submission(verification, 1)]),
+                std::slice::from_ref(&fornebu),
+                &baerum(),
+            );
+            assert_eq!(slugs(&plan), [("900000011".into(), Ref::Existing(1), None)]);
+            assert!(matches!(
+                plan.ops[0],
+                SchoolOp::Create {
+                    verification: CreateVerification::Held,
+                    ..
+                }
+            ));
+            assert_eq!(
+                plan.reviews,
+                [ReviewItem {
+                    kind: ReviewKind::PossibleSubmissionMatch,
+                    school: Some(Ref::Existing(40)),
+                    other_school: Some(Ref::New(0)),
+                    municipality: Some(Ref::Existing(1)),
+                    details: vec![
+                        ("orgnr", "900000011".into()),
+                        ("register_name", "Fornebu skole".into()),
+                        ("submitted_name", "Fornebu".into()),
+                        ("similarity", "0.57".into()),
+                    ],
+                }],
+                "{verification:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_submission_match_needs_the_same_municipality_a_live_submission_and_the_threshold() {
+        let listed = |plan: &SchoolPlan<u32>| {
+            plan.reviews.is_empty()
+                && matches!(
+                    plan.ops[..],
+                    [SchoolOp::Create {
+                        verification: CreateVerification::Listed,
+                        ..
+                    }]
+                )
+        };
+        let fornebu = unit("900000011", "Fornebu skole", "3201");
+        let elsewhere = fornebu_submission(Verification::Pending, 2);
+        let rejected = fornebu_submission(Verification::Rejected, 1);
+        for row in [elsewhere, rejected] {
+            let plan = run(
+                &with_schools(vec![row]),
+                std::slice::from_ref(&fornebu),
+                &baerum(),
+            );
+            assert!(listed(&plan), "{plan:?}");
+        }
+        // similarity("Lerberg skole", "Lerberg skole og kompetansesenter") is 0.4118.
+        let lerberg_submitted = SchoolSnapshot {
+            display_name: "Lerberg skole".into(),
+            ..fornebu_submission(Verification::Pending, 1)
+        };
+        let lerberg = unit("998516897", "Lerberg skole og kompetansesenter", "3201");
+        let plan = run(
+            &with_schools(vec![lerberg_submitted]),
+            &[lerberg],
+            &baerum(),
+        );
+        assert!(listed(&plan), "{plan:?}");
     }
 }

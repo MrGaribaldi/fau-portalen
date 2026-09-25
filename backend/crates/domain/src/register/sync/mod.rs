@@ -394,7 +394,7 @@ mod tests {
                 register_name: "Spjelkavik skule".into(),
                 display_name: Some("Spjelkavik skule".into()),
                 slug: Some(SlugChange {
-                    old: "spjelkavik-barneskule".into(),
+                    old: Some("spjelkavik-barneskule".into()),
                     new: "spjelkavik-skule".into(),
                 }),
             }]

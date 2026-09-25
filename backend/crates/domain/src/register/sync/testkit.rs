@@ -558,7 +558,8 @@ pub(super) fn apply(
                 if let Some(SlugChange { old, new }) = slug {
                     s.slug = Some(new.clone());
                     let m = s.municipality_id;
-                    out.school_slug_history.push((m, old.clone(), *id));
+                    out.school_slug_history
+                        .extend(old.clone().map(|old| (m, old, *id)));
                 }
             }
             SchoolOp::UpdateAttributes { id, attributes } => {
@@ -569,7 +570,8 @@ pub(super) fn apply(
                 s.municipality_id = municipality_id(to);
                 if let Some(SlugChange { old, new }) = slug {
                     s.slug = Some(new.clone());
-                    out.school_slug_history.push((*from, old.clone(), *id));
+                    out.school_slug_history
+                        .extend(old.clone().map(|old| (*from, old, *id)));
                 }
             }
         }

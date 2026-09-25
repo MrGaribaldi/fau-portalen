@@ -252,10 +252,11 @@ pub enum MunicipalityOp<Id> {
     },
 }
 
-/// A slug moving into history (§6, "Immutability and history").
+/// A school's slug changing (§6, "Immutability and history"). `old` goes into history; it is
+/// `None` when a school without a slug gets its first one, which writes no history row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlugChange {
-    pub old: String,
+    pub old: Option<String>,
     pub new: String,
 }
 

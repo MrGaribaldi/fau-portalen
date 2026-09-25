@@ -261,9 +261,8 @@ pub(super) fn plan_schools<Id: RowId>(
     let mut reviews = Vec::new();
 
     // Re-registrations and submission matches first, so a successor gets its predecessor's
-    // slug before any rename can take it (§4.5). Every candidate is assigned at once (fix
-    // round 1: a global best match, not whichever candidate the old per-unit `place` happened
-    // to see first).
+    // slug before any rename can take it (§4.5). Every candidate is assigned at once, by a
+    // global best match rather than in input order.
     let placements = place_all(
         &candidates,
         snapshot,
@@ -414,22 +413,22 @@ enum PredKind {
     Fau(usize),
 }
 
-/// §4.5, fix round 1: assign every candidate a re-registration, a submission match, or a plain
-/// listing, all at once. Every (candidate, predecessor) pair at or above
+/// §4.5: assign every candidate a re-registration, a submission match, or a plain listing, all
+/// at once. Every (candidate, predecessor) pair at or above
 /// `REREGISTRATION_THRESHOLD`, in the same municipality, competes globally: sorted by
 /// similarity descending, then the candidate's orgnr, then — for a tie on both — the FAU
 /// predecessor before a non-FAU one (the existing preference, since a human sees it either
-/// way), then the predecessor's own orgnr. Assigning in that order and taking each candidate's
+/// way), then the predecessor's own orgnr and id. Assigning in that order and taking each candidate's
 /// and each closing predecessor's *first* (i.e. best) match makes predecessor assignment
 /// independent of input order; `plan()` normalises `inputs.units`'s order for everything else
 /// (create order, `Ref::New` numbering and slug minting).
 ///
-/// A closing (non-FAU) predecessor gives its slug and successor link to its single best match;
-/// any other candidate that also matched it gets nothing from it (§4.5 rule 1, one successor
-/// per closing school). An FAU predecessor is never closed, so it is never "used up": every
-/// candidate that matches one, at or above the threshold, is held and reviewed on its own
-/// account, even when a *different*, higher-priority candidate already claimed the same FAU
-/// predecessor (§4.5 rule 2 -- a split against a live FAU is several reviews, not one).
+/// A closing (non-FAU) predecessor gives its slug and successor link to its single best match
+/// and closes as `Merged`; any other candidate that also matched it gets nothing from it (one
+/// successor per closing school). An FAU predecessor is never closed (D8), so it is never
+/// "used up": every candidate that matches one, at or above the threshold, is held and
+/// reviewed on its own account, even when a different, higher-priority candidate already
+/// claimed the same FAU predecessor (a split against a live FAU is several reviews, not one).
 fn place_all<Id: RowId>(
     candidates: &[Candidate<'_, Id>],
     snapshot: &RegisterSnapshot<Id>,
@@ -446,7 +445,7 @@ fn place_all<Id: RowId>(
         let name = cand.unit.name.as_str();
         for (j, c) in closings.iter().enumerate() {
             if c.reregistrable && in_municipality(cand, c.school.municipality_id) {
-                let sim = similarity(&c.school.display_name, name);
+                let sim = name_similarity(c.school, name);
                 if sim >= REREGISTRATION_THRESHOLD {
                     matches.push((i, PredKind::Closing(j), sim));
                 }
@@ -454,7 +453,7 @@ fn place_all<Id: RowId>(
         }
         for (k, f) in fau_closings.iter().enumerate() {
             if f.reregistrable && in_municipality(cand, f.school.municipality_id) {
-                let sim = similarity(&f.school.display_name, name);
+                let sim = name_similarity(f.school, name);
                 if sim >= REREGISTRATION_THRESHOLD {
                     matches.push((i, PredKind::Fau(k), sim));
                 }
@@ -462,11 +461,12 @@ fn place_all<Id: RowId>(
         }
     }
 
-    let pred_orgnr = |pred: &PredKind| -> &str {
-        match *pred {
-            PredKind::Closing(j) => closings[j].school.orgnr.as_deref().unwrap_or(""),
-            PredKind::Fau(k) => fau_closings[k].school.orgnr.as_deref().unwrap_or(""),
-        }
+    let pred_key = |pred: &PredKind| -> (&str, Id) {
+        let school = match *pred {
+            PredKind::Closing(j) => closings[j].school,
+            PredKind::Fau(k) => fau_closings[k].school,
+        };
+        (school.orgnr.as_deref().unwrap_or(""), school.id)
     };
     matches.sort_by(|a, b| {
         b.2.partial_cmp(&a.2)
@@ -477,7 +477,7 @@ fn place_all<Id: RowId>(
                 let b_fau = matches!(b.1, PredKind::Fau(_));
                 b_fau.cmp(&a_fau)
             })
-            .then_with(|| pred_orgnr(&a.1).cmp(pred_orgnr(&b.1)))
+            .then_with(|| pred_key(&a.1).cmp(&pred_key(&b.1)))
     });
 
     let mut placement: Vec<Option<Placement>> = (0..candidates.len()).map(|_| None).collect();
@@ -494,6 +494,8 @@ fn place_all<Id: RowId>(
                 closing_claimed.insert(j);
                 let me = Ref::New(new_number(unit_i));
                 closings[j].successor = Some(me);
+                // §4.5: a re-registration's predecessor closes as merged, whatever NSR's code.
+                closings[j].reason = ClosureReason::Merged;
                 placement[unit_i] = Some(Placement::Successor(closings[j].school.slug.clone()));
             }
             PredKind::Fau(k) => {
@@ -519,7 +521,8 @@ fn place_all<Id: RowId>(
         }
     }
 
-    // Submission matching, for every candidate that got no predecessor above (§4.5 rule 3).
+    // Submission matching, for every candidate that got no predecessor above (§4.5). Only a
+    // submission that has no orgnr yet can be the unit.
     for (i, cand) in candidates.iter().enumerate() {
         if placement[i].is_some() {
             continue;
@@ -529,6 +532,7 @@ fn place_all<Id: RowId>(
         let submitted = best(
             snapshot.schools.iter().filter(|s| {
                 s.origin == Origin::Submitted
+                    && s.orgnr.is_none()
                     && s.status == SchoolStatus::Active
                     && matches!(
                         s.verification,
@@ -536,7 +540,7 @@ fn place_all<Id: RowId>(
                     )
                     && in_municipality(cand, s.municipality_id)
             }),
-            |s| similarity(&s.display_name, name),
+            |s| name_similarity(s, name),
             SUBMISSION_MATCH_THRESHOLD,
         );
         placement[i] = Some(if let Some((p, sim)) = submitted {
@@ -564,16 +568,30 @@ fn place_all<Id: RowId>(
         .collect()
 }
 
-/// The most similar item at or above `threshold`; the first one on a tie.
-fn best<T>(
-    items: impl Iterator<Item = T>,
-    score: impl Fn(&T) -> f32,
+/// How alike a school and a unit name are: the better of the display name and the register
+/// name, so a curated display name (D5) does not hide the school from its own NSR name.
+fn name_similarity<Id>(school: &SchoolSnapshot<Id>, name: &str) -> f32 {
+    let display = similarity(&school.display_name, name);
+    school
+        .register_name
+        .as_deref()
+        .map_or(display, |register| display.max(similarity(register, name)))
+}
+
+/// The most similar school at or above `threshold`; the lowest id on a tie, so the result
+/// never depends on the snapshot's row order.
+fn best<'a, Id: RowId>(
+    items: impl Iterator<Item = &'a SchoolSnapshot<Id>>,
+    score: impl Fn(&SchoolSnapshot<Id>) -> f32,
     threshold: f32,
-) -> Option<(T, f32)> {
-    let mut found: Option<(T, f32)> = None;
+) -> Option<(&'a SchoolSnapshot<Id>, f32)> {
+    let mut found: Option<(&SchoolSnapshot<Id>, f32)> = None;
     for item in items {
-        let s = score(&item);
-        if s >= threshold && found.as_ref().is_none_or(|(_, best)| s > *best) {
+        let s = score(item);
+        let better = found
+            .as_ref()
+            .is_none_or(|(b, best)| s > *best || (s == *best && item.id < b.id));
+        if s >= threshold && better {
             found = Some((item, s));
         }
     }
@@ -603,16 +621,21 @@ fn plan_update<Id: RowId>(
     if renamed {
         // A move re-mints the slug in the target municipality instead.
         let slug = match &school.slug {
-            Some(old) if !moving && !school.display_name_curated => slugify(&unit.name)
+            _ if moving || school.display_name_curated => None,
+            Some(old) => slugify(&unit.name)
                 .ok()
                 .filter(|base| base != old)
                 .map(|base| book.mint(here, &base, post_town, me))
                 .filter(|new| new != old)
                 .map(|new| SlugChange {
-                    old: old.clone(),
+                    old: Some(old.clone()),
                     new,
                 }),
-            _ => None,
+            // A school without a slug gets its first one once its name is sluggable.
+            None => slugify(&unit.name).ok().map(|base| SlugChange {
+                old: None,
+                new: book.mint(here, &base, post_town, me),
+            }),
         };
         ops.push(SchoolOp::Rename {
             id: school.id,
@@ -633,7 +656,7 @@ fn plan_update<Id: RowId>(
         let slug = school.slug.as_ref().map(|old| {
             let base = slugify(display_name).unwrap_or_else(|_| old.clone());
             SlugChange {
-                old: old.clone(),
+                old: Some(old.clone()),
                 new: book.mint(to, &base, post_town, me),
             }
         });
@@ -818,7 +841,7 @@ mod tests {
                 register_name: "Hosle barneskole".into(),
                 display_name: Some("Hosle barneskole".into()),
                 slug: Some(SlugChange {
-                    old: "hosle-skole".into(),
+                    old: Some("hosle-skole".into()),
                     new: "hosle-barneskole".into(),
                 }),
             }]
@@ -1138,7 +1161,7 @@ mod tests {
                 from: 1,
                 to: Ref::Existing(2),
                 slug: Some(SlugChange {
-                    old: "brattvaag-barneskule".into(),
+                    old: Some("brattvaag-barneskule".into()),
                     new: "brattvaag-barneskule".into(),
                 }),
             }]
@@ -1426,6 +1449,17 @@ mod tests {
                 &stange(),
             );
             assert_eq!(successor(&plan), Some(Ref::New(0)), "{code}");
+            assert!(
+                matches!(
+                    plan.ops[0],
+                    SchoolOp::Close {
+                        reason: ClosureReason::Merged,
+                        ..
+                    }
+                ),
+                "{code}: a close with a successor is always Merged (§4.5): {:?}",
+                plan.ops
+            );
         }
         for code in ["D", "N", "O", "U"] {
             let plan = run(
@@ -1551,8 +1585,8 @@ mod tests {
         assert!(listed(&plan), "{plan:?}");
     }
 
-    // Fix round 1: a split (several new units matching one closing predecessor) must resolve
-    // to a single global best match, not to whichever unit `place()` happened to see first.
+    // A split (several new units matching one closing predecessor) must resolve to a single
+    // global best match, not to whichever unit the input lists first.
 
     #[test]
     fn a_split_assigns_the_slug_to_the_best_match_not_the_first_seen() {
@@ -1781,5 +1815,232 @@ mod tests {
             ]
         );
         assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+    }
+    #[test]
+    fn a_school_renamed_and_moved_in_one_run() {
+        // Brattvåg barneskule is renamed in NSR and its number 1580 now resolves to Haram (2).
+        let brattvaag = unit("974585715", "Brattvåg barneskule", "1580");
+        let snapshot = with_schools(vec![school(10, 1, &brattvaag, "brattvaag-barneskule")]);
+        let state = state(&[("1508", Ref::Existing(1)), ("1580", Ref::Existing(2))]);
+        let renamed = NsrUnit {
+            name: "Brattvåg skule".into(),
+            ..brattvaag
+        };
+        let plan = run(&snapshot, &[renamed], &state);
+        assert_eq!(
+            plan.ops,
+            [
+                SchoolOp::Rename {
+                    id: 10,
+                    register_name: "Brattvåg skule".into(),
+                    display_name: Some("Brattvåg skule".into()),
+                    slug: None,
+                },
+                SchoolOp::Move {
+                    id: 10,
+                    from: 1,
+                    to: Ref::Existing(2),
+                    slug: Some(SlugChange {
+                        old: Some("brattvaag-barneskule".into()),
+                        new: "brattvaag-skule".into(),
+                    }),
+                },
+            ],
+            "the Rename carries no slug; the Move re-mints from the new display name"
+        );
+    }
+
+    #[test]
+    fn an_fau_predecessor_wins_a_tie_with_a_non_fau_one() {
+        // Two closed "Stange ungdomsskole" rows, one with an FAU; the new unit matches both at
+        // 1.00. The FAU one is the match, so the unit is held and the other closes alone.
+        let fau = SchoolSnapshot {
+            has_live_fau: true,
+            ..school(30, 20, &stange_old(), "stange-ungdomsskole")
+        };
+        let other_unit = NsrUnit {
+            orgnr: "975270921".into(),
+            ..stange_old()
+        };
+        let other = school(31, 20, &other_unit, "stange-ungdomsskole-stange");
+        for schools in [
+            vec![fau.clone(), other.clone()],
+            vec![other.clone(), fau.clone()],
+        ] {
+            let plan = run(
+                &with_schools(schools),
+                &[stange_old(), other_unit.clone(), stange_new()],
+                &stange(),
+            );
+            assert_eq!(
+                plan.ops,
+                [
+                    SchoolOp::Close {
+                        id: 31,
+                        reason: ClosureReason::Merged,
+                        closed_on: date(2024, 8, 25),
+                        successor: None,
+                    },
+                    stange_create(0, None, CreateVerification::Held),
+                ]
+            );
+            assert_eq!(plan.reviews.len(), 1, "{:?}", plan.reviews);
+            assert_eq!(plan.reviews[0].kind, ReviewKind::PossibleReregistration);
+            assert_eq!(plan.reviews[0].school, Some(Ref::Existing(30)));
+        }
+    }
+
+    #[test]
+    fn a_submitted_school_that_already_has_an_orgnr_pulls_in_no_unit() {
+        let matched = SchoolSnapshot {
+            orgnr: Some("900000099".into()),
+            ..fornebu_submission(Verification::Verified, 1)
+        };
+        let fornebu = unit("900000011", "Fornebu skole", "3201");
+        let plan = run(&with_schools(vec![matched]), &[fornebu], &baerum());
+        assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+        assert_eq!(
+            slugs(&plan),
+            [(
+                "900000011".into(),
+                Ref::Existing(1),
+                Some("fornebu-skole".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_curated_display_name_does_not_hide_a_reregistration() {
+        let curated = "Fjellhaug u-skole (gamle)";
+        assert!(similarity(curated, "Stange ungdomsskole") < REREGISTRATION_THRESHOLD);
+        for has_live_fau in [false, true] {
+            let row = SchoolSnapshot {
+                display_name: curated.into(),
+                display_name_curated: true,
+                ..stange_row(has_live_fau)
+            };
+            let plan = run(
+                &with_schools(vec![row]),
+                &[stange_old(), stange_new()],
+                &stange(),
+            );
+            if has_live_fau {
+                assert_eq!(plan.ops, [stange_create(0, None, CreateVerification::Held)]);
+                assert_eq!(plan.reviews[0].kind, ReviewKind::PossibleReregistration);
+                assert_eq!(plan.reviews[0].details[4], ("similarity", "1.00".into()));
+            } else {
+                assert_eq!(
+                    plan.ops[0],
+                    SchoolOp::Close {
+                        id: 30,
+                        reason: ClosureReason::Merged,
+                        closed_on: date(2024, 8, 25),
+                        successor: Some(Ref::New(0)),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_submission_match_also_reads_the_register_name() {
+        let curated = "Nesøya (FAU)";
+        assert!(similarity(curated, "Fornebu skole") < SUBMISSION_MATCH_THRESHOLD);
+        let submission = SchoolSnapshot {
+            display_name: curated.into(),
+            display_name_curated: true,
+            register_name: Some("Fornebu".into()),
+            ..fornebu_submission(Verification::Verified, 1)
+        };
+        let fornebu = unit("900000011", "Fornebu skole", "3201");
+        let plan = run(&with_schools(vec![submission]), &[fornebu], &baerum());
+        assert_eq!(plan.reviews.len(), 1, "{:?}", plan.reviews);
+        assert_eq!(plan.reviews[0].kind, ReviewKind::PossibleSubmissionMatch);
+        assert_eq!(plan.reviews[0].details[3], ("similarity", "0.57".into()));
+    }
+
+    #[test]
+    fn a_listed_school_without_a_slug_gets_one_when_a_rename_makes_it_sluggable() {
+        let unsluggable = unit("974552124", "Школа", "3201");
+        let row = SchoolSnapshot {
+            slug: None,
+            ..school(10, 1, &unsluggable, "unused")
+        };
+        let renamed = NsrUnit {
+            name: "Hosle skole".into(),
+            ..unsluggable
+        };
+        let plan = run(&with_schools(vec![row]), &[renamed], &baerum());
+        assert_eq!(
+            plan.ops,
+            [SchoolOp::Rename {
+                id: 10,
+                register_name: "Hosle skole".into(),
+                display_name: Some("Hosle skole".into()),
+                slug: Some(SlugChange {
+                    old: None,
+                    new: "hosle-skole".into(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn best_breaks_a_tie_by_id_not_snapshot_order() {
+        let a = SchoolSnapshot {
+            id: 41,
+            ..fornebu_submission(Verification::Pending, 1)
+        };
+        let b = fornebu_submission(Verification::Pending, 1);
+        let fornebu = unit("900000011", "Fornebu skole", "3201");
+        let mut schools = vec![a, b];
+        let forward = run(
+            &with_schools(schools.clone()),
+            &[fornebu.clone()],
+            &baerum(),
+        );
+        schools.reverse();
+        let reversed = run(&with_schools(schools), &[fornebu], &baerum());
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.reviews[0].school, Some(Ref::Existing(40)));
+    }
+
+    #[test]
+    fn reversing_the_snapshot_schools_changes_nothing() {
+        let mut schools = vec![
+            stange_row(false),
+            fagerborg(60, "100000002", "fagerborg-a"),
+            fagerborg(61, "100000001", "fagerborg-b"),
+            SchoolSnapshot {
+                id: 41,
+                municipality_id: 20,
+                ..fornebu_submission(Verification::Pending, 20)
+            },
+            fornebu_submission(Verification::Verified, 20),
+        ];
+        let units = [
+            stange_old(),
+            stange_new(),
+            closed(
+                unit("100000002", "Fagerborg skole", "3413"),
+                "F",
+                "2024-08-25T01:15:10.91Z",
+            ),
+            closed(
+                unit("100000001", "Fagerborg skole", "3413"),
+                "S",
+                "2024-08-25T01:15:10.91Z",
+            ),
+            unit("900000050", "Fagerborg skole", "3413"),
+            unit("900000011", "Fornebu skole", "3413"),
+        ];
+        let forward = run(&with_schools(schools.clone()), &units, &stange());
+        schools.reverse();
+        let reversed = run(&with_schools(schools), &units, &stange());
+        assert_eq!(forward, reversed);
+        assert!(
+            !forward.reviews.is_empty() && forward.ops.len() > 3,
+            "{forward:?}"
+        );
     }
 }

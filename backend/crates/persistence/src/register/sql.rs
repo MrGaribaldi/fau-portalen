@@ -1,10 +1,22 @@
-//! Shared pieces of the register's SQL: the code columns' mapping onto the domain's enums.
+//! Shared pieces of the register's SQL: date and timestamp binding (as text, like
+//! `membership::sql`, because sqlx 0.8 has no jiff support) and the code columns' mapping onto
+//! the domain's enums.
 
 use fau_domain::register::sync::{
     MunicipalitySource, MunicipalityStatus, Origin, Ownership, SchoolStatus, Verification,
 };
+use jiff::civil::Date;
+use jiff::Timestamp;
 
 use super::error::RegisterError;
+
+pub(crate) fn date_param(d: Date) -> String {
+    d.to_string()
+}
+
+pub(crate) fn ts_param(t: Timestamp) -> String {
+    t.to_string()
+}
 
 pub(crate) fn municipality_status(code: &str) -> Result<MunicipalityStatus, RegisterError> {
     match code {

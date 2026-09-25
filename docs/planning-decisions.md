@@ -2595,3 +2595,49 @@ the live APIs yet. The agent's rulings:
   renamed on success. One gap is carried into part 4: a failed final rename leaves the `.partial`
   file behind.
 - **Raw NSR payloads are kept** (`nsr_unit_with_payload`), for §4.3's provenance table.
+
+## Register sync planner built: rulings for Erik's review (#3441) — 25 September 2026
+
+Part 3 of the register was built overnight on `school-register-3441`, following
+docs/superpowers/plans/2026-09-25-register-sync-planner.md. It is a pure planner in `fau-domain`
+that compares the current register with freshly fetched NSR, Kartverket and SSB data, and returns
+the changes to make, the items for review and a circuit-breaker verdict. Nothing is applied to a
+database yet; that is part 4. Every task was reviewed, and a whole-branch review and fix wave
+followed. The agent's rulings, with the cost if wrong:
+
+- **Re-registration (a school continuing under a new orgnr) follows only NSR's F and S closure
+  codes** (§4.5). There is no 30-day window.
+  - If the new number appears before the old one closes, the new school gets a suffixed slug and
+    no successor link. Curation or the review screen (#3499) can fix that.
+  - If it appears after, it takes the plain slug, with no successor link.
+- **When a school splits, the best name match inherits it.** New and old schools are paired by
+  highest similarity, with ties broken by orgnr, not by fetch order. Every new school that matches
+  a school with an FAU is held for review, so nobody can open a second FAU on a copy. The cost:
+  extra review items when a school with an FAU splits.
+- **A school closing while it has an FAU raises a review and is not closed** (D8).
+- **Input order never matters.** Units are sorted and de-duplicated by orgnr, Kartverket records
+  are sorted, and SSB changes are applied in date order. Chains that can't be ordered become
+  review items.
+- **The circuit breaker (§5.3) stops a sync on any of these:**
+  - more than 2% of schools closing;
+  - more than 5% renamed;
+  - more than 5% losing an attribute (such as the website), which catches an upstream schema change.
+
+  With fewer than 50 active schools a single closure trips it, so each environment is seeded in
+  full first.
+- **Seeding:**
+  - `--seed` refuses a non-empty register;
+  - a seed gets no SSB changes;
+  - the SSB lookback starts at the seed date.
+
+  This is part 4's job, and is written into the plan's handover.
+- **Address fallback is all-or-nothing.** The visiting address is used when it has a street,
+  otherwise the whole postal address.
+- **A submission match only considers submitted schools that have not already been matched.**
+  Similarity takes the higher of the display name and the register name, so a curated name does
+  not hide a re-registration.
+- **Known limitations, left for later:**
+  - a renumber onto a name with no sluggable characters blocks that municipality for review
+    (practically unreachable);
+  - NSR's `Utgaattype` is optional in the parser, so closure codes vanishing upstream would not
+    fail loudly.

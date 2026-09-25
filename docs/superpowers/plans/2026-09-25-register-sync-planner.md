@@ -5053,8 +5053,11 @@ git commit -m "Wire the sync planner with its circuit breaker, proven idempotent
     number and name, and no separate `Rename` follows for that municipality;
   - **slug-history `valid_from`** is the entity's last history row's `valid_until`, or else its
     `created_at` (a municipality, or a school created Listed) or `verified_at` (a school that got
-    its slug on verification). Guard `valid_from < valid_until`: two slug changes in the same
-    transaction timestamp would otherwise violate the primary key or write an empty interval.
+    its slug on verification). A school that gets its first slug through a `Rename`
+    (`SlugChange.old` is `None`) writes no history row. **When the guard fails,
+    `valid_from >= valid_until`, skip the history row**: nobody saw that slug live. That happens
+    for the intermediate slug of two renumbers in one run (5001→1234→5501), or for two slug changes
+    in one transaction timestamp (controller ruling, final re-review).
 - **A dissolved municipality** (an operator's decision, never the planner's) must also close its
   current `municipality_numbers` row, or `municipality_numbers_current` keeps the number taken.
 - **`UpdateDetails`** replaces the whole of `municipality_names` for that municipality, since
@@ -5108,8 +5111,9 @@ git commit -m "Wire the sync planner with its circuit breaker, proven idempotent
   CronJob.
 - **Deduplicate the input units by orgnr.** The caller merges "every active grunnskole" with
   "every orgnr the register holds", and the planner assumes each orgnr appears once.
-- **The SSB window is a fixed lookback,** for example from the seed date, not "since the last
-  run". A run that aborts or fails would otherwise lose changes for good. Re-reading old changes
+- **The SSB window is a fixed lookback that starts at the seed date** (mandatory, controller
+  ruling), not "since the last run". **A seed run is passed no code changes at all.** A seed given
+  an old split in its window would create neither target and block both for good. A run that aborts or fails would otherwise lose changes for good. Re-reading old changes
   is safe: an applied renumber finds no holder of its old code and is skipped, and a split or
   merge whose old code nobody holds and whose targets are all held counts as resolved and blocks
   nothing. The seed's own window is empty (it starts at the seed date), which matters because

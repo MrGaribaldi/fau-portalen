@@ -6,8 +6,8 @@
 mod municipalities;
 mod schools;
 mod similarity;
-#[cfg(test)]
-mod testkit;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 mod types;
 
 pub use similarity::{similarity, REREGISTRATION_THRESHOLD, SUBMISSION_MATCH_THRESHOLD};

@@ -33,6 +33,10 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# The sync planner's test builders and in-memory applier, for the SQL applier's parity
+# tests (tests/register_apply.rs). A dev-dependency feature: resolver 2 keeps it out of
+# `cargo build --release`, so it never reaches the image.
+fau-domain = { path = "../domain", features = ["testkit"] }
 # Test-only: dates for the membership fixtures, and an independent SHA-256 to check
 # that invitations store the token's hash and never the token.
 jiff = { workspace = true }

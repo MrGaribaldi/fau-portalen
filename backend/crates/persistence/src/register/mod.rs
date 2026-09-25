@@ -1,0 +1,11 @@
+//! The school register's persistence (#3441 part 4, docs/school-register-design.md §4, §5):
+//! the snapshot the sync planner reads, the applier that writes its plan in one transaction,
+//! and the run bookkeeping around it. Everything here runs as `fau_register` (D9); nothing
+//! reads the database clock for a rule, so every function takes the caller's `Moment`.
+
+mod error;
+mod snapshot;
+mod sql;
+
+pub use error::RegisterError;
+pub use snapshot::{load_snapshot, register_is_empty};

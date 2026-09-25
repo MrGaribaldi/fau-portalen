@@ -6,6 +6,7 @@ mod health;
 pub mod membership;
 mod migrate;
 mod pool;
+pub mod register;
 
 pub use contract::{is_retryable, is_undefined_table, read_contract_version};
 pub use health::{db_check, DbCheckError, DB_CHECK_TIMEOUT};

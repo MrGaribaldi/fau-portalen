@@ -13,5 +13,11 @@ jiff = { workspace = true }
 serde = { workspace = true }
 unicode-normalization = { workspace = true }
 
+[features]
+# The sync planner's test builders and in-memory applier (`register::sync::testkit`), for
+# the persistence parity tests in fau-app. Only ever enabled from a dev-dependency, which
+# resolver 2 keeps out of every non-test build, so it never reaches the release binary.
+testkit = []
+
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -1,6 +1,10 @@
 //! Builders for the planner's tests. The values mirror the recorded fixtures in
 //! crates/register-sources/tests/fixtures/ (see its README); the domain cannot depend on
 //! that crate, so they are written out by hand.
+//!
+//! Compiled for the domain's own tests and, behind the `testkit` feature, for fau-app's
+//! persistence parity tests (part 4), which run [`apply`] next to the SQL applier. Never part
+//! of a release build.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -19,17 +23,17 @@ use super::types::{
     SchoolSnapshot, SchoolStatus, SlugChange, SyncInputs, SyncPlan, Verification,
 };
 
-pub(super) fn ts(s: &str) -> Timestamp {
+pub fn ts(s: &str) -> Timestamp {
     s.parse().expect("a valid timestamp literal")
 }
 
 /// Monday 28 September 2026, 04:30 in Oslo: the weekly CronJob's slot (§5.1).
-pub(super) fn at() -> Moment {
+pub fn at() -> Moment {
     Moment::at(ts("2026-09-28T02:30:00Z"))
 }
 
 /// A Kartverket record whose official name and only name are the Norwegian name.
-pub(super) fn record(
+pub fn record(
     number: &str,
     name: &str,
     county_number: &str,
@@ -50,7 +54,7 @@ pub(super) fn record(
 }
 
 /// The active, Kartverket-sourced row a seed would have made from `r`.
-pub(super) fn municipality(id: u32, r: &MunicipalityRecord) -> MunicipalitySnapshot<u32> {
+pub fn municipality(id: u32, r: &MunicipalityRecord) -> MunicipalitySnapshot<u32> {
     MunicipalitySnapshot {
         id,
         number: r.number.clone(),
@@ -65,7 +69,7 @@ pub(super) fn municipality(id: u32, r: &MunicipalityRecord) -> MunicipalitySnaps
     }
 }
 
-pub(super) fn change(
+pub fn change(
     old_code: &str,
     old_name: &str,
     new_code: &str,
@@ -82,7 +86,7 @@ pub(super) fn change(
 }
 
 /// An active, in-scope public grunnskole (grades 1-7, Bokmål) with no address or website.
-pub(super) fn unit(orgnr: &str, name: &str, municipality_number: &str) -> NsrUnit {
+pub fn unit(orgnr: &str, name: &str, municipality_number: &str) -> NsrUnit {
     NsrUnit {
         orgnr: orgnr.into(),
         name: name.into(),
@@ -104,7 +108,7 @@ pub(super) fn unit(orgnr: &str, name: &str, municipality_number: &str) -> NsrUni
     }
 }
 
-pub(super) fn inputs<'a>(
+pub fn inputs<'a>(
     municipalities: &'a [MunicipalityRecord],
     code_changes: &'a [CodeChange],
     units: &'a [NsrUnit],
@@ -119,7 +123,7 @@ pub(super) fn inputs<'a>(
     }
 }
 
-pub(super) fn address(street: &str, postcode: &str, post_town: &str) -> NsrAddress {
+pub fn address(street: &str, postcode: &str, post_town: &str) -> NsrAddress {
     NsrAddress {
         street: Some(street.into()),
         postcode: Some(postcode.into()),
@@ -128,7 +132,7 @@ pub(super) fn address(street: &str, postcode: &str, post_town: &str) -> NsrAddre
 }
 
 /// The Kartverket records of the fixture units' municipalities, in Kartverket's shape.
-pub(super) fn fixture_records() -> Vec<MunicipalityRecord> {
+pub fn fixture_records() -> Vec<MunicipalityRecord> {
     vec![
         record("3201", "Bærum", "32", "Akershus"),
         record("3314", "Øvre Eiker", "33", "Buskerud"),
@@ -143,7 +147,7 @@ pub(super) fn fixture_records() -> Vec<MunicipalityRecord> {
 }
 
 /// Hosle skole, 974552124: an ordinary public school in 3201 Bærum.
-pub(super) fn hosle() -> NsrUnit {
+pub fn hosle() -> NsrUnit {
     NsrUnit {
         website: Some("www.hosle.no".into()),
         visiting: address("Bispeveien 73", "1362", "HOSLE"),
@@ -154,7 +158,7 @@ pub(super) fn hosle() -> NsrUnit {
 }
 
 /// Norges Toppidrettsgymnas ungdomsskole Bærum AS, 990672938: private.
-pub(super) fn ntg() -> NsrUnit {
+pub fn ntg() -> NsrUnit {
     NsrUnit {
         is_private: true,
         category_ids: vec!["1".into(), "4".into(), "16".into(), "32".into()],
@@ -173,7 +177,7 @@ pub(super) fn ntg() -> NsrUnit {
 }
 
 /// Lerberg skole og kompetansesenter, 998516897: combined, 85.201 then 85.310.
-pub(super) fn lerberg() -> NsrUnit {
+pub fn lerberg() -> NsrUnit {
     NsrUnit {
         category_ids: vec!["1".into(), "2".into(), "3".into(), "6".into(), "32".into()],
         nace: vec![(1, "85.201".into()), (2, "85.310".into())],
@@ -187,7 +191,7 @@ pub(super) fn lerberg() -> NsrUnit {
 }
 
 /// Signo Grunn- og videregående skole AS, 998666783: a special school (85.202).
-pub(super) fn signo() -> NsrUnit {
+pub fn signo() -> NsrUnit {
     NsrUnit {
         is_private: true,
         category_ids: vec![
@@ -213,7 +217,7 @@ pub(super) fn signo() -> NsrUnit {
 
 /// Lørenskog voksenopplæring, 999038182: adult education. Out of scope, so only the facts
 /// the filter reads are copied.
-pub(super) fn lorenskog_adult() -> NsrUnit {
+pub fn lorenskog_adult() -> NsrUnit {
     NsrUnit {
         category_ids: vec![
             "1".into(),
@@ -229,7 +233,7 @@ pub(super) fn lorenskog_adult() -> NsrUnit {
 }
 
 /// Wang Fredrikstad AS, 986779795: upper secondary as its primary NACE code. Out of scope.
-pub(super) fn wang() -> NsrUnit {
+pub fn wang() -> NsrUnit {
     NsrUnit {
         is_private: true,
         nace: vec![(1, "85.310".into()), (2, "85.201".into())],
@@ -238,7 +242,7 @@ pub(super) fn wang() -> NsrUnit {
 }
 
 /// Den norske skole - Gran Canaria, U90099017: abroad (2599). Out of scope.
-pub(super) fn gran_canaria() -> NsrUnit {
+pub fn gran_canaria() -> NsrUnit {
     NsrUnit {
         is_private: true,
         ..unit("U90099017", "Den norske skole - Gran Canaria", "2599")
@@ -246,7 +250,7 @@ pub(super) fn gran_canaria() -> NsrUnit {
 }
 
 /// Longyearbyen skole grunnskole, 974795655: Svalbard (2100).
-pub(super) fn longyearbyen() -> NsrUnit {
+pub fn longyearbyen() -> NsrUnit {
     NsrUnit {
         category_ids: vec!["1".into(), "2".into(), "3".into(), "5".into(), "32".into()],
         nace: vec![(1, "85.201".into()), (2, "85.310".into())],
@@ -259,7 +263,7 @@ pub(super) fn longyearbyen() -> NsrUnit {
 }
 
 /// Kjølsdalen montessoriskule SA, 998245508: Nynorsk, private.
-pub(super) fn kjolsdalen() -> NsrUnit {
+pub fn kjolsdalen() -> NsrUnit {
     NsrUnit {
         is_private: true,
         category_ids: vec!["1".into(), "4".into(), "16".into(), "32".into()],
@@ -273,7 +277,7 @@ pub(super) fn kjolsdalen() -> NsrUnit {
 }
 
 /// Halsa barne- og ungdomsskole, 998670799: no website.
-pub(super) fn halsa() -> NsrUnit {
+pub fn halsa() -> NsrUnit {
     NsrUnit {
         grade_to: Some(10),
         visiting: address("Glåmsmyrvegen 63", "6683", "VÅGLAND"),
@@ -285,7 +289,7 @@ pub(super) fn halsa() -> NsrUnit {
 
 /// Holtålen kommune Haltdalen oppvekstsenter avd skole, 974554682: the municipality in the
 /// name.
-pub(super) fn haltdalen() -> NsrUnit {
+pub fn haltdalen() -> NsrUnit {
     NsrUnit {
         website: Some("www.holtalenskolene.no".into()),
         visiting: address("Knuten 121", "7383", "HALTDALEN"),
@@ -299,7 +303,7 @@ pub(super) fn haltdalen() -> NsrUnit {
 }
 
 /// Stange ungdomsskole's old number, 975270920: closed as "Slettet for sammenslåing".
-pub(super) fn stange_old() -> NsrUnit {
+pub fn stange_old() -> NsrUnit {
     NsrUnit {
         is_active: false,
         grade_from: None,
@@ -317,7 +321,7 @@ pub(super) fn stange_old() -> NsrUnit {
 }
 
 /// Stange ungdomsskole's new number, 933181995.
-pub(super) fn stange_new() -> NsrUnit {
+pub fn stange_new() -> NsrUnit {
     NsrUnit {
         grade_from: Some(8),
         grade_to: Some(10),
@@ -329,7 +333,7 @@ pub(super) fn stange_new() -> NsrUnit {
 }
 
 /// Every fixture unit, in the README's order.
-pub(super) fn fixture_units() -> Vec<NsrUnit> {
+pub fn fixture_units() -> Vec<NsrUnit> {
     vec![
         hosle(),
         ntg(),
@@ -348,12 +352,7 @@ pub(super) fn fixture_units() -> Vec<NsrUnit> {
 }
 
 /// The listed, active register row a seed would have made from `unit`.
-pub(super) fn school(
-    id: u32,
-    municipality_id: u32,
-    unit: &NsrUnit,
-    slug: &str,
-) -> SchoolSnapshot<u32> {
+pub fn school(id: u32, municipality_id: u32, unit: &NsrUnit, slug: &str) -> SchoolSnapshot<u32> {
     SchoolSnapshot {
         id,
         municipality_id,
@@ -385,7 +384,7 @@ pub(super) fn school(
 /// must read back for the planner) never mentions `successor_id`, because the planner itself
 /// never reads a school's successor back from the snapshot — only `testkit::apply`'s callers
 /// need it, to check the handover contract.
-pub(super) fn apply(
+pub fn apply(
     snapshot: &RegisterSnapshot<u32>,
     plan: &SyncPlan<u32>,
 ) -> (RegisterSnapshot<u32>, BTreeMap<u32, u32>) {

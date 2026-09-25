@@ -108,6 +108,20 @@ fn migrations_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations")
 }
 
+/// How many `*.sql` files exist in `backend/migrations/` right now -- which is also
+/// how many rows `_sqlx_migrations` holds after a full run, and the schema
+/// contract's current version (each migration inserts its own migration-number row).
+/// One place for a fact three test files (`register_schema.rs`, `membership_schema.rs`,
+/// `migrations.rs`) otherwise each hard-code as a literal `4`, which migration 0005
+/// would have to find and update in three places at once (minor finding 10).
+pub fn migration_file_count() -> i32 {
+    std::fs::read_dir(migrations_dir())
+        .expect("read the migrations directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("sql"))
+        .count() as i32
+}
+
 /// The migrated template's name: [`TEMPLATE_PREFIX`] plus the first 12 hex digits of
 /// a hash over `roles.sql` and every file in `backend/migrations/` (sorted by name,
 /// name and contents both hashed). Two processes that would build the same template
@@ -419,6 +433,22 @@ async fn build_template(conn: &mut PgConnection, name: &str) {
     .execute(&mut *conn)
     .await
     .expect("rename the completed template into place");
+
+    // Section 3's flakiness fix: once the template is fully built, nothing may ever
+    // connect to it again. Without this, `CREATE DATABASE ... TEMPLATE` has to wait
+    // out (or be blocked by) any other session connected to the source -- observed
+    // taking about 5 seconds under 24-way parallel load, immediately before a server
+    // crash-restart that failed every in-flight test at once. `is_template true`
+    // additionally lets a non-superuser use this as a template source, though every
+    // caller here already is one; `allow_connections false` is what actually closes
+    // the door. `cleanup_old_templates` below is the one place that must undo this
+    // again, since PostgreSQL refuses to `DROP DATABASE` a `datistemplate` row.
+    sqlx::query(&format!(
+        r#"alter database "{name}" with is_template true allow_connections false"#
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("mark the completed template is_template/allow_connections false");
 }
 
 /// Defence in depth against `sqlx::migrate!`'s inability to notice a *new*
@@ -443,11 +473,7 @@ async fn assert_migrations_are_current(db_name: &str) {
         .await
         .expect("count applied migrations on the freshly built template");
 
-    let on_disk = std::fs::read_dir(migrations_dir())
-        .expect("read the migrations directory")
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("sql"))
-        .count() as i64;
+    let on_disk = i64::from(migration_file_count());
 
     assert_eq!(
         applied, on_disk,
@@ -480,6 +506,17 @@ async fn cleanup_old_templates(conn: &mut PgConnection, keep: &str) {
     .unwrap_or_default();
 
     for old_name in stale {
+        // A template built by `build_template` above is marked `is_template true`,
+        // and PostgreSQL refuses to `DROP DATABASE` such a row outright ("cannot
+        // drop a database used as a template") -- unlike renaming into or out of it,
+        // which is unaffected. Best effort, like the drop itself: an old template
+        // some other process still has open is left with `is_template` cleared but
+        // undropped, and a later run's `drop database if exists` finishes the job.
+        let _ = sqlx::query(&format!(
+            r#"alter database "{old_name}" with is_template false"#
+        ))
+        .execute(&mut *conn)
+        .await;
         let _ = sqlx::query(&format!(r#"drop database if exists "{old_name}""#))
             .execute(&mut *conn)
             .await;

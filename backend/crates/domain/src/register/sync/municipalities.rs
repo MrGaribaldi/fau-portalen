@@ -1,0 +1,769 @@
+//! Step 1 of a run: municipalities (docs/school-register-design.md §2.4, §5.2 step 1).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::register::scope::{classify, ScopeDecision};
+use crate::register::slug::municipality_slug;
+use crate::register::source::{CodeChange, MunicipalityRecord, OfficialName};
+
+use super::types::{
+    MunicipalityOp, MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, Ref,
+    RegisterSnapshot, ReviewItem, ReviewKind, RowId, RunKind, SyncInputs,
+};
+
+/// Svalbard is not a municipality in Kartverket or SSB, but NSR files Longyearbyen skole under
+/// 2100 (§2.2, D2).
+pub(super) const SVALBARD_NUMBER: &str = "2100";
+
+/// What the school planner needs to know about municipalities after step 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MunicipalityState<Id> {
+    /// Active municipalities by current number, after this plan's renumbers and creates.
+    pub by_number: BTreeMap<String, Ref<Id>>,
+    /// Every old and new code of an unexplained SSB group: nothing touches them this run.
+    pub blocked_numbers: BTreeSet<String>,
+    /// Existing municipalities that hold a blocked number.
+    pub blocked_ids: BTreeSet<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MunicipalityPlan<Id> {
+    pub ops: Vec<MunicipalityOp<Id>>,
+    pub reviews: Vec<ReviewItem<Id>>,
+    pub state: MunicipalityState<Id>,
+}
+
+/// An active municipality as this plan leaves it: a renumber changes its number and slug.
+struct Working<'a, Id> {
+    row: &'a MunicipalitySnapshot<Id>,
+    number: String,
+    slug: String,
+}
+
+pub(super) fn plan_municipalities<Id: RowId>(
+    snapshot: &RegisterSnapshot<Id>,
+    inputs: &SyncInputs<'_>,
+) -> MunicipalityPlan<Id> {
+    let mut ops = Vec::new();
+    let mut reviews = Vec::new();
+    let kartverket: BTreeSet<&str> = inputs
+        .municipalities
+        .iter()
+        .map(|r| r.number.as_str())
+        .collect();
+
+    let mut working: BTreeMap<Id, Working<'_, Id>> = BTreeMap::new();
+    let mut by_number: BTreeMap<String, Ref<Id>> = BTreeMap::new();
+    for row in &snapshot.municipalities {
+        if row.status == MunicipalityStatus::Active {
+            by_number.insert(row.number.clone(), Ref::Existing(row.id));
+            working.insert(
+                row.id,
+                Working {
+                    row,
+                    number: row.number.clone(),
+                    slug: row.slug.clone(),
+                },
+            );
+        }
+    }
+
+    // SSB: group by old code, skipping rows that change nothing. An old code Kartverket still
+    // lists is a boundary adjustment or a name change, never a renumber (§2.4 case 3).
+    let mut groups: BTreeMap<&str, Vec<&CodeChange>> = BTreeMap::new();
+    for c in inputs.code_changes {
+        if c.old_code == c.new_code && c.old_name == c.new_name {
+            continue;
+        }
+        if kartverket.contains(c.old_code.as_str()) {
+            continue;
+        }
+        groups.entry(c.old_code.as_str()).or_default().push(c);
+    }
+    let mut gone_groups_per_target: BTreeMap<&str, usize> = BTreeMap::new();
+    for changes in groups.values() {
+        let targets: BTreeSet<&str> = changes.iter().map(|c| c.new_code.as_str()).collect();
+        for t in targets {
+            *gone_groups_per_target.entry(t).or_default() += 1;
+        }
+    }
+
+    let mut blocked_numbers: BTreeSet<String> = BTreeSet::new();
+    for (old, changes) in &groups {
+        let targets: BTreeMap<&str, &str> = changes
+            .iter()
+            .map(|c| (c.new_code.as_str(), c.new_name.as_str()))
+            .collect();
+        let holder = match by_number.get(*old) {
+            Some(Ref::Existing(id)) => Some(*id),
+            _ => None,
+        };
+        let one_to_one = match targets.keys().next() {
+            Some(to) if targets.len() == 1 && gone_groups_per_target[to] == 1 => Some(*to),
+            _ => None,
+        };
+        let reason = match (one_to_one, holder) {
+            // Already applied, or never held: there is nothing to renumber.
+            (Some(_), None) => continue,
+            (Some(to), Some(id)) => {
+                let w = &working[&id];
+                if w.row.source == MunicipalitySource::Manual {
+                    continue;
+                }
+                if by_number.contains_key(to) {
+                    "target_in_use"
+                } else if let Ok(new_slug) = municipality_slug(to, &w.row.name) {
+                    ops.push(MunicipalityOp::Renumber {
+                        id,
+                        from: (*old).to_owned(),
+                        to: to.to_owned(),
+                        valid_from: changes[0].occurred_on,
+                        old_slug: w.slug.clone(),
+                        new_slug: new_slug.clone(),
+                    });
+                    by_number.remove(*old);
+                    by_number.insert(to.to_owned(), Ref::Existing(id));
+                    let w = working.get_mut(&id).expect("the holder is a working row");
+                    w.number = to.to_owned();
+                    w.slug = new_slug;
+                    continue;
+                } else {
+                    "unsluggable"
+                }
+            }
+            (None, _) if targets.len() > 1 => "split",
+            (None, _) => "merge",
+        };
+        blocked_numbers.insert((*old).to_owned());
+        blocked_numbers.extend(targets.keys().map(|t| (*t).to_owned()));
+        reviews.push(ReviewItem {
+            kind: ReviewKind::MunicipalitySplitOrMerge,
+            school: None,
+            other_school: None,
+            municipality: holder.map(Ref::Existing),
+            details: vec![
+                ("reason", reason.to_owned()),
+                ("old_code", (*old).to_owned()),
+                ("old_name", changes[0].old_name.clone()),
+                ("new_codes", join(targets.keys().copied())),
+                ("new_names", join(targets.values().copied())),
+            ],
+        });
+    }
+
+    // Kartverket against the municipality holding each number.
+    let mut next_new = 0u32;
+    for r in inputs.municipalities {
+        if blocked_numbers.contains(&r.number) {
+            continue;
+        }
+        match by_number.get(&r.number) {
+            Some(Ref::Existing(id)) => {
+                let w = &working[id];
+                if w.row.source == MunicipalitySource::Manual {
+                    continue;
+                }
+                if r.norwegian_name != w.row.name {
+                    match municipality_slug(&r.number, &r.norwegian_name) {
+                        Ok(new_slug) => ops.push(MunicipalityOp::Rename {
+                            id: *id,
+                            name: r.norwegian_name.clone(),
+                            old_slug: w.slug.clone(),
+                            new_slug,
+                        }),
+                        Err(_) => reviews.push(record_review(r, "unsluggable", Some(*id))),
+                    }
+                }
+                if details_differ(w.row, r) {
+                    ops.push(MunicipalityOp::UpdateDetails {
+                        id: *id,
+                        official_name: Some(r.official_name.clone()),
+                        county_number: r.county_number.clone(),
+                        county_name: r.county_name.clone(),
+                        names: r.names.clone(),
+                    });
+                }
+            }
+            // Kartverket listed the number twice; the first record created it.
+            Some(Ref::New(_)) => {}
+            None => match (inputs.kind, municipality_slug(&r.number, &r.norwegian_name)) {
+                (RunKind::Seed, Ok(slug)) => {
+                    ops.push(MunicipalityOp::Create {
+                        new: next_new,
+                        number: r.number.clone(),
+                        name: r.norwegian_name.clone(),
+                        official_name: Some(r.official_name.clone()),
+                        county_number: r.county_number.clone(),
+                        county_name: r.county_name.clone(),
+                        slug,
+                        names: r.names.clone(),
+                        source: MunicipalitySource::Kartverket,
+                    });
+                    by_number.insert(r.number.clone(), Ref::New(next_new));
+                    next_new += 1;
+                }
+                (RunKind::Seed, Err(_)) => reviews.push(record_review(r, "unsluggable", None)),
+                // SSB has not explained a new number: an operator decides (§2.4 case 3).
+                (RunKind::Sync, _) => reviews.push(record_review(r, "unknown_number", None)),
+            },
+        }
+    }
+
+    // Never dissolved automatically: an operator decides.
+    for w in working.values() {
+        if w.row.source == MunicipalitySource::Kartverket
+            && !kartverket.contains(w.number.as_str())
+            && !blocked_numbers.contains(&w.number)
+        {
+            reviews.push(ReviewItem {
+                kind: ReviewKind::MunicipalitySplitOrMerge,
+                school: None,
+                other_school: None,
+                municipality: Some(Ref::Existing(w.row.id)),
+                details: vec![
+                    ("reason", "absent_from_kartverket".to_owned()),
+                    ("number", w.number.clone()),
+                    ("name", w.row.name.clone()),
+                ],
+            });
+        }
+    }
+
+    // The manual Svalbard entry, once NSR has an in-scope school there.
+    let svalbard_needed = inputs.units.iter().any(|u| {
+        u.municipality_number == SVALBARD_NUMBER
+            && classify(&u.scope_facts()) == ScopeDecision::InScope
+    });
+    if svalbard_needed
+        && !by_number.contains_key(SVALBARD_NUMBER)
+        && !blocked_numbers.contains(SVALBARD_NUMBER)
+    {
+        ops.push(MunicipalityOp::Create {
+            new: next_new,
+            number: SVALBARD_NUMBER.to_owned(),
+            name: "Svalbard".to_owned(),
+            official_name: None,
+            county_number: "21".to_owned(),
+            county_name: "Svalbard".to_owned(),
+            slug: "2100-svalbard".to_owned(),
+            names: vec![OfficialName {
+                name: "Svalbard".to_owned(),
+                language: "no".to_owned(),
+                priority: 1,
+            }],
+            source: MunicipalitySource::Manual,
+        });
+        by_number.insert(SVALBARD_NUMBER.to_owned(), Ref::New(next_new));
+    }
+
+    let blocked_ids = working
+        .values()
+        .filter(|w| blocked_numbers.contains(&w.number))
+        .map(|w| w.row.id)
+        .collect();
+    MunicipalityPlan {
+        ops,
+        reviews,
+        state: MunicipalityState {
+            by_number,
+            blocked_numbers,
+            blocked_ids,
+        },
+    }
+}
+
+fn record_review<Id>(r: &MunicipalityRecord, reason: &str, id: Option<Id>) -> ReviewItem<Id> {
+    ReviewItem {
+        kind: ReviewKind::MunicipalitySplitOrMerge,
+        school: None,
+        other_school: None,
+        municipality: id.map(Ref::Existing),
+        details: vec![
+            ("reason", reason.to_owned()),
+            ("number", r.number.clone()),
+            ("name", r.norwegian_name.clone()),
+        ],
+    }
+}
+
+fn details_differ<Id>(row: &MunicipalitySnapshot<Id>, r: &MunicipalityRecord) -> bool {
+    row.official_name.as_deref() != Some(r.official_name.as_str())
+        || row.county_number != r.county_number
+        || row.county_name != r.county_name
+        || sorted(&row.names) != sorted(&r.names)
+}
+
+/// Names compare as a set: the database returns them in no particular order.
+fn sorted(names: &[OfficialName]) -> Vec<&OfficialName> {
+    let mut v: Vec<&OfficialName> = names.iter().collect();
+    v.sort_by(|a, b| (a.priority, &a.language, &a.name).cmp(&(b.priority, &b.language, &b.name)));
+    v
+}
+
+fn join<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    items.collect::<Vec<_>>().join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::civil::date;
+
+    use super::super::testkit::{change, inputs, municipality, record, unit};
+    use super::*;
+
+    fn run(
+        snapshot: &RegisterSnapshot<u32>,
+        records: &[MunicipalityRecord],
+        changes: &[CodeChange],
+        units: &[crate::register::source::NsrUnit],
+        kind: RunKind,
+    ) -> MunicipalityPlan<u32> {
+        plan_municipalities(snapshot, &inputs(records, changes, units, kind))
+    }
+
+    fn snapshot(municipalities: Vec<MunicipalitySnapshot<u32>>) -> RegisterSnapshot<u32> {
+        RegisterSnapshot {
+            municipalities,
+            ..RegisterSnapshot::default()
+        }
+    }
+
+    fn no_names(name: &str) -> Vec<OfficialName> {
+        vec![OfficialName {
+            name: name.into(),
+            language: "no".into(),
+            priority: 1,
+        }]
+    }
+
+    #[test]
+    fn a_seed_creates_every_kartverket_municipality_and_svalbard() {
+        let records = [
+            record("3201", "Bærum", "32", "Akershus"),
+            record("3413", "Stange", "34", "Innlandet"),
+        ];
+        // Longyearbyen skole grunnskole, 974795655, is filed under 2100.
+        let units = [unit("974795655", "Longyearbyen skole grunnskole", "2100")];
+        let plan = run(
+            &RegisterSnapshot::default(),
+            &records,
+            &[],
+            &units,
+            RunKind::Seed,
+        );
+        assert_eq!(
+            plan.ops,
+            [
+                MunicipalityOp::Create {
+                    new: 0,
+                    number: "3201".into(),
+                    name: "Bærum".into(),
+                    official_name: Some("Bærum".into()),
+                    county_number: "32".into(),
+                    county_name: "Akershus".into(),
+                    slug: "3201-baerum".into(),
+                    names: no_names("Bærum"),
+                    source: MunicipalitySource::Kartverket,
+                },
+                MunicipalityOp::Create {
+                    new: 1,
+                    number: "3413".into(),
+                    name: "Stange".into(),
+                    official_name: Some("Stange".into()),
+                    county_number: "34".into(),
+                    county_name: "Innlandet".into(),
+                    slug: "3413-stange".into(),
+                    names: no_names("Stange"),
+                    source: MunicipalitySource::Kartverket,
+                },
+                MunicipalityOp::Create {
+                    new: 2,
+                    number: "2100".into(),
+                    name: "Svalbard".into(),
+                    official_name: None,
+                    county_number: "21".into(),
+                    county_name: "Svalbard".into(),
+                    slug: "2100-svalbard".into(),
+                    names: no_names("Svalbard"),
+                    source: MunicipalitySource::Manual,
+                },
+            ]
+        );
+        assert!(plan.reviews.is_empty());
+        assert_eq!(
+            plan.state.by_number,
+            BTreeMap::from([
+                ("2100".to_owned(), Ref::New(2)),
+                ("3201".to_owned(), Ref::New(0)),
+                ("3413".to_owned(), Ref::New(1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn svalbard_needs_an_in_scope_unit_and_is_created_once() {
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        let inactive = crate::register::source::NsrUnit {
+            is_active: false,
+            ..unit("974795655", "Longyearbyen skole grunnskole", "2100")
+        };
+        let plan = run(
+            &RegisterSnapshot::default(),
+            &records,
+            &[],
+            &[inactive],
+            RunKind::Seed,
+        );
+        assert_eq!(plan.ops.len(), 1, "Bærum only: {:?}", plan.ops);
+
+        let svalbard = MunicipalitySnapshot {
+            source: MunicipalitySource::Manual,
+            official_name: None,
+            ..municipality(2, &record("2100", "Svalbard", "21", "Svalbard"))
+        };
+        let plan = run(
+            &snapshot(vec![municipality(1, &records[0]), svalbard]),
+            &records,
+            &[],
+            &[unit("974795655", "Longyearbyen skole grunnskole", "2100")],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert!(
+            plan.reviews.is_empty(),
+            "a manual entry is never compared with Kartverket: {:?}",
+            plan.reviews
+        );
+        assert_eq!(plan.state.by_number["2100"], Ref::Existing(2));
+    }
+
+    #[test]
+    fn a_one_to_one_ssb_change_is_a_renumber() {
+        // 1 January 2024: 3024 Bærum in Viken became 3201 Bærum in Akershus.
+        let old = municipality(1, &record("3024", "Bærum", "30", "Viken"));
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        let changes = [change("3024", "Bærum", "3201", "Bærum", date(2024, 1, 1))];
+        let plan = run(&snapshot(vec![old]), &records, &changes, &[], RunKind::Sync);
+        assert_eq!(
+            plan.ops,
+            [
+                MunicipalityOp::Renumber {
+                    id: 1,
+                    from: "3024".into(),
+                    to: "3201".into(),
+                    valid_from: date(2024, 1, 1),
+                    old_slug: "3024-baerum".into(),
+                    new_slug: "3201-baerum".into(),
+                },
+                MunicipalityOp::UpdateDetails {
+                    id: 1,
+                    official_name: Some("Bærum".into()),
+                    county_number: "32".into(),
+                    county_name: "Akershus".into(),
+                    names: no_names("Bærum"),
+                },
+            ]
+        );
+        assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+        assert_eq!(
+            plan.state.by_number,
+            BTreeMap::from([("3201".to_owned(), Ref::Existing(1))])
+        );
+
+        // The same change again, once applied, does nothing.
+        let applied = municipality(1, &records[0]);
+        let again = run(
+            &snapshot(vec![applied]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(again.ops.is_empty() && again.reviews.is_empty());
+    }
+
+    #[test]
+    fn a_split_is_reviewed_and_blocks_every_code_in_it() {
+        // 1 January 2024: 1507 Ålesund became 1508 Ålesund and 1580 Haram.
+        let aalesund = municipality(1, &record("1507", "Ålesund", "15", "Møre og Romsdal"));
+        let records = [
+            record("1508", "Ålesund", "15", "Møre og Romsdal"),
+            record("1580", "Haram", "15", "Møre og Romsdal"),
+        ];
+        let changes = [
+            change("1507", "Ålesund", "1508", "Ålesund", date(2024, 1, 1)),
+            change("1507", "Ålesund", "1580", "Haram", date(2024, 1, 1)),
+        ];
+        let plan = run(
+            &snapshot(vec![aalesund]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert_eq!(
+            plan.reviews,
+            [ReviewItem {
+                kind: ReviewKind::MunicipalitySplitOrMerge,
+                school: None,
+                other_school: None,
+                municipality: Some(Ref::Existing(1)),
+                details: vec![
+                    ("reason", "split".into()),
+                    ("old_code", "1507".into()),
+                    ("old_name", "Ålesund".into()),
+                    ("new_codes", "1508,1580".into()),
+                    ("new_names", "Ålesund,Haram".into()),
+                ],
+            }],
+            "one item for the group; no unknown-number or absent item for its codes"
+        );
+        assert_eq!(
+            plan.state.blocked_numbers,
+            BTreeSet::from(["1507".into(), "1508".into(), "1580".into()])
+        );
+        assert_eq!(plan.state.blocked_ids, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn a_merger_is_reviewed_once_per_old_code() {
+        // 1 January 2020: 1571 Halsa and 5011 Hemne became part of 5055 Heim.
+        let halsa = municipality(1, &record("1571", "Halsa", "15", "Møre og Romsdal"));
+        let hemne = municipality(2, &record("5011", "Hemne", "50", "Trøndelag"));
+        let records = [record("5055", "Heim", "50", "Trøndelag")];
+        let changes = [
+            change("1571", "Halsa", "5055", "Heim", date(2020, 1, 1)),
+            change("5011", "Hemne", "5055", "Heim", date(2020, 1, 1)),
+        ];
+        let plan = run(
+            &snapshot(vec![halsa, hemne]),
+            &records,
+            &changes,
+            &[],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        let reasons: Vec<_> = plan
+            .reviews
+            .iter()
+            .map(|r| {
+                (
+                    r.municipality,
+                    r.details[0].1.as_str(),
+                    r.details[1].1.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                (Some(Ref::Existing(1)), "merge", "1571"),
+                (Some(Ref::Existing(2)), "merge", "5011"),
+            ]
+        );
+        assert_eq!(
+            plan.state.blocked_numbers,
+            BTreeSet::from(["1571".into(), "5011".into(), "5055".into()])
+        );
+    }
+
+    #[test]
+    fn the_2026_changes_are_a_boundary_adjustment_and_name_changes() {
+        // 3118 Indre Østfold "changed" to 3207 and 3216 while continuing, and 0301, 5006
+        // and 5536 changed their official names only.
+        let records = [
+            record("0301", "Oslo", "03", "Oslo"),
+            record("3118", "Indre Østfold", "31", "Østfold"),
+            record("3207", "Nordre Follo", "32", "Akershus"),
+            record("3216", "Vestby", "32", "Akershus"),
+        ];
+        let rows = records
+            .iter()
+            .zip(1..)
+            .map(|(r, id)| municipality(id, r))
+            .collect();
+        let d = date(2026, 1, 1);
+        let changes = [
+            change("0301", "Oslo", "0301", "Oslo - Oslove", d),
+            change("3118", "Indre Østfold", "3118", "Indre Østfold", d),
+            change("3118", "Indre Østfold", "3207", "Nordre Follo", d),
+            change("3118", "Indre Østfold", "3216", "Vestby", d),
+        ];
+        let plan = run(&snapshot(rows), &records, &changes, &[], RunKind::Sync);
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert!(plan.reviews.is_empty(), "{:?}", plan.reviews);
+        assert!(plan.state.blocked_numbers.is_empty());
+    }
+
+    #[test]
+    fn an_official_name_change_moves_no_slug() {
+        // D3: "Oslo" to "Oslo - Oslove" is a detail, not a rename.
+        let oslo = municipality(1, &record("0301", "Oslo", "03", "Oslo"));
+        let names = vec![
+            OfficialName {
+                name: "Oslo".into(),
+                language: "no".into(),
+                priority: 1,
+            },
+            OfficialName {
+                name: "Oslove".into(),
+                language: "sma".into(),
+                priority: 2,
+            },
+        ];
+        let records = [MunicipalityRecord {
+            official_name: "Oslo - Oslove".into(),
+            names: names.clone(),
+            ..record("0301", "Oslo", "03", "Oslo")
+        }];
+        let plan = run(&snapshot(vec![oslo]), &records, &[], &[], RunKind::Sync);
+        assert_eq!(
+            plan.ops,
+            [MunicipalityOp::UpdateDetails {
+                id: 1,
+                official_name: Some("Oslo - Oslove".into()),
+                county_number: "03".into(),
+                county_name: "Oslo".into(),
+                names,
+            }]
+        );
+    }
+
+    #[test]
+    fn names_in_another_order_are_no_change() {
+        let names = vec![
+            OfficialName {
+                name: "Kárášjohka".into(),
+                language: "se".into(),
+                priority: 1,
+            },
+            OfficialName {
+                name: "Karasjok".into(),
+                language: "no".into(),
+                priority: 2,
+            },
+        ];
+        let r = MunicipalityRecord {
+            official_name: "Kárášjohka".into(),
+            names: names.clone(),
+            ..record("5610", "Karasjok", "56", "Finnmark")
+        };
+        let mut row = municipality(1, &r);
+        row.names.reverse();
+        let plan = run(&snapshot(vec![row]), &[r], &[], &[], RunKind::Sync);
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+    }
+
+    #[test]
+    fn a_norwegian_name_change_is_a_rename() {
+        let baerum = municipality(1, &record("3201", "Bærum", "32", "Akershus"));
+        let renamed = [MunicipalityRecord {
+            norwegian_name: "Store Bærum".into(),
+            ..record("3201", "Bærum", "32", "Akershus")
+        }];
+        let plan = run(
+            &snapshot(vec![baerum.clone()]),
+            &renamed,
+            &[],
+            &[],
+            RunKind::Sync,
+        );
+        assert_eq!(
+            plan.ops,
+            [MunicipalityOp::Rename {
+                id: 1,
+                name: "Store Bærum".into(),
+                old_slug: "3201-baerum".into(),
+                new_slug: "3201-store-baerum".into(),
+            }]
+        );
+
+        // A case-only change updates the name and keeps the slug.
+        let shouted = [MunicipalityRecord {
+            norwegian_name: "BÆRUM".into(),
+            ..record("3201", "Bærum", "32", "Akershus")
+        }];
+        let plan = run(&snapshot(vec![baerum]), &shouted, &[], &[], RunKind::Sync);
+        assert_eq!(
+            plan.ops,
+            [MunicipalityOp::Rename {
+                id: 1,
+                name: "BÆRUM".into(),
+                old_slug: "3201-baerum".into(),
+                new_slug: "3201-baerum".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sync_never_creates_an_unexplained_number() {
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        let plan = run(
+            &RegisterSnapshot::default(),
+            &records,
+            &[],
+            &[],
+            RunKind::Sync,
+        );
+        assert!(plan.ops.is_empty());
+        assert_eq!(
+            plan.reviews,
+            [ReviewItem {
+                kind: ReviewKind::MunicipalitySplitOrMerge,
+                school: None,
+                other_school: None,
+                municipality: None,
+                details: vec![
+                    ("reason", "unknown_number".into()),
+                    ("number", "3201".into()),
+                    ("name", "Bærum".into()),
+                ],
+            }]
+        );
+        assert!(plan.state.by_number.is_empty());
+    }
+
+    #[test]
+    fn a_municipality_absent_from_kartverket_is_reviewed_not_dissolved() {
+        let records = [record("3201", "Bærum", "32", "Akershus")];
+        let svalbard = MunicipalitySnapshot {
+            source: MunicipalitySource::Manual,
+            official_name: None,
+            ..municipality(3, &record("2100", "Svalbard", "21", "Svalbard"))
+        };
+        let dissolved = MunicipalitySnapshot {
+            status: MunicipalityStatus::Dissolved,
+            ..municipality(4, &record("1719", "Levanger", "17", "Nord-Trøndelag"))
+        };
+        let rows = vec![
+            municipality(1, &records[0]),
+            municipality(2, &record("1507", "Ålesund", "15", "Møre og Romsdal")),
+            svalbard,
+            dissolved,
+        ];
+        let plan = run(&snapshot(rows), &records, &[], &[], RunKind::Sync);
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert_eq!(
+            plan.reviews,
+            [ReviewItem {
+                kind: ReviewKind::MunicipalitySplitOrMerge,
+                school: None,
+                other_school: None,
+                municipality: Some(Ref::Existing(2)),
+                details: vec![
+                    ("reason", "absent_from_kartverket".into()),
+                    ("number", "1507".into()),
+                    ("name", "Ålesund".into()),
+                ],
+            }],
+            "neither the manual Svalbard entry nor a dissolved row is reviewed"
+        );
+        assert_eq!(
+            plan.state.by_number.get("1507"),
+            Some(&Ref::Existing(2)),
+            "its schools still resolve"
+        );
+        assert_eq!(plan.state.by_number.get("1719"), None);
+    }
+}

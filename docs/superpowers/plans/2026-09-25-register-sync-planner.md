@@ -110,11 +110,17 @@ builds the persistence applier and `fau register sync`.
 
 - **Re-registration only follows NSR closure codes F and S** (§4.5), as the plan does. This
   overrides the brief.
-- **No 30-day window, kept, with its limitation recorded.** If a school's new NSR number appears
-  in an earlier run than the old number's closure, the new school is created Listed with a
-  suffixed slug, and the old one later closes with no successor link. That is rare (it needs the
-  two numbers to overlap across a weekly run). It is fixable by operator curation (D5) and the
-  review screen (#3499). It is left for the matcher/review work, not solved here.
+- **No 30-day window, kept, with its limitation recorded.** Re-registration is only recognised
+  when the old number's closure and the new number arrive in the same run. Otherwise:
+  - if the new number appears in an earlier run, while the old school is still active and holds
+    the slug, the new school is created Listed with a suffixed slug, and the old one later closes
+    with no successor link;
+  - if the old number closes in an earlier run, the old school releases its slug when it closes,
+    so the new school later takes the bare slug, again with no successor link.
+
+  A suffixed slug only happens while the old school still holds it. Both cases are rare (they
+  need the two numbers to straddle a weekly run), are fixable by operator curation (D5) and the
+  review screen (#3499), and are left for the matcher/review work, not solved here.
 - **A closure with an FAU raises a review item and does not close,** following D8, which is Erik's
   decision. §10's "closes the row" line predates it.
 - **Address fallback is whole-address, not field-by-field.** `SchoolAttributes::from_unit` uses
@@ -5030,22 +5036,42 @@ git commit -m "Wire the sync planner with its circuit breaker, proven idempotent
 - **`Create`:**
   - the row gets origin `register`, the given verification, and `search_text` from
     `search::search_text`;
-  - **a Held row gets no `school_orgnr_history` row and no FAU link** (ruling, 24 September 2026),
-    so it can be deleted when a review resolves;
-  - only Listed creates get their orgnr recorded in history, if part 4 records current orgnrs there
-    at all.
+  - **a Held row gets no FAU link** (ruling, 24 September 2026), so it can be deleted when a
+    review resolves.
+- **`school_orgnr_history` holds former orgnrs only.** No op writes it. It is written only by
+  the "same school" outcome of a re-registration review, which moves the old orgnr there. A
+  school's current orgnr lives on `schools.orgnr` and never in history.
 - **Renames and renumbers:**
-  - **`Rename` and `Move`** write a `school_slug_history` row only when they carry a `SlugChange`.
-    A move's history row is keyed on `from`, the old municipality, even when the text is the same;
+  - **`Rename` and `Move`** write a `school_slug_history` row only when they carry a `SlugChange`
+    whose `old` is `Some`. `old: None` is a slugless school getting its first slug: set it, write
+    no history. A move's history row is keyed on `from`, the old municipality, even when the text
+    is the same;
   - **`MunicipalityOp::Rename`** writes `municipality_slug_history` only when `old_slug != new_slug`;
   - **`Renumber`** closes the old `municipality_numbers` row at `valid_from`, opens a new one from
-    `valid_from`, and always writes the slug history.
+    `valid_from`, and always writes the slug history. When `name` is `Some`, it also sets the
+    Norwegian name: a same-run rename is folded in, `new_slug` is already minted from the new
+    number and name, and no separate `Rename` follows for that municipality;
+  - **slug-history `valid_from`** is the entity's last history row's `valid_until`, or else its
+    `created_at` (a municipality, or a school created Listed) or `verified_at` (a school that got
+    its slug on verification). Guard `valid_from < valid_until`: two slug changes in the same
+    transaction timestamp would otherwise violate the primary key or write an empty interval.
+- **A dissolved municipality** (an operator's decision, never the planner's) must also close its
+  current `municipality_numbers` row, or `municipality_numbers_current` keeps the number taken.
 - **`UpdateDetails`** replaces the whole of `municipality_names` for that municipality, since
   `fau_register` may delete names (0004).
 - **Reviews:**
-  - **Deduplicate review items against open ones:** skip an item when an open item already exists
-    with the same `kind` and the same `school`, `other_school` and `municipality`. The planner
-    cannot see open items, so without this each weekly run repeats every unresolved item.
+  - **Deduplicate review items against open ones.** The planner cannot see open items, so
+    without this each weekly run repeats every unresolved item. Skip an item when an open item
+    already has the same key:
+    - `kind`, `school`, `other_school` and `municipality`; plus
+    - a discriminator from `details`: `municipality_number` for `unknown_municipality_number`
+      (those items have no municipality or school), and `reason` plus `number` or `old_code`
+      (whichever is present) for `municipality_split_or_merge`, where several items can share a
+      null municipality.
+
+    Every item the planner builds carries those keys, and a test pins it for each reason.
+  - **An Apply whose ops are empty and whose reviews all dedupe away** is recorded as
+    `no_change`, like a `NoChange` outcome.
   - **Re-raised items.** Some items are raised on every run until someone resolves them:
     - `municipality_split_or_merge` for an absent or unexplained municipality;
     - `closure_with_fau`;
@@ -5057,18 +5083,45 @@ git commit -m "Wire the sync planner with its circuit breaker, proven idempotent
 - **Building the snapshot:**
   - `SchoolAttributes` columns map as `ownership`, `grade_from`, `grade_to`, `register_language`
     (from `language`), `website`, `street_address`, `postcode` and `post_town`. The snapshot must
-    read them back unchanged, or every run reports `UpdateAttributes`;
+    read them back exactly, including an empty string versus null, or every run reports
+    `UpdateAttributes` (and a null read back as `Some("")`, or the reverse, can trip the
+    attribute-loss breaker);
+  - **use a deterministic `ORDER BY`** (by id) for every snapshot query. The planner breaks its
+    own ties by id, but a stable order keeps plans and diffs reproducible;
   - `has_live_fau` is "a tenant with status pending or active references the school";
   - every school's current slug goes in, closed ones included.
 - **`NoChange` writes nothing** but the run row (§5.3). So `last_seen_in_source_at` can only be
   refreshed inside an applied run, or dropped.
 - **`Abort { MassChange }`** is the `mass_change` alert. Record it in `register_sync_runs.abort_reason`,
-  and raise a `mass_change` review item if part 4 wants one in the queue.
+  and raise a `mass_change` review item if part 4 wants one in the queue. It trips on more than 2%
+  of active schools closing, more than 5% renamed, or (controller ruling) more than 5% losing an
+  attribute: `attribute_losses` counts schools whose `UpdateAttributes` turns any field from
+  `Some` into `None`, and is in both `Counts` and the abort reason.
+- **`Utgaattype` drift.** If NSR stopped sending closure codes, closed units would lose their
+  F/S codes and no re-registration would be recognised. The breaker does not see that; the part 2
+  parser is meant to, by failing loudly on missing required fields. **Known gap:** `Utgaattype`
+  is optional in `crates/register-sources/src/nsr.rs` (`utgaattype: Option<IdDto>`), so a
+  missing code is not an error: an inactive unit without one closes as `closed`, with no
+  re-registration. Not changed here; a decision for the sources crate.
 - **A small register trips the breaker.** With fewer than 50 active schools, any single close
   aborts a sync. Seed each environment fully, since seeds are exempt, before scheduling the
   CronJob.
 - **Deduplicate the input units by orgnr.** The caller merges "every active grunnskole" with
   "every orgnr the register holds", and the planner assumes each orgnr appears once.
+- **The SSB window is a fixed lookback,** for example from the seed date, not "since the last
+  run". A run that aborts or fails would otherwise lose changes for good. Re-reading old changes
+  is safe: an applied renumber finds no holder of its old code and is skipped, and a split or
+  merge whose old code nobody holds and whose targets are all held counts as resolved and blocks
+  nothing. The seed's own window is empty (it starts at the seed date), which matters because
+  on an empty register every SSB group has no holder.
+- **Before the first sync:** backfill `register_name` on every register-origin school, or the
+  first sync reports every one of them as renamed and the breaker aborts. **`--seed` must refuse
+  a non-empty register** (controller ruling): a seed has no breaker and creates municipalities
+  for unknown numbers.
+- **The SQL applier must pass the same scenarios as the test applier,** including seed, then a
+  rename, then a re-registration, then the same inputs twice (`NoChange`), with the constraints
+  checked after each op. Ops come in an order that satisfies 0004's unique indexes at every
+  step, which `testkit::apply` asserts.
 
 ## Self-Review
 
@@ -5115,7 +5168,7 @@ git commit -m "Wire the sync planner with its circuit breaker, proven idempotent
   run in the scratch copy (the similarity literals from pg_trgm itself).
 - **Type consistency:**
   - `MunicipalityState` (Task 2) is read by `plan_schools` (Task 3);
-  - `Closing.successor` (Task 3) is set by `place` (Task 4);
+  - `Closing.successor` (Task 3) is set by `place_all` (Task 4, after fix round 1);
   - the `testkit` builders from Tasks 2–3 are used by Task 5;
   - `SchoolPlan.skipped` feeds `Counts.skipped`;
   - no `#[allow(dead_code)]` survives Task 5.

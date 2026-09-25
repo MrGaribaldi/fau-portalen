@@ -459,7 +459,7 @@ async fn the_contract_version_is_four() {
         .fetch_one(&db.app_pool().await)
         .await
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, common::migration_file_count());
 }
 
 // The tests below round out coverage of 0003's remaining check constraints -- every

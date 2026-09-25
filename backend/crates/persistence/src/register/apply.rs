@@ -7,13 +7,15 @@ use std::collections::{BTreeSet, HashMap};
 
 use fau_domain::register::search::search_text;
 use fau_domain::register::source::OfficialName;
-use fau_domain::register::sync::{Counts, MunicipalityOp, SyncPlan};
+use fau_domain::register::sync::{Counts, MunicipalityOp, Ref, SchoolOp, SyncPlan};
 use fau_domain::time::Moment;
 use jiff::civil::Date;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::error::RegisterError;
+use super::reviews::{write_reviews, NewReview};
+use super::school_ops::{apply_school_op, link_successor, refresh_school_search_text};
 use super::sql::{date_param, ts_param};
 
 /// What an applied plan wrote.
@@ -23,13 +25,17 @@ pub struct AppliedCounts {
     pub counts: Counts,
     /// How many ops ran.
     pub ops: usize,
+    /// The review items written, in plan order.
+    pub new_reviews: Vec<NewReview>,
+    /// Review items skipped because an open item already has their key.
+    pub deduplicated_reviews: usize,
 }
 
 impl AppliedCounts {
-    /// Nothing but bookkeeping would be written: the Handover records such a run as
-    /// `no_change`, like a `NoChange` outcome.
+    /// No op ran and every review deduplicated away: the Handover records such a run as
+    /// `no_change`, like a `NoChange` outcome, so the caller rolls it back.
     pub fn wrote_nothing(&self) -> bool {
-        self.ops == 0
+        self.ops == 0 && self.new_reviews.is_empty()
     }
 }
 
@@ -37,8 +43,9 @@ impl AppliedCounts {
 /// a successor that a later `Create` makes. Municipalities first, then schools, each in op
 /// order: ids are time-ordered, so new rows sort after every existing one, as the test
 /// applier's `max + 1` ids do.
-struct NewIds {
+pub(super) struct NewIds {
     municipalities: HashMap<u32, Uuid>,
+    schools: HashMap<u32, Uuid>,
 }
 
 impl NewIds {
@@ -51,29 +58,84 @@ impl NewIds {
                 _ => None,
             })
             .collect();
-        NewIds { municipalities }
+        let schools = plan
+            .school_ops
+            .iter()
+            .filter_map(|op| match op {
+                SchoolOp::Create { new, .. } => Some((*new, Uuid::now_v7())),
+                _ => None,
+            })
+            .collect();
+        NewIds {
+            municipalities,
+            schools,
+        }
+    }
+
+    pub(super) fn municipality(&self, r: &Ref<Uuid>) -> Result<Uuid, RegisterError> {
+        resolve(&self.municipalities, r)
+    }
+
+    pub(super) fn school(&self, r: &Ref<Uuid>) -> Result<Uuid, RegisterError> {
+        resolve(&self.schools, r)
     }
 }
 
-/// Applies `plan` inside the caller's transaction: every municipality op in order, then every
-/// school op in order.
+fn resolve(new: &HashMap<u32, Uuid>, r: &Ref<Uuid>) -> Result<Uuid, RegisterError> {
+    match r {
+        Ref::Existing(id) => Ok(*id),
+        Ref::New(n) => new.get(n).copied().ok_or(RegisterError::UnknownRow),
+    }
+}
+
+/// Applies `plan` inside the caller's transaction, as the Handover orders it: every
+/// municipality op, then every school op, each in plan order; then the successor links, since
+/// a `Close` can name a school a later `Create` makes; then the review items, deduplicated
+/// against open ones.
 pub async fn apply_plan(
     conn: &mut PgConnection,
     plan: &SyncPlan<Uuid>,
     at: Moment,
 ) -> Result<AppliedCounts, RegisterError> {
     let ids = NewIds::allocate(plan);
+
     let mut touched = BTreeSet::new();
     for op in &plan.municipality_ops {
-        let id = apply_municipality_op(conn, op, &ids, at).await?;
-        touched.insert(id);
+        touched.insert(apply_municipality_op(conn, op, &ids, at).await?);
     }
     for id in touched {
         refresh_municipality_search_text(conn, id).await?;
     }
+
+    let mut renamed = BTreeSet::new();
+    let mut successors = Vec::new();
+    for op in &plan.school_ops {
+        match op {
+            SchoolOp::Rename { id, .. } => {
+                renamed.insert(*id);
+            }
+            SchoolOp::Close {
+                id,
+                successor: Some(successor),
+                ..
+            } => successors.push((*id, ids.school(successor)?)),
+            _ => {}
+        }
+        apply_school_op(conn, op, &ids, at).await?;
+    }
+    for (closed, successor) in successors {
+        link_successor(conn, closed, successor).await?;
+    }
+    for id in renamed {
+        refresh_school_search_text(conn, id).await?;
+    }
+
+    let (new_reviews, deduplicated_reviews) = write_reviews(conn, &plan.reviews, &ids, at).await?;
     Ok(AppliedCounts {
         counts: plan.counts,
-        ops: plan.municipality_ops.len(),
+        ops: plan.municipality_ops.len() + plan.school_ops.len(),
+        new_reviews,
+        deduplicated_reviews,
     })
 }
 
@@ -97,10 +159,7 @@ async fn apply_municipality_op(
             names,
             source,
         } => {
-            let id = *ids
-                .municipalities
-                .get(new)
-                .ok_or(RegisterError::UnknownRow)?;
+            let id = ids.municipality(&Ref::New(*new))?;
             sqlx::query(
                 "insert into municipalities
                    (id, name, official_name, county_number, county_name, slug, status, source,
@@ -316,7 +375,7 @@ async fn refresh_municipality_search_text(
 }
 
 /// An op names exactly one row; anything else is a plan against a register it did not read.
-fn expect_one(rows: u64) -> Result<(), RegisterError> {
+pub(super) fn expect_one(rows: u64) -> Result<(), RegisterError> {
     if rows == 1 {
         Ok(())
     } else {

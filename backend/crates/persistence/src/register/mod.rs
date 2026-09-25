@@ -5,9 +5,14 @@
 
 mod apply;
 mod error;
+mod reviews;
+mod school_ops;
 mod snapshot;
 mod sql;
+mod staging;
 
 pub use apply::{apply_plan, AppliedCounts};
 pub use error::RegisterError;
+pub use reviews::NewReview;
 pub use snapshot::{load_snapshot, register_is_empty};
+pub use staging::{stage_payloads, NsrPayload};

@@ -7,15 +7,22 @@ mod common;
 use std::collections::{BTreeSet, HashMap};
 
 use common::TestDb;
-use fau_domain::register::source::{CodeChange, MunicipalityRecord, NsrUnit, OfficialName};
-use fau_domain::register::sync::testkit::{self, change, fixture_records, gran_canaria, record};
+use fau_domain::register::source::{
+    CodeChange, MunicipalityRecord, NsrClosure, NsrUnit, OfficialName,
+};
+use fau_domain::register::sync::testkit::{
+    self, change, fixture_records, fixture_units, gran_canaria, hosle, lerberg, ntg, record,
+    stange_new, stange_old,
+};
 use fau_domain::register::sync::{
     plan, MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, Origin, Ownership,
-    RegisterSnapshot, RowId, RunKind, SchoolAttributes, SchoolSnapshot, SchoolStatus, SyncOutcome,
-    SyncPlan, Verification,
+    RegisterSnapshot, ReviewKind, RowId, RunKind, SchoolAttributes, SchoolSnapshot, SchoolStatus,
+    SyncOutcome, SyncPlan, Verification,
 };
 use fau_domain::time::Moment;
-use fau_persistence::register::{apply_plan, load_snapshot, register_is_empty, AppliedCounts};
+use fau_persistence::register::{
+    apply_plan, load_snapshot, register_is_empty, stage_payloads, AppliedCounts, NsrPayload,
+};
 use jiff::civil::date;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -570,5 +577,466 @@ async fn a_middle_slug_writes_no_history_and_a_same_day_renumber_closes_a_day_la
     assert_eq!(
         text(&admin, "select slug from municipalities").await,
         ["3291-baerum"]
+    );
+}
+
+/// 99 unchanged listed schools in 3201 Bærum, "Skole 0" to "Skole 98": enough that one
+/// close or rename stays under the circuit breaker (§5.3).
+fn bystanders() -> Vec<NsrUnit> {
+    (0..99)
+        .map(|i| testkit::unit(&format!("9{i:08}"), &format!("Skole {i}"), "3201"))
+        .collect()
+}
+
+fn with_bystanders(units: Vec<NsrUnit>) -> Vec<NsrUnit> {
+    units.into_iter().chain(bystanders()).collect()
+}
+
+/// The Handover's scenario: a seed, then a rename, then a re-registration, then the same
+/// inputs again, each checked against the test applier.
+#[tokio::test]
+async fn seed_rename_reregistration_then_nothing_match_the_test_applier() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    let records = fixture_records();
+    // Stange ungdomsskole is still open under its old number at the seed.
+    let stange_open = NsrUnit {
+        is_active: true,
+        closure: None,
+        ..stange_old()
+    };
+    let seeded: Vec<NsrUnit> = fixture_units()
+        .into_iter()
+        .filter(|u| u.orgnr != stange_new().orgnr)
+        .map(|u| {
+            if u.orgnr == stange_open.orgnr {
+                stange_open.clone()
+            } else {
+                u
+            }
+        })
+        .collect();
+    let seeded = with_bystanders(seeded);
+
+    let (seed, _) = step(
+        &pool,
+        &records,
+        &[],
+        &seeded,
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+    let seed = applied(seed);
+    assert_eq!(
+        (
+            seed.counts.municipalities_created,
+            seed.counts.schools_created
+        ),
+        (10, 108)
+    );
+
+    // Hosle is renamed; NTG loses its website.
+    let renamed: Vec<NsrUnit> = seeded
+        .iter()
+        .cloned()
+        .map(|u| match u.orgnr.as_str() {
+            "974552124" => NsrUnit {
+                name: "Hosle barneskole".into(),
+                ..u
+            },
+            "990672938" => NsrUnit { website: None, ..u },
+            _ => u,
+        })
+        .collect();
+    let (rename, _) = step(
+        &pool,
+        &records,
+        &[],
+        &renamed,
+        RunKind::Sync,
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await;
+    let rename = applied(rename);
+    assert_eq!(
+        (
+            rename.counts.schools_renamed,
+            rename.counts.schools_updated,
+            rename.counts.attribute_losses
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        text(
+            &admin,
+            &format!(
+                "select h.slug || ' ' || {} || ' ' || {} || ' ' || s.slug || ' ' || s.search_text
+                   from school_slug_history h join schools s on s.id = h.school_id",
+                utc("h.valid_from"),
+                utc("h.valid_until")
+            )
+        )
+        .await,
+        ["hosle-skole 2026-09-28T02:30:00Z 2026-10-05T02:30:00Z hosle-barneskole hosle barneskole"]
+    );
+
+    // The old number closes as "Slettet for sammenslåing" and the new one appears.
+    let reregistered: Vec<NsrUnit> = renamed
+        .iter()
+        .filter(|u| u.orgnr != stange_open.orgnr)
+        .cloned()
+        .chain([stange_old(), stange_new()])
+        .collect();
+    let (rereg, _) = step(
+        &pool,
+        &records,
+        &[],
+        &reregistered,
+        RunKind::Sync,
+        at("2026-10-12T02:30:00Z"),
+    )
+    .await;
+    let rereg = applied(rereg);
+    assert_eq!(
+        (rereg.counts.schools_closed, rereg.counts.schools_created),
+        (1, 1)
+    );
+    assert_eq!(
+        text(
+            &admin,
+            "select c.orgnr || ' ' || c.status || ' ' || c.closure_reason || ' ' || c.closed_on
+                    || ' ' || coalesce(c.slug, '-') || ' -> ' || s.orgnr || ' ' || s.slug
+               from schools c join schools s on s.id = c.successor_id"
+        )
+        .await,
+        ["975270920 closed merged 2024-08-25 - -> 933181995 stange-ungdomsskole"]
+    );
+
+    // The same inputs twice: nothing to do.
+    for week in ["2026-10-19T02:30:00Z", "2026-10-26T02:30:00Z"] {
+        assert_eq!(
+            step(&pool, &records, &[], &reregistered, RunKind::Sync, at(week)).await,
+            (SyncOutcome::NoChange, None)
+        );
+    }
+}
+
+/// A move, an out-of-scope close, a closure with an FAU, a submission hold and an unknown
+/// number in one run; then the same inputs again, whose review items all deduplicate away.
+#[tokio::test]
+async fn moves_closures_holds_and_reviews_match_the_test_applier() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    let records = fixture_records();
+    step(
+        &pool,
+        &records,
+        &[],
+        &with_bystanders(vec![hosle(), ntg(), lerberg()]),
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+    // Lerberg gets an FAU; someone submits "Ås skole" in Bærum.
+    exec(
+        &admin,
+        "insert into tenants (id, name, status, school_id)
+         select '01990000-0000-7000-8000-000000020001', 'Lerberg FAU', 'active', id
+           from schools where orgnr = '998516897';
+         insert into schools (id, municipality_id, origin, display_name, verification, status,
+                              search_text)
+         select '01990000-0000-7000-8000-000000030001', m.id, 'submitted', 'Ås skole',
+                'pending', 'active', 'ås skole as skole'
+           from municipalities m where m.slug = '3201-baerum';",
+    )
+    .await;
+
+    let units = with_bystanders(vec![
+        // Hosle moves to 3314 Øvre Eiker.
+        NsrUnit {
+            municipality_number: "3314".into(),
+            ..hosle()
+        },
+        // NTG turns into adult education.
+        NsrUnit {
+            category_ids: vec!["1".into(), "10".into()],
+            ..ntg()
+        },
+        // Lerberg closes, but it has an FAU.
+        NsrUnit {
+            is_active: false,
+            closure: Some(NsrClosure {
+                code: "N".into(),
+                at: Some(testkit::ts("2026-09-20T10:00:00Z")),
+            }),
+            ..lerberg()
+        },
+        testkit::unit("974000001", "Ås skole", "3201"),
+        testkit::unit("974000002", "Nordpolen skole", "9999"),
+    ]);
+    let (first, written) = step(
+        &pool,
+        &records,
+        &[],
+        &units,
+        RunKind::Sync,
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await;
+    let first = applied(first);
+    assert_eq!(
+        (
+            first.counts.schools_moved,
+            first.counts.schools_closed,
+            first.counts.schools_held,
+            first.counts.reviews,
+            first.counts.skipped,
+        ),
+        (1, 1, 1, 3, 1)
+    );
+    let written = written.expect("applied");
+    assert_eq!(
+        written
+            .new_reviews
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [
+            ReviewKind::PossibleSubmissionMatch,
+            ReviewKind::ClosureWithFau,
+            ReviewKind::UnknownMunicipalityNumber
+        ]
+    );
+    assert_eq!(written.deduplicated_reviews, 0);
+    assert_eq!(
+        text(
+            &admin,
+            "select s.orgnr || ' ' || s.status || ' ' || coalesce(s.closure_reason, '-') || ' '
+                    || s.in_scope || ' ' || s.verification || ' ' || coalesce(s.slug, '-')
+                    || ' ' || m.slug
+               from schools s join municipalities m on m.id = s.municipality_id
+              where s.orgnr in ('974552124', '990672938', '998516897', '974000001')
+              order by s.orgnr"
+        )
+        .await,
+        [
+            "974000001 active - true held - 3201-baerum",
+            "974552124 active - true listed hosle-skole 3314-oevre-eiker",
+            "990672938 closed out_of_scope false listed - 3201-baerum",
+            "998516897 active - true listed lerberg-skole-og-kompetansesenter 3314-oevre-eiker",
+        ]
+    );
+    assert_eq!(
+        text(
+            &admin,
+            "select m.slug || ' ' || h.slug from school_slug_history h
+               join municipalities m on m.id = h.municipality_id
+               join schools s on s.id = h.school_id order by s.orgnr"
+        )
+        .await,
+        [
+            "3201-baerum hosle-skole",
+            "3201-baerum norges-toppidrettsgymnas-ungdomsskole-baerum-as",
+        ]
+    );
+    assert_eq!(
+        text(
+            &admin,
+            "select kind || ' ' || details::text from register_review_items order by kind"
+        )
+        .await,
+        [
+            r#"closure_with_fau {"name": "Lerberg skole og kompetansesenter", "orgnr": "998516897", "reason": "closed", "closed_on": "2026-09-20"}"#,
+            r#"possible_submission_match {"orgnr": "974000001", "similarity": "1.00", "register_name": "Ås skole", "submitted_name": "Ås skole"}"#,
+            r#"unknown_municipality_number {"orgnrs": "974000002", "unit_count": "1", "municipality_number": "9999"}"#,
+        ]
+    );
+
+    // Again: the closure and the unknown number are raised again, and both deduplicate.
+    let (second, written) = step(
+        &pool,
+        &records,
+        &[],
+        &units,
+        RunKind::Sync,
+        at("2026-10-12T02:30:00Z"),
+    )
+    .await;
+    let second = applied(second);
+    assert!(second.municipality_ops.is_empty() && second.school_ops.is_empty());
+    assert_eq!(second.reviews.len(), 2);
+    let written = written.expect("applied");
+    assert!(written.wrote_nothing());
+    assert_eq!(written.deduplicated_reviews, 2);
+    assert_eq!(
+        text(&admin, "select count(*)::text from register_review_items").await,
+        ["3"]
+    );
+}
+
+/// Items with null references are told apart by their details: the reason plus the number
+/// or old code, and the municipality number.
+#[tokio::test]
+async fn open_reviews_deduplicate_on_their_discriminating_details() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    step(
+        &pool,
+        &fixture_records(),
+        &[],
+        &with_bystanders(vec![hosle()]),
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+
+    // A split of a 1507 nobody holds, a number SSB never explained, and units under two
+    // unknown numbers: four items, every one with no school and no municipality.
+    let records: Vec<MunicipalityRecord> = fixture_records()
+        .into_iter()
+        .chain([
+            record("1508", "Ålesund", "15", "Møre og Romsdal"),
+            record("1580", "Haram", "15", "Møre og Romsdal"),
+            record("4699", "Nyby", "46", "Vestland"),
+        ])
+        .collect();
+    let changes = [
+        change("1507", "Ålesund", "1508", "Ålesund", date(2024, 1, 1)),
+        change("1507", "Ålesund", "1580", "Haram", date(2024, 1, 1)),
+    ];
+    let mut units = with_bystanders(vec![
+        hosle(),
+        testkit::unit("974000002", "Nordpolen skole", "9999"),
+        testkit::unit("974000003", "Sydpolen skole", "9998"),
+    ]);
+    let reviews = |applied: Option<AppliedCounts>| {
+        let a = applied.expect("applied");
+        (a.new_reviews.len(), a.deduplicated_reviews)
+    };
+
+    let (_, first) = step(
+        &pool,
+        &records,
+        &changes,
+        &units,
+        RunKind::Sync,
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await;
+    assert_eq!(reviews(first), (4, 0));
+    let (_, second) = step(
+        &pool,
+        &records,
+        &changes,
+        &units,
+        RunKind::Sync,
+        at("2026-10-12T02:30:00Z"),
+    )
+    .await;
+    assert_eq!(reviews(second), (0, 4));
+
+    units.push(testkit::unit("974000004", "Månen skole", "9997"));
+    let (_, third) = step(
+        &pool,
+        &records,
+        &changes,
+        &units,
+        RunKind::Sync,
+        at("2026-10-19T02:30:00Z"),
+    )
+    .await;
+    assert_eq!(reviews(third), (1, 4));
+    assert_eq!(
+        text(
+            &admin,
+            "select kind || ' ' || coalesce(details->>'reason', details->>'municipality_number')
+                    || ' ' || coalesce(details->>'old_code', details->>'number', '-')
+               from register_review_items order by 1"
+        )
+        .await,
+        [
+            "municipality_split_or_merge split 1507",
+            "municipality_split_or_merge unknown_number 4699",
+            "unknown_municipality_number 9997 -",
+            "unknown_municipality_number 9998 -",
+            "unknown_municipality_number 9999 -",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn payloads_are_staged_with_their_hash_and_scope_and_mark_schools_seen() {
+    use sha2::{Digest, Sha256};
+
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    step(
+        &pool,
+        &fixture_records(),
+        &[],
+        &[hosle()],
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+
+    let first = br#"{"Organisasjonsnummer": "974552124"}"#.to_vec();
+    let second = br#"{"Organisasjonsnummer": "974552124", "Navn": "Hosle skole"}"#.to_vec();
+    let mut tx = pool.begin().await.unwrap();
+    stage_payloads(
+        &mut tx,
+        &[
+            NsrPayload::new(&hosle(), first),
+            NsrPayload::new(&gran_canaria(), b"{}".to_vec()),
+        ],
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await
+    .unwrap();
+    stage_payloads(
+        &mut tx,
+        &[NsrPayload::new(&hosle(), second.clone())],
+        at("2026-10-12T02:30:00Z"),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let sha: String = Sha256::digest(&second)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        text(
+            &admin,
+            &format!(
+                "select external_id || ' ' || payload_sha256 || ' ' || in_scope || ' '
+                        || scope_reason || ' ' || {} || ' ' || coalesce({}, '-')
+                        || ' ' || payload::text
+                   from register_source_records order by external_id",
+                utc("fetched_at"),
+                utc("source_changed_at")
+            )
+        )
+        .await,
+        [
+            format!(
+                r#"974552124 {sha} true in_scope 2026-10-12T02:30:00Z 2026-09-13T01:05:43Z {{"Navn": "Hosle skole", "Organisasjonsnummer": "974552124"}}"#
+            ),
+            "U90099017 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a false abroad 2026-10-05T02:30:00Z - {}".to_owned(),
+        ]
+    );
+    assert_eq!(
+        text(
+            &admin,
+            &format!("select {} from schools", utc("last_seen_in_source_at"))
+        )
+        .await,
+        ["2026-10-12T02:30:00Z"]
     );
 }

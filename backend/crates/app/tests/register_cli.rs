@@ -867,3 +867,45 @@ async fn the_detail_pass_logs_its_progress_in_counts() {
         (&json!(12), &json!(12))
     );
 }
+
+/// Final review, item 3: a sync blocked by a lock another session holds gives up after the
+/// connection's 10 s `lock_timeout`, exits 1 and records `database_timeout`, rather than
+/// hanging the CronJob until its deadline.
+#[tokio::test]
+async fn a_sync_blocked_on_a_lock_fails_with_database_timeout() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    let env = sources.env(&db.register_url());
+
+    // Only the snapshot reads this table: the lock, the emptiness check and the run row all
+    // get through, and the run blocks once it has started.
+    let mut holder = admin.begin().await.unwrap();
+    sqlx::query("lock table school_slug_history in access exclusive mode")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        fau(&["sync", "--seed"], &env),
+    )
+    .await
+    .expect("the blocked sync must give up on its own, well before 45 s");
+    let waited = started.elapsed();
+    holder.rollback().await.unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        waited >= std::time::Duration::from_secs(9),
+        "it waited the lock timeout out: {waited:?}"
+    );
+    assert_eq!(
+        runs(&admin).await,
+        [(
+            "seed".into(),
+            Some("failed".into()),
+            Some("database_timeout".into())
+        )]
+    );
+}

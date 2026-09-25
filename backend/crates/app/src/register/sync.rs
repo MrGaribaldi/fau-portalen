@@ -12,9 +12,9 @@ use fau_domain::register::source::NsrUnit;
 use fau_domain::register::sync::{plan, RunKind, SyncInputs, SyncOutcome, SyncPlan};
 use fau_domain::time::Moment;
 use fau_persistence::register::{
-    abort_reason_text, apply_plan, load_snapshot, record_aborted, record_applied, record_dry_run,
-    record_failed, record_no_change, register_is_empty, seed_date, stage_payloads, start_run,
-    try_lock, AppliedCounts, NsrPayload, RegisterError,
+    abort_reason_text, apply_plan, connect, load_snapshot, record_aborted, record_applied,
+    record_dry_run, record_failed, record_no_change, register_is_empty, seed_date, stage_payloads,
+    start_run, try_lock, AppliedCounts, NsrPayload, RegisterError,
 };
 use fau_register_sources::client::SourceClient;
 use fau_register_sources::SourceError;
@@ -59,6 +59,7 @@ impl SyncError {
     /// `Display`, a URL, a response body or an address.
     fn code(&self) -> &'static str {
         match self {
+            SyncError::Database(e) | SyncError::Apply(e) if e.is_timeout() => "database_timeout",
             SyncError::Database(_) => "database_error",
             SyncError::Source(_) => "source_error",
             SyncError::Apply(_) => "apply_error",
@@ -91,7 +92,7 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
     // A dedicated connection, never a pooled one (controller hand-off): it holds the session
     // advisory lock for the whole run, and closing it -- on every exit path, including an
     // error or a panic -- is what releases that lock.
-    let mut conn = match PgConnection::connect(config.database_url.expose()).await {
+    let mut conn = match connect(config.database_url.expose()).await {
         Ok(conn) => conn,
         Err(e) => {
             let e = SyncError::from(e);
@@ -127,7 +128,7 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
 /// is then left unfinished for real, which is what #3442's alerting on a stuck run watches
 /// for.
 async fn record_run_failure(config: &RegisterConfig, run: Uuid, reason: &'static str) {
-    let mut fresh = match PgConnection::connect(config.database_url.expose()).await {
+    let mut fresh = match connect(config.database_url.expose()).await {
         Ok(fresh) => fresh,
         Err(_) => {
             tracing::error!(run_id = %run, "could not connect to record the run as failed");

@@ -4,6 +4,7 @@
 //! reads the database clock for a rule, so every function takes the caller's `Moment`.
 
 mod apply;
+mod connect;
 mod error;
 mod export;
 mod reviews;
@@ -14,6 +15,7 @@ mod sql;
 mod staging;
 
 pub use apply::{apply_plan, AppliedCounts};
+pub use connect::{connect, LOCK_TIMEOUT, STATEMENT_TIMEOUT};
 pub use error::RegisterError;
 pub use export::{export_rows, ExportRow};
 pub use reviews::NewReview;

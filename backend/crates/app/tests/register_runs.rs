@@ -8,8 +8,8 @@ use fau_domain::register::sync::testkit::{self, fixture_records, hosle, lerberg}
 use fau_domain::register::sync::{plan, AbortReason, Counts, RunKind, SyncOutcome, SyncPlan};
 use fau_domain::time::Moment;
 use fau_persistence::register::{
-    apply_plan, load_snapshot, record_aborted, record_applied, record_dry_run, record_failed,
-    record_no_change, seed_date, start_run, try_lock, unlock, RegisterError,
+    apply_plan, connect, load_snapshot, record_aborted, record_applied, record_dry_run,
+    record_failed, record_no_change, seed_date, start_run, try_lock, unlock, RegisterError,
 };
 use jiff::civil::date;
 use serde_json::{json, Value};
@@ -395,4 +395,29 @@ async fn the_runtime_role_cannot_record_a_run() {
         start_run(&mut conn, RunKind::Sync, false, at("2026-10-05T02:30:00Z")).await,
         Err(RegisterError::Database("sqlstate 42501".into()))
     );
+}
+
+/// Final review, item 3: every register connection carries its own timeouts, so a run blocked
+/// on a lock or a statement fails instead of hanging the CronJob.
+#[tokio::test]
+async fn a_register_connection_has_statement_and_lock_timeouts() {
+    let db = TestDb::migrated().await;
+    let mut conn = connect(&db.register_url()).await.unwrap();
+    let statement: String = sqlx::query_scalar("show statement_timeout")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let lock: String = sqlx::query_scalar("show lock_timeout")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!((statement.as_str(), lock.as_str()), ("1min", "10s"));
+}
+
+#[test]
+fn a_timeout_is_told_apart_from_other_database_errors() {
+    assert!(RegisterError::Database("sqlstate 55P03".into()).is_timeout());
+    assert!(RegisterError::Database("sqlstate 57014".into()).is_timeout());
+    assert!(!RegisterError::Database("sqlstate 42501".into()).is_timeout());
+    assert!(!RegisterError::Decode.is_timeout());
 }

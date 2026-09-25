@@ -19,6 +19,15 @@ pub enum RegisterError {
     PayloadNotUtf8,
 }
 
+impl RegisterError {
+    /// The session's `lock_timeout` (SQLSTATE 55P03) or `statement_timeout` (57014) ended a
+    /// statement: the run was blocked, not refused.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, RegisterError::Database(kind)
+            if kind == "sqlstate 55P03" || kind == "sqlstate 57014")
+    }
+}
+
 impl From<sqlx::Error> for RegisterError {
     fn from(e: sqlx::Error) -> Self {
         RegisterError::Database(safe_error_kind(&e))

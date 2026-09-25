@@ -4,8 +4,7 @@
 //! quotes doubled) and LF line ends. Values are written as they are: whoever opens the file
 //! in a spreadsheet imports it as text.
 
-use fau_persistence::register::{export_rows, ExportRow, RegisterError};
-use sqlx::{Connection, PgConnection};
+use fau_persistence::register::{connect, export_rows, ExportRow, RegisterError};
 
 use super::Exit;
 use crate::config::RegisterConfig;
@@ -40,7 +39,7 @@ pub(super) fn csv(rows: &[ExportRow]) -> String {
 
 pub(super) async fn export(config: &RegisterConfig) -> Exit {
     let rows: Result<Vec<ExportRow>, RegisterError> = async {
-        let mut conn = PgConnection::connect(config.database_url.expose()).await?;
+        let mut conn = connect(config.database_url.expose()).await?;
         export_rows(&mut conn).await
     }
     .await;

@@ -6,6 +6,7 @@
 mod apply;
 mod error;
 mod reviews;
+mod runs;
 mod school_ops;
 mod snapshot;
 mod sql;
@@ -14,5 +15,10 @@ mod staging;
 pub use apply::{apply_plan, AppliedCounts};
 pub use error::RegisterError;
 pub use reviews::NewReview;
+pub use runs::{
+    abort_reason_text, counts_json, record_aborted, record_applied, record_dry_run, record_failed,
+    record_no_change, seed_date, start_run, try_lock, unlock, REGISTER_SYNC_LOCK_ID,
+    SYNC_APPLIED_ACTION,
+};
 pub use snapshot::{load_snapshot, register_is_empty};
 pub use staging::{stage_payloads, NsrPayload};

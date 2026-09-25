@@ -18,6 +18,11 @@ pub(crate) fn ts_param(t: Timestamp) -> String {
     t.to_string()
 }
 
+/// A timestamp read back as microseconds since the epoch.
+pub(crate) fn from_micros(us: i64) -> Result<Timestamp, RegisterError> {
+    Timestamp::from_microsecond(us).map_err(|_| RegisterError::Decode)
+}
+
 pub(crate) fn municipality_status(code: &str) -> Result<MunicipalityStatus, RegisterError> {
     match code {
         "active" => Ok(MunicipalityStatus::Active),

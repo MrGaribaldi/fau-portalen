@@ -18,6 +18,7 @@ use fau_persistence::register::{
 };
 use fau_register_sources::client::SourceClient;
 use fau_register_sources::SourceError;
+use jiff::Timestamp;
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
@@ -83,7 +84,9 @@ impl From<FetchError> for SyncError {
 }
 
 pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> Exit {
-    let at = Moment::at(jiff::Timestamp::now());
+    // The register's own rules, and `started_at`, run on this one instant. Every finish time
+    // is read from the clock when the run actually finishes (final review, item 1).
+    let at = Moment::at(Timestamp::now());
     let kind = if seed { RunKind::Seed } else { RunKind::Sync };
     // A dedicated connection, never a pooled one (controller hand-off): it holds the session
     // advisory lock for the whole run, and closing it -- on every exit path, including an
@@ -106,7 +109,7 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
                 // hand-off). If the apply failed because `conn` itself broke (an io error, or
                 // its backend killed, e.g. by a Postgres restart), reusing it to record the
                 // failure would fail the same way and leave the run row unfinished forever.
-                record_run_failure(config, run, e.code(), at).await;
+                record_run_failure(config, run, e.code()).await;
                 Exit::Failed
             }
         },
@@ -123,7 +126,7 @@ pub(super) async fn sync(config: &RegisterConfig, dry_run: bool, seed: bool) -> 
 /// cannot write, a fixed-text error goes to stderr and the caller still exits 1; the run row
 /// is then left unfinished for real, which is what #3442's alerting on a stuck run watches
 /// for.
-async fn record_run_failure(config: &RegisterConfig, run: Uuid, reason: &'static str, at: Moment) {
+async fn record_run_failure(config: &RegisterConfig, run: Uuid, reason: &'static str) {
     let mut fresh = match PgConnection::connect(config.database_url.expose()).await {
         Ok(fresh) => fresh,
         Err(_) => {
@@ -131,7 +134,10 @@ async fn record_run_failure(config: &RegisterConfig, run: Uuid, reason: &'static
             return;
         }
     };
-    if record_failed(&mut fresh, run, reason, at).await.is_err() {
+    if record_failed(&mut fresh, run, reason, Timestamp::now())
+        .await
+        .is_err()
+    {
         tracing::error!(run_id = %run, "could not record the run as failed");
     }
 }
@@ -183,7 +189,9 @@ async fn execute(
         RunKind::Sync => Some(seed_date(conn).await?.ok_or(SyncError::NoSeed)?),
     };
     let held = load_snapshot(conn).await?;
-    let client = Arc::new(SourceClient::new(source_urls(config))?);
+    let client = Arc::new(
+        SourceClient::new(source_urls(config))?.with_retry_delays(config.source_retry_delays),
+    );
     let fetched = fetch(client, &held, kind, ssb_from, at.today()).await?;
     if fetched.absent_from_list > 0 {
         tracing::warn!(
@@ -217,15 +225,15 @@ async fn execute(
         tx.rollback().await?;
         return Ok(match &outcome {
             SyncOutcome::Abort { reason, counts } => {
-                record_dry_run(conn, run, counts, Some(reason), at).await?;
+                record_dry_run(conn, run, counts, Some(reason), Timestamp::now()).await?;
                 Exit::Aborted
             }
             SyncOutcome::Apply(plan) => {
-                record_dry_run(conn, run, &plan.counts, None, at).await?;
+                record_dry_run(conn, run, &plan.counts, None, Timestamp::now()).await?;
                 Exit::Done
             }
             SyncOutcome::NoChange => {
-                record_dry_run(conn, run, &Default::default(), None, at).await?;
+                record_dry_run(conn, run, &Default::default(), None, Timestamp::now()).await?;
                 Exit::Done
             }
         });
@@ -234,7 +242,7 @@ async fn execute(
     match outcome {
         SyncOutcome::NoChange => {
             tx.rollback().await?;
-            record_no_change(conn, run, at).await?;
+            record_no_change(conn, run, Timestamp::now()).await?;
             tracing::info!(run_id = %run, outcome = "no_change", "register sync finished");
             Ok(Exit::Done)
         }
@@ -246,7 +254,16 @@ async fn execute(
             // before `conn` is next used -- the same reasoning as `apply_and_stage`'s error
             // arm below, never `Transaction`'s drop glue.
             let mut record_tx = conn.begin().await?;
-            if let Err(e) = record_aborted(&mut record_tx, run, kind, &reason, &counts, at).await {
+            if let Err(e) = record_aborted(
+                &mut record_tx,
+                run,
+                kind,
+                &reason,
+                &counts,
+                Timestamp::now(),
+            )
+            .await
+            {
                 let _ = record_tx.rollback().await;
                 return Err(SyncError::Database(e));
             }
@@ -263,7 +280,7 @@ async fn execute(
                 Ok(applied) if applied.wrote_nothing() => {
                     // Every review deduplicated away and there was no op: nothing to keep.
                     tx.rollback().await?;
-                    record_no_change(conn, run, at).await?;
+                    record_no_change(conn, run, Timestamp::now()).await?;
                     tracing::info!(
                         run_id = %run,
                         outcome = "no_change",
@@ -319,6 +336,6 @@ async fn apply_and_stage(
         .map(|(unit, body)| NsrPayload::new(&unit, body))
         .collect();
     stage_payloads(tx, &payloads, at).await?;
-    record_applied(tx, run, kind, &applied, at).await?;
+    record_applied(tx, run, kind, &applied, Timestamp::now()).await?;
     Ok(applied)
 }

@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
@@ -322,6 +323,7 @@ async fn an_unreachable_source_is_a_transport_error() {
     };
     let err = SourceClient::new(dead)
         .unwrap()
+        .with_retry_delays([Duration::ZERO, Duration::ZERO])
         .municipalities()
         .await
         .unwrap_err();
@@ -338,4 +340,152 @@ fn production_urls_are_the_documented_ones() {
     assert_eq!(u.kartverket, "https://api.kartverket.no/kommuneinfo/v1");
     assert_eq!(u.ssb, "https://data.ssb.no/api/klass/v1");
     assert_eq!(u.brreg, "https://data.brreg.no/enhetsregisteret/api");
+}
+
+/// Final review, item 2: a client whose NSR detail endpoint answers each request with the
+/// next status in `script` (then 200 with Hosle's recorded detail once the script runs out),
+/// retrying after 20 ms and then 40 ms. Returns the client and the request counter.
+async fn scripted_detail_client(
+    script: Vec<StatusCode>,
+    body: Vec<u8>,
+) -> (SourceClient, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let script = Arc::new(script);
+    let body = Arc::new(body);
+    let app = Router::new().route(
+        "/v4/enhet/{orgnr}",
+        get(move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let (script, body) = (script.clone(), body.clone());
+            async move {
+                match script.get(n) {
+                    Some(status) => (*status, Vec::new()),
+                    None => (StatusCode::OK, body.to_vec()),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let urls = SourceUrls {
+        nsr: format!("http://{addr}"),
+        kartverket: "http://127.0.0.1:9/unused".into(),
+        ssb: "http://127.0.0.1:9/unused".into(),
+        brreg: "http://127.0.0.1:9/unused".into(),
+    };
+    let client = SourceClient::new(urls)
+        .unwrap()
+        .with_retry_delays([Duration::from_millis(20), Duration::from_millis(40)]);
+    (client, hits)
+}
+
+#[tokio::test]
+async fn a_5xx_is_retried_and_a_later_success_is_used() {
+    let (c, hits) = scripted_detail_client(
+        vec![StatusCode::SERVICE_UNAVAILABLE],
+        fixture("nsr/enhet-974552124.json"),
+    )
+    .await;
+    assert_eq!(c.nsr_unit("974552124").await.unwrap().name, "Hosle skole");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_persistent_5xx_gives_up_after_three_attempts_with_both_delays() {
+    let (c, hits) = scripted_detail_client(
+        vec![StatusCode::BAD_GATEWAY; 10],
+        fixture("nsr/enhet-974552124.json"),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let err = c.nsr_unit("974552124").await.unwrap_err();
+    assert_eq!(
+        (err.source, err.kind),
+        (Source::Nsr, SourceErrorKind::Status { status: 502 })
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "three attempts in total");
+    assert!(
+        started.elapsed() >= Duration::from_millis(60),
+        "waited 20 ms, then 40 ms: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_4xx_is_never_retried() {
+    let (c, hits) = scripted_detail_client(
+        vec![StatusCode::NOT_FOUND],
+        fixture("nsr/enhet-974552124.json"),
+    )
+    .await;
+    let err = c.nsr_unit("974552124").await.unwrap_err();
+    assert_eq!(err.kind, SourceErrorKind::Status { status: 404 });
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_parse_error_is_never_retried() {
+    let (c, hits) = scripted_detail_client(Vec::new(), b"{\"not\": \"a unit\"}".to_vec()).await;
+    let err = c.nsr_unit("974552124").await.unwrap_err();
+    assert!(
+        matches!(err.kind, SourceErrorKind::Parse { .. }),
+        "{:?}",
+        err.kind
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+/// A server that drops its first connection without a response, then answers every later
+/// one with Kartverket's recorded municipalities: a transport error, then a success.
+#[tokio::test]
+async fn a_transport_error_is_retried() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        let body = fixture("kartverket/fylkerkommuner.json");
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                drop(socket);
+                continue;
+            }
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    let urls = SourceUrls {
+        nsr: "http://127.0.0.1:9/unused".into(),
+        kartverket: format!("http://{addr}"),
+        ssb: "http://127.0.0.1:9/unused".into(),
+        brreg: "http://127.0.0.1:9/unused".into(),
+    };
+    let c = SourceClient::new(urls)
+        .unwrap()
+        .with_retry_delays([Duration::from_millis(10), Duration::from_millis(10)]);
+    assert_eq!(c.municipalities().await.unwrap().len(), 357);
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn the_default_retry_delays_are_one_then_four_seconds() {
+    assert_eq!(
+        fau_register_sources::client::DEFAULT_RETRY_DELAYS,
+        [Duration::from_secs(1), Duration::from_secs(4)]
+    );
 }

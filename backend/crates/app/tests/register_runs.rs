@@ -44,7 +44,7 @@ async fn run(
         &testkit::inputs(&fixture_records(), &[], units, kind),
     ));
     let counts = apply_plan(&mut tx, &plan, at).await.unwrap();
-    record_applied(&mut tx, id, kind, &counts, at)
+    record_applied(&mut tx, id, kind, &counts, at.now())
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -214,7 +214,7 @@ async fn an_abort_records_its_reason_and_one_mail_and_nothing_else() {
         RunKind::Seed,
         &AbortReason::EmptySource { source: "nsr" },
         &Counts::default(),
-        now,
+        now.now(),
     )
     .await
     .unwrap();
@@ -236,7 +236,7 @@ async fn an_abort_records_its_reason_and_one_mail_and_nothing_else() {
             active: 100,
         },
         &mass_counts,
-        now,
+        now.now(),
     )
     .await
     .unwrap();
@@ -298,7 +298,7 @@ async fn no_change_dry_run_and_failed_rows_finish_once() {
     let quiet = start_run(&mut conn, RunKind::Sync, false, now)
         .await
         .unwrap();
-    record_no_change(&mut conn, quiet, now).await.unwrap();
+    record_no_change(&mut conn, quiet, now.now()).await.unwrap();
     let dry = start_run(&mut conn, RunKind::Sync, true, now)
         .await
         .unwrap();
@@ -310,14 +310,14 @@ async fn no_change_dry_run_and_failed_rows_finish_once() {
             ..Counts::default()
         },
         None,
-        now,
+        now.now(),
     )
     .await
     .unwrap();
     let failed = start_run(&mut conn, RunKind::Sync, false, now)
         .await
         .unwrap();
-    record_failed(&mut conn, failed, "source Nsr: Transport", now)
+    record_failed(&mut conn, failed, "source Nsr: Transport", now.now())
         .await
         .unwrap();
 
@@ -344,7 +344,7 @@ async fn no_change_dry_run_and_failed_rows_finish_once() {
         )
     );
     assert_eq!(
-        record_no_change(&mut conn, quiet, now).await,
+        record_no_change(&mut conn, quiet, now.now()).await,
         Err(RegisterError::UnknownRow),
         "a finished run is never finished again"
     );
@@ -363,7 +363,7 @@ async fn the_ssb_lookback_starts_on_the_oslo_date_of_the_first_applied_seed() {
     let dry = start_run(&mut conn, RunKind::Seed, true, now)
         .await
         .unwrap();
-    record_dry_run(&mut conn, dry, &Counts::default(), None, now)
+    record_dry_run(&mut conn, dry, &Counts::default(), None, now.now())
         .await
         .unwrap();
     let aborted = start_run(&mut conn, RunKind::Seed, false, now)
@@ -375,7 +375,7 @@ async fn the_ssb_lookback_starts_on_the_oslo_date_of_the_first_applied_seed() {
         RunKind::Seed,
         &AbortReason::EmptySource { source: "nsr" },
         &Counts::default(),
-        now,
+        now.now(),
     )
     .await
     .unwrap();

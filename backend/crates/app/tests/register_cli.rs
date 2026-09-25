@@ -5,8 +5,8 @@
 
 mod common;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query};
@@ -87,6 +87,12 @@ struct Sources {
     pause_kartverket: Arc<AtomicBool>,
     paused: Arc<Notify>,
     resume: Arc<Notify>,
+    /// Milliseconds Kartverket waits before it answers: a run that visibly takes time.
+    slow_kartverket_ms: Arc<AtomicU64>,
+    /// Orgnrs whose next detail request answers 503, once each.
+    flaky_detail: Arc<Mutex<HashSet<String>>>,
+    /// Every NSR detail request, by orgnr.
+    detail_hits: Arc<Mutex<Vec<String>>>,
 }
 
 impl Sources {
@@ -97,6 +103,11 @@ impl Sources {
         let pause_kartverket = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
+        let slow_kartverket_ms = Arc::new(AtomicU64::new(0));
+        let slow = slow_kartverket_ms.clone();
+        let flaky_detail = Arc::new(Mutex::new(HashSet::new()));
+        let detail_hits = Arc::new(Mutex::new(Vec::new()));
+        let (flaky, hits) = (flaky_detail.clone(), detail_hits.clone());
         let (empty, queries) = (empty_nsr.clone(), ssb_queries.clone());
         let fail = fail_detail.clone();
         let (pause, entered, released) = (pause_kartverket.clone(), paused.clone(), resume.clone());
@@ -122,9 +133,14 @@ impl Sources {
                 "/nsr/v4/enhet/{orgnr}",
                 get(move |Path(orgnr): Path<String>| {
                     let fail = fail.load(Ordering::SeqCst);
+                    hits.lock().unwrap().push(orgnr.clone());
+                    let flaky = flaky.lock().unwrap().remove(&orgnr);
                     async move {
                         if fail {
                             return (StatusCode::INTERNAL_SERVER_ERROR, Vec::new());
+                        }
+                        if flaky {
+                            return (StatusCode::SERVICE_UNAVAILABLE, Vec::new());
                         }
                         match std::fs::read(format!("{FIXTURES}/nsr/enhet-{orgnr}.json")) {
                             Ok(body) => (StatusCode::OK, body),
@@ -138,7 +154,9 @@ impl Sources {
                 get(move || {
                     let (pause, entered, released) =
                         (pause.clone(), entered.clone(), released.clone());
+                    let slow = slow.load(Ordering::SeqCst);
                     async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(slow)).await;
                         if pause.load(Ordering::SeqCst) {
                             entered.notify_one();
                             released.notified().await;
@@ -168,6 +186,9 @@ impl Sources {
             pause_kartverket,
             paused,
             resume,
+            slow_kartverket_ms,
+            flaky_detail,
+            detail_hits,
         }
     }
 
@@ -179,6 +200,8 @@ impl Sources {
             ("REGISTER_KARTVERKET_URL", format!("{}/kv", self.base)),
             ("REGISTER_SSB_URL", format!("{}/ssb", self.base)),
             ("LOG_LEVEL", "info".to_owned()),
+            // Three attempts, as in production, but without its 1 s and 4 s waits.
+            ("REGISTER_SOURCE_RETRY_DELAYS_MS", "10,20".to_owned()),
         ]
     }
 }
@@ -709,4 +732,138 @@ async fn a_dry_run_that_would_abort_exits_3() {
         )]
     );
     assert_eq!(count(&admin, "municipalities").await, 0);
+}
+
+/// Final review, item 1: a run row's `finished_at`, and its audit entry's `occurred_at`, are
+/// when the run actually finished -- never the `Moment` it started at.
+#[tokio::test]
+async fn a_run_records_when_it_actually_finished() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    sources.slow_kartverket_ms.store(400, Ordering::SeqCst);
+
+    let out = fau(&["sync", "--seed"], &sources.env(&db.register_url())).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let (run_ms, audit_ms, mail_ms): (f64, f64, f64) = sqlx::query_as(
+        "select extract(epoch from r.finished_at - r.started_at)::float8 * 1000,
+                extract(epoch from a.occurred_at - r.started_at)::float8 * 1000,
+                extract(epoch from o.created_at - r.started_at)::float8 * 1000
+           from register_sync_runs r
+           join audit_events a on a.subject_id = r.id
+           join outbox o on o.template = 'register.seed_summary'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    for (what, ms) in [
+        ("finished_at", run_ms),
+        ("occurred_at", audit_ms),
+        ("mail", mail_ms),
+    ] {
+        assert!(ms >= 400.0, "{what} is only {ms} ms after started_at");
+    }
+
+    // A failed run, too: its finish time is taken when the failure is recorded.
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    sources.fail_detail.store(true, Ordering::SeqCst);
+    let failed = fau(&["sync", "--seed"], &sources.env(&db.register_url())).await;
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+    let failed_ms: f64 = sqlx::query_scalar(
+        "select extract(epoch from finished_at - started_at)::float8 * 1000
+           from register_sync_runs",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert!(
+        failed_ms >= 400.0,
+        "a failed run finished {failed_ms} ms after it started"
+    );
+}
+
+/// The log lines of `out` whose message is `message`, parsed.
+fn log_lines(out: &std::process::Output, message: &str) -> Vec<Value> {
+    stderr(out)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|l| l["message"] == json!(message))
+        .collect()
+}
+
+/// Final review, item 2: a detail request that answers 503 once is retried, and the run
+/// succeeds. The retry is logged with the source and the kind, never the URL.
+#[tokio::test]
+async fn a_detail_that_fails_once_with_503_is_retried_and_the_run_succeeds() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    sources
+        .flaky_detail
+        .lock()
+        .unwrap()
+        .insert("974552124".to_owned());
+
+    let out = fau(&["sync", "--seed"], &sources.env(&db.register_url())).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(count(&admin, "schools").await, 9);
+    let hosle_hits = sources
+        .detail_hits
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|o| *o == "974552124")
+        .count();
+    assert_eq!(hosle_hits, 2, "one 503, then one success");
+    let retries = log_lines(&out, "source request failed, retrying");
+    assert_eq!(retries.len(), 1, "{}", stderr(&out));
+    let log = stderr(&out);
+    assert!(log.contains("Status"), "{log}");
+    assert!(!log.contains("127.0.0.1") && !log.contains("/v4/"), "{log}");
+}
+
+/// Final review, item 2: a detail fetch that keeps failing names the failing orgnr and the
+/// error's source and kind in its log line, after three attempts, and never a URL or a body.
+#[tokio::test]
+async fn a_persistent_detail_failure_is_logged_with_its_orgnr_and_kind() {
+    let db = TestDb::migrated().await;
+    let sources = Sources::start().await;
+    sources.fail_detail.store(true, Ordering::SeqCst);
+
+    let out = fau(&["sync", "--seed"], &sources.env(&db.register_url())).await;
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let failures = log_lines(&out, "NSR detail fetch failed");
+    assert!(!failures.is_empty(), "{}", stderr(&out));
+    for line in &failures {
+        let fields = line;
+        let orgnr = fields["orgnr"].as_str().expect("the orgnr is logged");
+        assert!(ORGNRS.contains(&orgnr), "{line}");
+        assert_eq!(fields["source"], json!("Nsr"), "{line}");
+        assert_eq!(fields["kind"], json!("Status { status: 500 }"), "{line}");
+    }
+    let hits = sources.detail_hits.lock().unwrap().clone();
+    let first = failures[0]["orgnr"].as_str().unwrap();
+    assert_eq!(
+        hits.iter().filter(|o| *o == first).count(),
+        3,
+        "three attempts in total: {hits:?}"
+    );
+    let log = stderr(&out);
+    assert!(!log.contains("127.0.0.1") && !log.contains("/v4/"), "{log}");
+}
+
+/// Final review, item 11: the detail pass reports its progress in counts only.
+#[tokio::test]
+async fn the_detail_pass_logs_its_progress_in_counts() {
+    let db = TestDb::migrated().await;
+    let sources = Sources::start().await;
+    let out = fau(&["sync", "--seed"], &sources.env(&db.register_url())).await;
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let done = log_lines(&out, "NSR detail pass finished");
+    assert_eq!(done.len(), 1, "{}", stderr(&out));
+    assert_eq!(
+        (&done[0]["fetched"], &done[0]["total"]),
+        (&json!(12), &json!(12))
+    );
 }

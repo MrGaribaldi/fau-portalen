@@ -4,11 +4,16 @@
 //!
 //! Audit and mail are global: no tenant, actor `system`, and params that hold ids, codes and
 //! counts only. Mail goes to the operational address (§5.3) through 0004's global templates.
+//!
+//! Only [`start_run`] takes the run's `Moment`, for `started_at`. Every function that finishes
+//! a run takes `finished_at`, the wall-clock time the run actually finished, which is also the
+//! audit entry's `occurred_at` and the mail's `created_at` (final review, item 1).
 
 use fau_domain::membership::rules::EWB_OVERSIGHT_ADDRESS;
 use fau_domain::register::sync::{AbortReason, Counts, RunKind};
 use fau_domain::time::{oslo_today, Moment};
 use jiff::civil::Date;
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -110,7 +115,7 @@ async fn finish(
     outcome: &str,
     counts: Value,
     abort_reason: Option<&str>,
-    at: Moment,
+    finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
     let updated = sqlx::query(
         "update register_sync_runs
@@ -119,7 +124,7 @@ async fn finish(
           where id = $1 and finished_at is null",
     )
     .bind(run)
-    .bind(ts_param(at.now()))
+    .bind(ts_param(finished_at))
     .bind(outcome)
     .bind(counts.to_string())
     .bind(abort_reason)
@@ -136,7 +141,7 @@ async fn finish(
 pub async fn record_no_change(
     conn: &mut PgConnection,
     run: Uuid,
-    at: Moment,
+    finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
     finish(
         conn,
@@ -144,7 +149,7 @@ pub async fn record_no_change(
         "no_change",
         counts_json(&Counts::default()),
         None,
-        at,
+        finished_at,
     )
     .await
 }
@@ -156,7 +161,7 @@ pub async fn record_dry_run(
     run: Uuid,
     counts: &Counts,
     abort: Option<&AbortReason>,
-    at: Moment,
+    finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
     let reason = abort.map(abort_reason_text);
     finish(
@@ -165,7 +170,7 @@ pub async fn record_dry_run(
         "no_change",
         counts_json(counts),
         reason.as_deref(),
-        at,
+        finished_at,
     )
     .await
 }
@@ -176,9 +181,9 @@ pub async fn record_failed(
     conn: &mut PgConnection,
     run: Uuid,
     reason: &str,
-    at: Moment,
+    finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
-    finish(conn, run, "failed", json!({}), Some(reason), at).await
+    finish(conn, run, "failed", json!({}), Some(reason), finished_at).await
 }
 
 /// The circuit breaker or an empty source stopped the run (§5.3): the run row and the
@@ -189,10 +194,18 @@ pub async fn record_aborted(
     kind: RunKind,
     reason: &AbortReason,
     counts: &Counts,
-    at: Moment,
+    finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
     let text = abort_reason_text(reason);
-    finish(conn, run, "aborted", counts_json(counts), Some(&text), at).await?;
+    finish(
+        conn,
+        run,
+        "aborted",
+        counts_json(counts),
+        Some(&text),
+        finished_at,
+    )
+    .await?;
     let mut params = json!({ "run_id": run, "kind": kind_code(kind) });
     match reason {
         AbortReason::EmptySource { source } => {
@@ -212,7 +225,7 @@ pub async fn record_aborted(
             params["active"] = json!(active);
         }
     }
-    enqueue(conn, "register.sync_aborted", params, at).await
+    enqueue(conn, "register.sync_aborted", params, finished_at).await
 }
 
 /// An applied run, inside the transaction that applied it: the run row, one audit entry, and
@@ -224,12 +237,12 @@ pub async fn record_applied(
     run: Uuid,
     kind: RunKind,
     applied: &AppliedCounts,
-    at: Moment,
+    finished_at: Timestamp,
 ) -> Result<(), RegisterError> {
     let mut counts = counts_json(&applied.counts);
     counts["reviews_written"] = json!(applied.new_reviews.len());
     counts["reviews_deduplicated"] = json!(applied.deduplicated_reviews);
-    finish(conn, run, "applied", counts.clone(), None, at).await?;
+    finish(conn, run, "applied", counts.clone(), None, finished_at).await?;
 
     let mut params = counts.clone();
     params["kind"] = json!(kind_code(kind));
@@ -241,7 +254,7 @@ pub async fn record_applied(
     .bind(Uuid::now_v7())
     .bind(SYNC_APPLIED_ACTION)
     .bind(run)
-    .bind(ts_param(at.now()))
+    .bind(ts_param(finished_at))
     .bind(params.to_string())
     .execute(&mut *conn)
     .await?;
@@ -252,7 +265,7 @@ pub async fn record_applied(
                 conn,
                 "register.seed_summary",
                 json!({ "run_id": run, "counts": counts }),
-                at,
+                finished_at,
             )
             .await
         }
@@ -266,7 +279,7 @@ pub async fn record_applied(
                         "review_item_id": review.id,
                         "kind": review.kind.code(),
                     }),
-                    at,
+                    finished_at,
                 )
                 .await?;
             }
@@ -279,7 +292,7 @@ async fn enqueue(
     conn: &mut PgConnection,
     template: &'static str,
     params: Value,
-    at: Moment,
+    created_at: Timestamp,
 ) -> Result<(), RegisterError> {
     sqlx::query(
         "insert into outbox (id, tenant_id, template, recipient_email, params, created_at)
@@ -289,7 +302,7 @@ async fn enqueue(
     .bind(template)
     .bind(EWB_OVERSIGHT_ADDRESS)
     .bind(params.to_string())
-    .bind(ts_param(at.now()))
+    .bind(ts_param(created_at))
     .execute(&mut *conn)
     .await?;
     Ok(())

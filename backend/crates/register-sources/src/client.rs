@@ -18,6 +18,11 @@ const NSR_PAGE_SIZE: u32 = 1000;
 const NSR_MAX_PAGES: u32 = 100;
 const BRREG_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The waits before the second and the third attempt of a request (final review, item 2):
+/// three attempts in total. Only a 5xx status or a transport error is retried; a 4xx or a
+/// response that does not parse would fail the same way again.
+pub const DEFAULT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceUrls {
     pub nsr: String,
@@ -40,6 +45,7 @@ impl SourceUrls {
 pub struct SourceClient {
     http: reqwest::Client,
     urls: SourceUrls,
+    retry_delays: [Duration; 2],
 }
 
 impl SourceClient {
@@ -50,10 +56,51 @@ impl SourceClient {
             .user_agent(concat!("fau-register/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| SourceError::new(Source::Nsr, SourceErrorKind::Transport))?;
-        Ok(Self { http, urls })
+        Ok(Self {
+            http,
+            urls,
+            retry_delays: DEFAULT_RETRY_DELAYS,
+        })
     }
 
+    /// Replaces [`DEFAULT_RETRY_DELAYS`], e.g. so a test need not wait five seconds.
+    pub fn with_retry_delays(mut self, delays: [Duration; 2]) -> Self {
+        self.retry_delays = delays;
+        self
+    }
+
+    /// One GET, retried after each of `retry_delays` on a 5xx or a transport error. Every
+    /// other failure, and the last attempt's, is returned as it is. The body is only returned
+    /// once it has been read whole, so a parse error downstream is never retried.
     async fn get(
+        &self,
+        source: Source,
+        url: &str,
+        query: &[(&str, String)],
+        accept_json: bool,
+    ) -> Result<Vec<u8>, SourceError> {
+        let mut delays = self.retry_delays.iter();
+        loop {
+            match self.get_once(source, url, query, accept_json).await {
+                Err(e) if retryable(&e.kind) => match delays.next() {
+                    Some(delay) => {
+                        // The source and a fixed kind only: never the URL or a body.
+                        tracing::warn!(
+                            source = ?e.source,
+                            kind = ?e.kind,
+                            retry_in_ms = delay.as_millis() as u64,
+                            "source request failed, retrying"
+                        );
+                        tokio::time::sleep(*delay).await;
+                    }
+                    None => return Err(e),
+                },
+                result => return result,
+            }
+        }
+    }
+
+    async fn get_once(
         &self,
         source: Source,
         url: &str,
@@ -226,6 +273,15 @@ impl SourceClient {
             let _ = tokio::fs::remove_file(&partial).await;
         }
         result
+    }
+}
+
+/// A 5xx or a transport failure may pass; a 4xx, a parse error or anything else will not.
+fn retryable(kind: &SourceErrorKind) -> bool {
+    match kind {
+        SourceErrorKind::Status { status } => (500..600).contains(status),
+        SourceErrorKind::Transport => true,
+        _ => false,
     }
 }
 

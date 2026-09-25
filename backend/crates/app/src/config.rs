@@ -12,6 +12,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use tracing::level_filters::LevelFilter;
 use url::Url;
@@ -339,6 +340,10 @@ pub struct RegisterConfig {
     pub nsr_url: Option<Url>,
     pub kartverket_url: Option<Url>,
     pub ssb_url: Option<Url>,
+    /// The waits before a source request's second and third attempt (final review, item 2).
+    /// `REGISTER_SOURCE_RETRY_DELAYS_MS`, two comma-separated milliseconds; the default is
+    /// the client's 1 s and 4 s. Tests shorten it.
+    pub source_retry_delays: [Duration; 2],
 }
 
 impl RegisterConfig {
@@ -352,7 +357,26 @@ impl RegisterConfig {
             nsr_url: optional_source_url("REGISTER_NSR_URL")?,
             kartverket_url: optional_source_url("REGISTER_KARTVERKET_URL")?,
             ssb_url: optional_source_url("REGISTER_SSB_URL")?,
+            source_retry_delays: match optional("REGISTER_SOURCE_RETRY_DELAYS_MS") {
+                Some(raw) => retry_delays("REGISTER_SOURCE_RETRY_DELAYS_MS", &raw)?,
+                None => fau_register_sources::client::DEFAULT_RETRY_DELAYS,
+            },
         })
+    }
+}
+
+/// Exactly two waits in milliseconds, each at most a minute: `"1000,4000"`.
+fn retry_delays(name: &'static str, raw: &str) -> Result<[Duration; 2], ConfigError> {
+    let invalid = || err(name, ConfigProblem::Invalid);
+    let ms: Vec<u64> = raw
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().map_err(|_| invalid()))
+        .collect::<Result<_, _>>()?;
+    match ms.as_slice() {
+        [a, b] if *a <= 60_000 && *b <= 60_000 => {
+            Ok([Duration::from_millis(*a), Duration::from_millis(*b)])
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -486,6 +510,22 @@ mod tests {
         let url = Url::parse("http://example.org").unwrap();
         let e = validate_public_base_url(&url, AppEnv::Development).unwrap_err();
         assert_eq!(e.problem, ConfigProblem::NotPermitted);
+    }
+
+    #[test]
+    fn retry_delays_are_two_bounded_millisecond_values() {
+        assert_eq!(
+            retry_delays("R", "1000, 4000").unwrap(),
+            [Duration::from_secs(1), Duration::from_secs(4)]
+        );
+        assert_eq!(retry_delays("R", "0,0").unwrap(), [Duration::ZERO; 2]);
+        for raw in ["1000", "1,2,3", "a,b", "-1,5", "60001,1"] {
+            assert_eq!(
+                retry_delays("R", raw).unwrap_err().problem,
+                ConfigProblem::Invalid,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

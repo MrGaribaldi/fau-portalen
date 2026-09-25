@@ -99,6 +99,9 @@ struct AppSubmitCase<'a> {
     register_name: Option<&'a str>,
     last_seen_in_source_at: bool,
     source_changed_at: bool,
+    verified_at: bool,
+    scope_override: Option<bool>,
+    in_scope: bool,
 }
 
 impl<'a> AppSubmitCase<'a> {
@@ -117,6 +120,9 @@ impl<'a> AppSubmitCase<'a> {
             register_name: None,
             last_seen_in_source_at: false,
             source_changed_at: false,
+            verified_at: false,
+            scope_override: None,
+            in_scope: true,
         }
     }
 }
@@ -131,9 +137,11 @@ async fn app_submit_variant(
         "insert into schools
            (id, municipality_id, origin, display_name, verification, slug, orgnr,
             display_name_curated, status, closed_on, successor_id, search_text,
-            register_name, last_seen_in_source_at, source_changed_at)
+            register_name, last_seen_in_source_at, source_changed_at,
+            verified_at, scope_override, in_scope)
          values ($1, $2, 'submitted', 'X', $3, $4, $5, $6, $7, $8::date, $9, 'x', $10,
-                 case when $11 then now() else null end, case when $12 then now() else null end)",
+                 case when $11 then now() else null end, case when $12 then now() else null end,
+                 case when $13 then now() else null end, $14, $15)",
     )
     .bind(id)
     .bind(m)
@@ -147,6 +155,9 @@ async fn app_submit_variant(
     .bind(case.register_name)
     .bind(case.last_seen_in_source_at)
     .bind(case.source_changed_at)
+    .bind(case.verified_at)
+    .bind(case.scope_override)
+    .bind(case.in_scope)
     .execute(pool)
     .await?;
     Ok(id)
@@ -198,7 +209,10 @@ async fn contract_version_is_four() {
         .fetch_one(&db.admin_pool())
         .await
         .unwrap();
-    assert_eq!(v, 4);
+    // Minor finding 10: one shared expectation (the number of migration files on
+    // disk) rather than a hard-coded literal repeated in three test files, so a
+    // future migration 0005 only has this one number to move past.
+    assert_eq!(v, common::migration_file_count());
 }
 
 #[tokio::test]
@@ -403,13 +417,31 @@ async fn one_linked_fau_per_school_and_one_school_per_fau() {
 #[tokio::test]
 async fn the_runtime_role_reads_the_public_register_but_not_the_bookkeeping() {
     let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
     let app = db.app_pool().await;
+    // `schools` carries RLS (`schools_app_read`): a bare `select count(*)` on an
+    // empty table would return 0 without error even with that policy dropped, and
+    // the loop below would still "pass" for the wrong reason (Important finding 2).
+    // A row inserted as superuser -- so this cannot be satisfied by fau_app's own
+    // insert grant alone -- makes the read able to fail.
+    let m = municipality(&admin, "3201", "3201-app-read-check")
+        .await
+        .unwrap();
+    let seeded = listed_school(&admin, m, "900000071", Some("app-read-check-skole"))
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("select count(*) from schools where id = $1")
+        .bind(seeded)
+        .fetch_one(&app)
+        .await
+        .expect("fau_app must read schools");
+    assert_eq!(n, 1, "fau_app must see the row a superuser inserted");
+
     for table in [
         "municipalities",
         "municipality_names",
         "municipality_numbers",
         "municipality_slug_history",
-        "schools",
         "school_slug_history",
         "registered_faus",
         "school_fau_links",
@@ -502,6 +534,27 @@ async fn the_runtime_role_may_insert_only_a_pending_submitted_school() {
         AppSubmitCase {
             source_changed_at: true,
             ..AppSubmitCase::baseline("a source_changed_at")
+        },
+        // Important finding 1: the four clauses no case above pinned. `verification`
+        // is set to 'rejected' rather than left at 'pending', with nothing else
+        // changed -- 'rejected' passes schools_slug_needs_verification trivially
+        // (slug stays null, so that check is satisfied for any verification value),
+        // so only the policy's own "verification = 'pending'" clause is violated.
+        AppSubmitCase {
+            verification: "rejected",
+            ..AppSubmitCase::baseline("verification not pending")
+        },
+        AppSubmitCase {
+            verified_at: true,
+            ..AppSubmitCase::baseline("a verified_at")
+        },
+        AppSubmitCase {
+            scope_override: Some(false),
+            ..AppSubmitCase::baseline("a scope_override")
+        },
+        AppSubmitCase {
+            in_scope: false,
+            ..AppSubmitCase::baseline("in_scope false")
         },
     ];
     for case in cases {
@@ -614,6 +667,30 @@ async fn the_runtime_role_may_queue_a_submission_and_its_lookup_but_not_curate_t
         "fau_app must not curate a submission's review_state"
     );
 
+    // A submission fau_app tries to hand itself a reviewed_at is refused, even
+    // though retrieval_status and review_state both stay at their own allowed,
+    // untouched values -- so only the policy's "reviewed_at is null" clause is
+    // violated here (Important finding 1).
+    let school2b = submitted_school(&app, m).await.unwrap();
+    let err = sqlx::query(
+        "insert into school_submissions
+           (id, school_id, submitted_by, submitted_name, decision_url, decision_kind,
+            retrieval_status, review_state, reviewed_at)
+         values ($1, $2, $3, 'Ny skole', 'https://example.test/vedtak', 'municipal_decision',
+                 'fetched', 'pending', now())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(school2b)
+    .bind(account)
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not set reviewed_at on its own submission"
+    );
+
     // Likewise a lookup fau_app tries to hand itself an outcome, or a retry count.
     let school3 = submitted_school(&app, m).await.unwrap();
     let submission3 = Uuid::now_v7();
@@ -715,6 +792,307 @@ async fn the_register_role_writes_the_register_and_deletes_only_held_schools() {
         .execute(&reg)
         .await
         .expect("fau_register reads tenants");
+}
+
+/// Important finding 2, the `fau_register` half: `schools`, `school_submissions` and
+/// `register_lookups` all carry RLS, and a bare `select count(*)` on an empty table
+/// would return 0 without error even with the read policy dropped. Each row here is
+/// inserted as superuser, not through `fau_register`'s own write grant, so this
+/// cannot be satisfied by the write path alone -- only the read policy itself makes
+/// it pass.
+#[tokio::test]
+async fn the_register_role_reads_the_rls_protected_tables_it_owns() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let reg = db.register_pool().await;
+
+    let m = municipality(&admin, "3201", "3201-register-read-check")
+        .await
+        .unwrap();
+    let seeded = listed_school(&admin, m, "900000091", Some("register-read-check-skole"))
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("select count(*) from schools where id = $1")
+        .bind(seeded)
+        .fetch_one(&reg)
+        .await
+        .expect("fau_register must read schools");
+    assert_eq!(n, 1);
+
+    let submitted = submitted_school(&admin, m).await.unwrap();
+    let account = Uuid::now_v7();
+    sqlx::query("insert into accounts (id, email) values ($1, $2)")
+        .bind(account)
+        .bind(format!("{account}@example.test"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let submission = Uuid::now_v7();
+    sqlx::query(
+        "insert into school_submissions
+           (id, school_id, submitted_by, submitted_name, decision_url, decision_kind,
+            retrieval_status, review_state)
+         values ($1, $2, $3, 'Ny skole', 'https://example.test/vedtak', 'municipal_decision',
+                 'fetched', 'pending')",
+    )
+    .bind(submission)
+    .bind(submitted)
+    .bind(account)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let n: i64 = sqlx::query_scalar("select count(*) from school_submissions where id = $1")
+        .bind(submission)
+        .fetch_one(&reg)
+        .await
+        .expect("fau_register must read school_submissions");
+    assert_eq!(n, 1);
+
+    let lookup = Uuid::now_v7();
+    sqlx::query(
+        "insert into register_lookups (id, submission_id, queued_at) values ($1, $2, now())",
+    )
+    .bind(lookup)
+    .bind(submission)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let n: i64 = sqlx::query_scalar("select count(*) from register_lookups where id = $1")
+        .bind(lookup)
+        .fetch_one(&reg)
+        .await
+        .expect("fau_register must read register_lookups");
+    assert_eq!(n, 1);
+}
+
+/// Coverage gap (audit section 5): `fau_register`'s own privilege boundaries were
+/// never pinned, only `fau_app`'s (`schema_review.rs`). Mirrors that file's DDL,
+/// TEMP and superuser/bypassrls checks for the register role.
+#[tokio::test]
+async fn the_register_role_is_not_privileged() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let reg = db.register_pool().await;
+
+    let row: (bool, bool) = sqlx::query_as(
+        "select rolsuper, rolbypassrls from pg_roles where rolname = 'fau_register'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (false, false),
+        "fau_register must not be a superuser or bypass RLS"
+    );
+
+    let err = sqlx::query("create table sneaky_register (id int)")
+        .execute(&reg)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_register must not have DDL rights: {err:?}"
+    );
+
+    let err = sqlx::query("create temporary table sneaky_register_temp (id int)")
+        .execute(&reg)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_register must not have TEMP rights: {err:?}"
+    );
+}
+
+/// Coverage gap (audit section 5): `fau_register` writes only the register (D9) --
+/// it must get 42501 on insert, update and delete against the membership tables,
+/// the same boundary `schema_review.rs` pins for `fau_app` against the register.
+#[tokio::test]
+async fn the_register_role_cannot_write_membership_tables() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let reg = db.register_pool().await;
+
+    let m = common::membership::school(&admin, "register-membership-guard").await;
+    let t = Uuid::now_v7();
+    sqlx::query(
+        "insert into tenants (id, name, status, school_id) values ($1, 'FAU', 'active', $2)",
+    )
+    .bind(t)
+    .bind(m)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let acc = Uuid::now_v7();
+    sqlx::query(
+        "insert into accounts (id, email, verified_at) values ($1, 'x@example.test', now())",
+    )
+    .bind(acc)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let err =
+        sqlx::query("insert into memberships (tenant_id, id, account_id) values ($1, $2, $3)")
+            .bind(t)
+            .bind(Uuid::now_v7())
+            .bind(acc)
+            .execute(&reg)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_register must not insert into memberships"
+    );
+
+    let err = sqlx::query("update accounts set disabled_at = now() where id = $1")
+        .bind(acc)
+        .execute(&reg)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_register must not update accounts"
+    );
+
+    let err = sqlx::query("delete from tenants where id = $1")
+        .bind(t)
+        .execute(&reg)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_register must not delete from tenants (only select is granted)"
+    );
+}
+
+/// Coverage gap (audit section 5): `fau_app` may insert only a pending submitted
+/// school, its submission and its lookup (D9) -- it must be refused outright on
+/// `registered_faus` and `school_fau_links`, which only `fau_register` writes.
+#[tokio::test]
+async fn the_runtime_role_cannot_insert_into_brreg_bookkeeping() {
+    let db = TestDb::migrated().await;
+    let app = db.app_pool().await;
+
+    let err = sqlx::query(
+        "insert into registered_faus (orgnr, registered_name, organisation_form, status, last_seen_in_source_at)
+         values ('913706399', 'X', 'FLI', 'active', now())",
+    )
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not insert into registered_faus"
+    );
+
+    let err = sqlx::query(
+        "insert into school_fau_links (school_id, fau_orgnr, method, state) values ($1, '913706399', 'address', 'candidate')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "fau_app must not insert into school_fau_links"
+    );
+}
+
+/// Coverage gap (audit section 5): the domain's own slug output (`fau_domain::
+/// register::slug`) must always satisfy 0004's `municipalities_slug_format` /
+/// `schools_slug_format` CHECKs -- otherwise the two would silently drift apart,
+/// since the database cannot read the Rust functions that mint these slugs.
+/// Exercises `slugify`, `municipality_slug` and `first_free_slug` (the numbered-
+/// collision branch) over the same real-world and edge-case names `slug.rs`'s own
+/// unit tests use, including the 80-character hard cut with no hyphen to cut at.
+#[tokio::test]
+async fn slugify_output_always_satisfies_0004s_slug_checks() {
+    use fau_domain::register::slug::{first_free_slug, municipality_slug, slugify};
+
+    let db = TestDb::migrated().await;
+    let reg = db.register_pool().await;
+
+    for (number, name) in [
+        ("3911", "Færder"),
+        ("1515", "Herøy"),
+        ("5540", "Kåfjord"),
+        ("5610", "Karasjok"),
+        ("3201", "Bærum"),
+        ("0716", "Våle"),
+    ] {
+        let slug = municipality_slug(number, name).expect("a valid municipality number");
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "insert into municipalities (id, name, county_number, county_name, slug, status, source, search_text)
+             values ($1, $2, '03', 'Oslo', $3, 'active', 'kartverket', $2)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(&slug)
+        .execute(&reg)
+        .await
+        .unwrap_or_else(|e| panic!("{name} -> {slug}: {e}"));
+    }
+
+    let m = municipality(&reg, "0301", "0301-slugify-check")
+        .await
+        .unwrap();
+    let one_word = "a".repeat(100); // slug.rs's own 80-character hard cut: no hyphen to cut at.
+    let school_names = [
+        "Grünerløkka skole",
+        "St. Svithun skole",
+        "Straße",
+        "Kárášjohka",
+        "Deanu Sàmeskuvla",
+        "Máze Skuvla/Masi skole Máze skole",
+        one_word.as_str(),
+    ];
+    for (i, name) in school_names.iter().enumerate() {
+        let slug = slugify(name).expect("sluggable characters");
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "insert into schools (id, municipality_id, origin, display_name, register_name, slug,
+                                  verification, orgnr, status, search_text)
+             values ($1, $2, 'register', $3, $3, $4, 'listed', $5, 'active', $3)",
+        )
+        .bind(id)
+        .bind(m)
+        .bind(*name)
+        .bind(&slug)
+        .bind(format!("9100{i:05}"))
+        .execute(&reg)
+        .await
+        .unwrap_or_else(|e| panic!("{name} -> {slug}: {e}"));
+    }
+
+    // first_free_slug's own numbered-collision output must pass too, not just a bare
+    // slugify() result: simulates one existing school already holding the base slug.
+    let base = slugify("Kollisjon skole").unwrap();
+    let taken: std::collections::HashSet<&str> = [base.as_str()].into_iter().collect();
+    let numbered = first_free_slug(&base, None, |candidate| taken.contains(candidate));
+    assert_eq!(numbered, format!("{base}-2"));
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into schools (id, municipality_id, origin, display_name, register_name, slug,
+                              verification, orgnr, status, search_text)
+         values ($1, $2, 'register', 'Kollisjon skole', 'Kollisjon skole', $3, 'listed',
+                 '910099999', 'active', 'kollisjon skole')",
+    )
+    .bind(id)
+    .bind(m)
+    .bind(&numbered)
+    .execute(&reg)
+    .await
+    .unwrap_or_else(|e| panic!("{numbered}: {e}"));
 }
 
 #[tokio::test]

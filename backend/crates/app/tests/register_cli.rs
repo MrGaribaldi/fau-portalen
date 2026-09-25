@@ -102,6 +102,9 @@ struct Sources {
     /// NSR calls Hosle skole "Hosle barneskole", in the list and the detail: one rename of
     /// nine schools, which trips the 5% rename breaker.
     rename_hosle: Arc<AtomicBool>,
+    /// NSR files Hosle skole under 9999, a number Kartverket does not know: one
+    /// `unknown_municipality_number` review item on every run, seed included.
+    hosle_unknown_number: Arc<AtomicBool>,
 }
 
 impl Sources {
@@ -119,6 +122,9 @@ impl Sources {
         let (flaky, hits) = (flaky_detail.clone(), detail_hits.clone());
         let rename_hosle = Arc::new(AtomicBool::new(false));
         let (rename_list, rename_detail) = (rename_hosle.clone(), rename_hosle.clone());
+        let hosle_unknown_number = Arc::new(AtomicBool::new(false));
+        let (unknown_list, unknown_detail) =
+            (hosle_unknown_number.clone(), hosle_unknown_number.clone());
         let (empty, queries) = (empty_nsr.clone(), ssb_queries.clone());
         let fail = fail_detail.clone();
         let (pause, entered, released) = (pause_kartverket.clone(), paused.clone(), resume.clone());
@@ -128,6 +134,7 @@ impl Sources {
                 get(move || {
                     let empty = empty.load(Ordering::SeqCst);
                     let rename = rename_list.load(Ordering::SeqCst);
+                    let unknown = unknown_list.load(Ordering::SeqCst);
                     async move {
                         let body = if empty {
                             json!({
@@ -136,9 +143,12 @@ impl Sources {
                             })
                         } else {
                             let mut list = nsr_list();
-                            if rename {
-                                for unit in list["EnhetListe"].as_array_mut().unwrap() {
+                            for unit in list["EnhetListe"].as_array_mut().unwrap() {
+                                if rename {
                                     rename_if_hosle(unit);
+                                }
+                                if unknown && unit["Organisasjonsnummer"] == json!("974552124") {
+                                    unit["Kommunenummer"] = json!("9999");
                                 }
                             }
                             list
@@ -154,6 +164,7 @@ impl Sources {
                     hits.lock().unwrap().push(orgnr.clone());
                     let flaky = flaky.lock().unwrap().remove(&orgnr);
                     let rename = rename_detail.load(Ordering::SeqCst);
+                    let unknown = unknown_detail.load(Ordering::SeqCst);
                     async move {
                         if fail {
                             return (StatusCode::INTERNAL_SERVER_ERROR, Vec::new());
@@ -162,9 +173,14 @@ impl Sources {
                             return (StatusCode::SERVICE_UNAVAILABLE, Vec::new());
                         }
                         match std::fs::read(format!("{FIXTURES}/nsr/enhet-{orgnr}.json")) {
-                            Ok(body) if rename => {
+                            Ok(body) if rename || unknown => {
                                 let mut unit: Value = serde_json::from_slice(&body).unwrap();
-                                rename_if_hosle(&mut unit);
+                                if rename {
+                                    rename_if_hosle(&mut unit);
+                                }
+                                if unknown && orgnr == "974552124" {
+                                    unit["Kommune"]["Kommunenummer"] = json!("9999");
+                                }
                                 (StatusCode::OK, serde_json::to_vec(&unit).unwrap())
                             }
                             Ok(body) => (StatusCode::OK, body),
@@ -214,6 +230,7 @@ impl Sources {
             flaky_detail,
             detail_hits,
             rename_hosle,
+            hosle_unknown_number,
         }
     }
 
@@ -1032,4 +1049,51 @@ async fn accept_mass_change_is_refused_on_a_seed() {
         stderr(&out)
     );
     assert!(runs(&db.admin_pool()).await.is_empty());
+}
+
+/// Final review, item 9: a seed whose plan holds a review item mails only its
+/// `register.seed_summary`, never a `register.review_item`. A later sync whose only review
+/// item deduplicates against the open one sends no mail at all and is recorded `no_change`.
+#[tokio::test]
+async fn review_mail_is_never_sent_by_a_seed_or_for_a_deduplicated_item() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let sources = Sources::start().await;
+    sources.hosle_unknown_number.store(true, Ordering::SeqCst);
+    let env = sources.env(&db.register_url());
+
+    let seed = fau(&["sync", "--seed"], &env).await;
+    assert_eq!(seed.status.code(), Some(0), "{}", stderr(&seed));
+    let items: Vec<String> = sqlx::query_scalar(
+        "select kind || ' ' || (details->>'municipality_number') from register_review_items",
+    )
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(items, ["unknown_municipality_number 9999"]);
+    assert_eq!(outbox_templates(&admin).await, ["register.seed_summary"]);
+
+    let sync = fau(&["sync"], &env).await;
+    assert_eq!(sync.status.code(), Some(0), "{}", stderr(&sync));
+    assert_eq!(
+        runs(&admin).await,
+        [
+            ("seed".into(), Some("applied".into()), None),
+            ("sync".into(), Some("no_change".into()), None),
+        ]
+    );
+    assert_eq!(outbox_templates(&admin).await, ["register.seed_summary"]);
+    assert_eq!(count(&admin, "register_review_items").await, 1);
+    assert_eq!(
+        count(&admin, "audit_events").await,
+        1,
+        "only the seed is audited"
+    );
+    let done = log_lines(&sync, "register sync finished");
+    assert_eq!(
+        done[0]["reviews_deduplicated"],
+        json!(1),
+        "{}",
+        stderr(&sync)
+    );
 }

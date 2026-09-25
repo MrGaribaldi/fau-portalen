@@ -7,6 +7,7 @@ mod common;
 use std::collections::{BTreeSet, HashMap};
 
 use common::TestDb;
+use fau_domain::register::search::search_text;
 use fau_domain::register::source::{
     CodeChange, MunicipalityRecord, NsrClosure, NsrUnit, OfficialName,
 };
@@ -15,9 +16,9 @@ use fau_domain::register::sync::testkit::{
     stange_new, stange_old,
 };
 use fau_domain::register::sync::{
-    plan, MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, Origin, Ownership,
-    RegisterSnapshot, ReviewKind, RowId, RunKind, SchoolAttributes, SchoolSnapshot, SchoolStatus,
-    SyncOutcome, SyncPlan, Verification,
+    plan, Counts, MunicipalitySnapshot, MunicipalitySource, MunicipalityStatus, Origin, Ownership,
+    RegisterSnapshot, ReviewItem, ReviewKind, RowId, RunKind, SchoolAttributes, SchoolSnapshot,
+    SchoolStatus, SyncOutcome, SyncPlan, Verification,
 };
 use fau_domain::time::Moment;
 use fau_persistence::register::{
@@ -492,6 +493,15 @@ async fn municipality_ops_apply_like_the_test_applier() {
         .await,
         ["3201 2026-09-28 2027-01-01", "3299 2027-01-01 -"]
     );
+    // Final review, item 8: a renamed municipality's search text follows its new name.
+    assert_eq!(
+        text(
+            &admin,
+            "select slug || ' ' || search_text from municipalities where slug like '5055-%'"
+        )
+        .await,
+        ["5055-heimdal heimdal"]
+    );
 
     // The same sources again: nothing to do, on either side.
     assert_eq!(
@@ -965,6 +975,394 @@ async fn open_reviews_deduplicate_on_their_discriminating_details() {
             "unknown_municipality_number 9998 -",
             "unknown_municipality_number 9999 -",
         ]
+    );
+}
+
+/// Final review, item 7(a): a school with an FAU whose unit closes as F while a similar new
+/// unit appears. The FAU school stays open, the new unit is created Held, and one
+/// `possible_reregistration` item is raised. On the next run the new unit is a held school,
+/// so `closure_with_fau` is raised instead and the first item is not raised again; on the
+/// run after that, everything deduplicates.
+#[tokio::test]
+async fn a_reregistration_against_a_live_fau_is_held_and_never_raised_twice() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    let records = fixture_records();
+    let stange_open = NsrUnit {
+        is_active: true,
+        closure: None,
+        ..stange_old()
+    };
+    step(
+        &pool,
+        &records,
+        &[],
+        &with_bystanders(vec![stange_open.clone()]),
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+    exec(
+        &admin,
+        "insert into tenants (id, name, status, school_id)
+         select '01990000-0000-7000-8000-000000020001', 'Stange FAU', 'active', id
+           from schools where orgnr = '975270920';",
+    )
+    .await;
+
+    let units = with_bystanders(vec![stange_old(), stange_new()]);
+    let (first, written) = step(
+        &pool,
+        &records,
+        &[],
+        &units,
+        RunKind::Sync,
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await;
+    let first = applied(first);
+    assert_eq!(
+        (
+            first.counts.schools_created,
+            first.counts.schools_held,
+            first.counts.schools_closed
+        ),
+        (0, 1, 0),
+        "a held create counts as held, not created, and the FAU school never closes"
+    );
+    assert_eq!(
+        written
+            .expect("applied")
+            .new_reviews
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ReviewKind::PossibleReregistration]
+    );
+    assert_eq!(
+        text(
+            &admin,
+            "select orgnr || ' ' || status || ' ' || verification || ' ' || coalesce(slug, '-')
+               from schools where orgnr in ('975270920', '933181995') order by orgnr"
+        )
+        .await,
+        [
+            "933181995 active held -",
+            "975270920 active listed stange-ungdomsskole",
+        ]
+    );
+
+    let (_, written) = step(
+        &pool,
+        &records,
+        &[],
+        &units,
+        RunKind::Sync,
+        at("2026-10-12T02:30:00Z"),
+    )
+    .await;
+    assert_eq!(
+        written
+            .expect("applied")
+            .new_reviews
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ReviewKind::ClosureWithFau]
+    );
+    let (_, written) = step(
+        &pool,
+        &records,
+        &[],
+        &units,
+        RunKind::Sync,
+        at("2026-10-19T02:30:00Z"),
+    )
+    .await;
+    assert!(written.expect("applied").wrote_nothing());
+    assert_eq!(
+        text(
+            &admin,
+            "select kind || ' ' || count(*) from register_review_items group by kind order by kind"
+        )
+        .await,
+        ["closure_with_fau 1", "possible_reregistration 1"]
+    );
+}
+
+/// Final review, item 7(b): a plain close, NSR's "N" on a school with no FAU: status,
+/// reason and date set, the slug moved into history and cleared.
+#[tokio::test]
+async fn a_plain_close_matches_the_test_applier() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    let records = fixture_records();
+    step(
+        &pool,
+        &records,
+        &[],
+        &with_bystanders(vec![lerberg()]),
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+    let closed = NsrUnit {
+        is_active: false,
+        closure: Some(NsrClosure {
+            code: "N".into(),
+            at: Some(testkit::ts("2026-09-20T10:00:00Z")),
+        }),
+        ..lerberg()
+    };
+    let (outcome, written) = step(
+        &pool,
+        &records,
+        &[],
+        &with_bystanders(vec![closed]),
+        RunKind::Sync,
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await;
+    assert_eq!(applied(outcome).counts.schools_closed, 1);
+    assert!(written.expect("applied").new_reviews.is_empty());
+    assert_eq!(
+        text(
+            &admin,
+            "select status || ' ' || closure_reason || ' ' || closed_on || ' '
+                    || coalesce(slug, '-') || ' ' || in_scope
+                    || ' ' || coalesce(successor_id::text, '-')
+               from schools where orgnr = '998516897'"
+        )
+        .await,
+        ["closed closed 2026-09-20 - true -"]
+    );
+    assert_eq!(
+        text(
+            &admin,
+            &format!(
+                "select h.slug || ' ' || {} from school_slug_history h
+                   join schools s on s.id = h.school_id where s.orgnr = '998516897'",
+                utc("h.valid_until")
+            )
+        )
+        .await,
+        ["lerberg-skole-og-kompetansesenter 2026-10-05T02:30:00Z"]
+    );
+}
+
+/// Final review, items 7(c) and 8: NSR renames a school whose display name is curated. The
+/// register name follows NSR, the curated display name and its slug are kept, and the search
+/// text is refreshed to cover both names.
+#[tokio::test]
+async fn a_curated_rename_keeps_the_display_name_and_refreshes_search() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    let records = fixture_records();
+    step(
+        &pool,
+        &records,
+        &[],
+        &with_bystanders(vec![hosle()]),
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+    exec(
+        &admin,
+        "update schools set display_name = 'Hosle skole og SFO', display_name_curated = true,
+                            search_text = 'hosle skole og sfo'
+          where orgnr = '974552124'",
+    )
+    .await;
+
+    let renamed = NsrUnit {
+        name: "Hosle barneskole".into(),
+        ..hosle()
+    };
+    let (outcome, _) = step(
+        &pool,
+        &records,
+        &[],
+        &with_bystanders(vec![renamed]),
+        RunKind::Sync,
+        at("2026-10-05T02:30:00Z"),
+    )
+    .await;
+    assert_eq!(applied(outcome).counts.schools_renamed, 1);
+    let expected = search_text(["Hosle skole og SFO", "Hosle barneskole"]);
+    assert_eq!(
+        text(
+            &admin,
+            "select display_name || '|' || register_name || '|' || slug || '|' || search_text
+               from schools where orgnr = '974552124'"
+        )
+        .await,
+        [format!(
+            "Hosle skole og SFO|Hosle barneskole|hosle-skole|{expected}"
+        )]
+    );
+    assert!(expected.contains("barneskole"), "{expected}");
+}
+
+/// Final review, items 7(d) and 8: SSB renumbers Bærum and Kartverket lists the new number
+/// under a new name in the same run. The rename is folded into the `Renumber` (`name: Some`)
+/// with no separate `Rename`, the new slug is minted from the new number and name, and the
+/// search text follows the new name.
+#[tokio::test]
+async fn a_renumber_with_a_rename_folded_in_matches_the_test_applier() {
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let admin = db.admin_pool();
+    let units = [gran_canaria()];
+    step(
+        &pool,
+        &fixture_records(),
+        &[],
+        &units,
+        RunKind::Seed,
+        at("2026-09-28T02:30:00Z"),
+    )
+    .await;
+
+    let records: Vec<MunicipalityRecord> = fixture_records()
+        .into_iter()
+        .map(|r| match r.number.as_str() {
+            "3201" => record("3299", "Nye Bærum", "32", "Akershus"),
+            _ => r,
+        })
+        .collect();
+    let changes = [change(
+        "3201",
+        "Bærum",
+        "3299",
+        "Nye Bærum",
+        date(2027, 1, 1),
+    )];
+    let (outcome, _) = step(
+        &pool,
+        &records,
+        &changes,
+        &units,
+        RunKind::Sync,
+        at("2027-01-04T02:30:00Z"),
+    )
+    .await;
+    let plan = applied(outcome);
+    let folded: Vec<_> = plan
+        .municipality_ops
+        .iter()
+        .filter(|op| {
+            matches!(op, fau_domain::register::sync::MunicipalityOp::Renumber { name: Some(n), .. }
+                if n == "Nye Bærum")
+        })
+        .collect();
+    assert_eq!(folded.len(), 1, "{:?}", plan.municipality_ops);
+    assert!(
+        !plan.municipality_ops.iter().any(|op| matches!(
+            op,
+            fau_domain::register::sync::MunicipalityOp::Rename { .. }
+        )),
+        "{:?}",
+        plan.municipality_ops
+    );
+    assert_eq!(
+        text(
+            &admin,
+            "select m.name || '|' || m.slug || '|' || n.number || '|' || m.search_text
+               from municipalities m
+               join municipality_numbers n on n.municipality_id = m.id and n.valid_until is null
+              where m.slug like '3299-%'"
+        )
+        .await,
+        [format!(
+            "Nye Bærum|3299-nye-baerum|3299|{}",
+            search_text(["Nye Bærum"])
+        )]
+    );
+    assert_eq!(
+        text(
+            &admin,
+            "select slug from municipality_slug_history order by slug"
+        )
+        .await,
+        ["3201-baerum"]
+    );
+}
+
+/// A plan of review items only, with no references: the discriminated kinds' case.
+fn reviews_only(items: &[(ReviewKind, &[(&'static str, &str)])]) -> SyncPlan<Uuid> {
+    SyncPlan {
+        municipality_ops: vec![],
+        school_ops: vec![],
+        reviews: items
+            .iter()
+            .map(|(kind, details)| ReviewItem {
+                kind: *kind,
+                school: None,
+                other_school: None,
+                municipality: None,
+                details: details.iter().map(|(k, v)| (*k, (*v).to_owned())).collect(),
+            })
+            .collect(),
+        counts: Counts::default(),
+    }
+}
+
+/// Final review, item 6: for a discriminated kind, a null discriminator is a value of its
+/// own. An item missing it never deduplicates against an open item that has it, nor the
+/// reverse; two items that both lack it do.
+#[tokio::test]
+async fn a_null_discriminator_never_matches_a_present_one() {
+    use ReviewKind::{MunicipalitySplitOrMerge as Split, UnknownMunicipalityNumber as Unknown};
+
+    let db = TestDb::migrated().await;
+    let pool = db.register_pool().await;
+    let apply = |plan: SyncPlan<Uuid>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let a = apply_plan(&mut tx, &plan, at("2026-10-05T02:30:00Z"))
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            (a.new_reviews.len(), a.deduplicated_reviews)
+        }
+    };
+
+    // Present first, then missing: both are written, and each dedupes only against itself.
+    assert_eq!(
+        apply(reviews_only(&[
+            (Unknown, &[("municipality_number", "9999")]),
+            (Split, &[("reason", "split"), ("old_code", "1507")]),
+        ]))
+        .await,
+        (2, 0)
+    );
+    assert_eq!(
+        apply(reviews_only(&[
+            (Unknown, &[]),
+            (Split, &[("reason", "split")]),
+            (Split, &[("old_code", "1507")]),
+        ]))
+        .await,
+        (3, 0),
+        "a missing discriminator is not a wildcard"
+    );
+    assert_eq!(
+        apply(reviews_only(&[
+            (Unknown, &[("municipality_number", "9999")]),
+            (Unknown, &[]),
+            (Split, &[("reason", "split"), ("old_code", "1507")]),
+            (Split, &[("reason", "split")]),
+            (Split, &[("old_code", "1507")]),
+            // `number` and `old_code` are one discriminator: whichever is present.
+            (Split, &[("reason", "split"), ("number", "1507")]),
+        ]))
+        .await,
+        (0, 6)
     );
 }
 

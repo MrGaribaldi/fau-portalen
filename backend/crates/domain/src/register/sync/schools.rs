@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn a_school_whose_number_resolves_elsewhere_moves() {
-        // After the 1507 split is resolved, Brattvåg barneskole's NSR number 1580 resolves
+        // After the 1507 split is resolved, Brattvåg barneskule's NSR number 1580 resolves
         // to Haram (2), while its row is still under Ålesund (1).
         let brattvaag = unit("974585715", "Brattvåg barneskule", "1580");
         let snapshot = with_schools(vec![school(10, 1, &brattvaag, "brattvaag-barneskule")]);

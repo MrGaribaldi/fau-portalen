@@ -1,11 +1,12 @@
 # Groups, directory, chat, calendar and date poll: design
 
-Status: **design agreed in chat, 26 September 2026**, section by section; the written spec awaits
-Erik's review. Two features came out of conversations with potential customers, chat and a
-calendar. During design they grew into five pieces that share one substrate. Erik's decisions
-are listed in section 2. Rulings the agent made where he gave no answer are marked
-**Ruling** so they can be challenged. User-facing strings are Bokmål source strings for the
-localisation mechanism (#3439), shown in quotes.
+Status: **accepted 26 September 2026** on #3500. Erik reviewed the written spec and accepted it
+with one comment: section 5.2 has no live preview in the MVP, and one may be implemented later
+(now listed in section 9). The closed-group ruling in section 3.3 was accepted with the rest. Two
+features came out of conversations with potential customers, chat and a calendar. During design
+they grew into five pieces that share one substrate. Erik's decisions are listed in section 2.
+Rulings the agent made where he gave no answer are marked **Ruling**. User-facing strings are
+Bokmål source strings for the localisation mechanism (#3439), shown in quotes.
 
 ## 1. Scope and build order
 
@@ -182,7 +183,8 @@ This format is shared with event and poll descriptions.
   the per-viewer resolution of document links correct.
 - **On write**, the server rejects document links to another FAU or to ids that do not exist.
 - **Composer:** a textarea with B/I/U buttons and Ctrl+B/I/U shortcuts that insert the markers,
-  plus the document picker. There is no live preview; the sent message shows the result.
+  plus the document picker. There is no live preview in the MVP; the sent message shows the
+  result.
 - Links carry `rel="noopener nofollow"`. There are **no link previews**, since fetching a URL
   server-side invites SSRF and tells the linked site that we exist.
 
@@ -352,6 +354,7 @@ with exceptions, multiplies the complexity of both editing and the feed.
 - Recurrence rules, a week view and a group lead role.
 - Per-group encryption keys.
 - Chat attachments, which are replaced by document links.
+- A live preview in the chat composer (Erik on #3500: possibly later).
 
 ## 10. Tests
 

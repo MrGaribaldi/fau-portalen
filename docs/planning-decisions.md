@@ -2728,3 +2728,10 @@ The ones that bind other work:
 
 Agent ruling, open to challenge: a closed group's existence and name are hidden from anyone who
 cannot read it.
+
+## #3500 accepted — 26 September 2026
+
+Erik reviewed and accepted docs/groups-directory-chat-calendar-design.md on #3500, with one
+comment: the chat composer has no live preview in the MVP, and one may be implemented later. That
+is now in the spec's deferred list. The agent's closed-group ruling (a closed group's existence
+and name are hidden from anyone who cannot read it) stands with the acceptance.

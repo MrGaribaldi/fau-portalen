@@ -2735,3 +2735,27 @@ Erik reviewed and accepted docs/groups-directory-chat-calendar-design.md on #350
 comment: the chat composer has no live preview in the MVP, and one may be implemented later. That
 is now in the spec's deferred list. The agent's closed-group ruling (a closed group's existence
 and name are hidden from anyone who cannot read it) stands with the acceptance.
+
+## Key service first, phased with its replica — 26 September 2026
+
+While planning #3501, the agent found that no key service exists and no card holds one, although
+every feature on #3500 and the documents migration (#3419) store encrypted fields. Erik decided,
+and agreed the design section by section (docs/key-service-design.md):
+
+- **Build the key service before #3501**, rather than building features against a stand-in
+  cipher.
+- **Phase the replica.** Card 1 is the key service, with the 7-day destruction queue modelled.
+  Card 2, the ransomware replica, is a hard gate before any real FAU data.
+- **The backend is trusted by service credential plus limits:** mTLS, a NetworkPolicy, and rate
+  limits and a lease-enforced ceiling. There are no membership checks and no Hanko call in the key
+  service.
+- **The key service is a separate binary with SQLite on its own volume**, never backed up. It
+  runs with `secure_delete` and a rollback journal.
+- **Key classes:** KEK, record key, document key, monthly chat epoch key, sealing pair and
+  invitation key. ADR-003 5a's "FAU data key" is the record key; ADR-003 is amended.
+
+Agent rulings open to challenge:
+- the key service gets its own image, not a `fau` subcommand (spec §6.1);
+- invitation keys are destroyed with the KEK only for now (spec §3.1).
+
+Erik asked for card 1's implementation plan to start the same evening.

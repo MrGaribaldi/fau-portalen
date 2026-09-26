@@ -446,6 +446,16 @@ ask once. The control that matters is the rate and the ceiling, not the interval
 **The rule.** The backend obtains an FAU data key **once per user session per FAU**, and holds it
 as a handle in memory only.
 
+*Amended 26 September 2026 (docs/key-service-design.md §3.1).* The "FAU data key" in this section is
+the **record key**, the one key per FAU that protects small fields outside documents: group names,
+member names and contact emails, event and poll details. Document keys stay per document, as
+decision 5 says. Other data keys are held under the same rule: a document key while its document
+is open; a monthly chat epoch key while its month is being read; the FAU's sealing private key on
+the approval screen only; an invitation key for one invitation. The ceiling is enforced by the key
+service through **leases**, not merely observed: every unwrap returns a lease, the backend renews it
+on real activity and releases it on logout or idle, and the key service refuses a new distinct FAU
+above the ceiling.
+
 - Held for the session, with an idle timeout in the tens of minutes.
 - Refreshed by **real user activity only** - no background timer, no keep-alive on an idle tab.
   The same rule the cost section applies to token refresh, for the same reason: manufactured

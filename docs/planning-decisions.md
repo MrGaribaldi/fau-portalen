@@ -2701,3 +2701,30 @@ and an in-process fixture server. The agent's rulings, with the cost if wrong:
   - A dry run given `--accept-mass-change` records no abort reason.
   - sqlx logs the value of an unrecognised query parameter in `REGISTER_DATABASE_URL`. That is not
     the password, but the config could reject unknown parameters.
+
+## Groups, guests, directory, chat, calendar and date poll designed — 26 September 2026
+
+Talks with potential customers surfaced chat and a calendar. Erik designed them with the agent in
+chat, section by section, and agreed each section. The spec is
+docs/groups-directory-chat-calendar-design.md, and its section 2 lists the decisions (D1–D12).
+The ones that bind other work:
+
+- **Groups are first-class and arbitrary.** A year or unit is just one way to fill a group.
+  Groups are open to members by default, and an admin can mark one closed.
+- **A third capability class, `guest`,** reads and writes only within its own groups and folders.
+  There is one authorization function for every resource, and the SSE stream is filtered through
+  it.
+- **Folders carry an audience,** and documents inherit access from their folder. A meeting is an
+  event, and its documents anchor to `event_id`. Both bind #3419's document migration.
+- **The directory shows every current member's name and contact email to the FAU.** Names are
+  kept for history after a membership ends; contact emails are not.
+- **Chat has channels and no direct messages.** Messages use a small Markdown subset with links
+  to documents, and expire after 12 months when monthly epoch keys are destroyed.
+- **The calendar feed is redacted:** times and a generic label only, and the feed never touches
+  the key service. Full details come only through an `.ics` download inside the session. A public
+  calendar is designed for but not built.
+- **Notifications are in-app only in the MVP.** An email digest may become a paid add-on per FAU.
+- **The date poll has open votes, and the organiser decides.** Deciding creates the event.
+
+Agent ruling, open to challenge: a closed group's existence and name are hidden from anyone who
+cannot read it.

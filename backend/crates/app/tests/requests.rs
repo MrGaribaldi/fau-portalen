@@ -14,11 +14,10 @@ use fau_persistence::membership::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn access(fau: &Fau, requester: &str, message: Option<&str>) -> CreateAccessRequest {
+fn access(fau: &Fau, requester: &str) -> CreateAccessRequest {
     CreateAccessRequest {
         tenant_id: fau.tenant_id,
         requester: verified(requester),
-        message: message.map(str::to_owned),
     }
 }
 
@@ -37,7 +36,7 @@ async fn an_access_request_reaches_the_admins_and_names_nobody() {
     let t0 = at(T0);
     let fau = active_fau(&pool, "admin@example.test", t0).await;
 
-    let id = create_access_request(&pool, access(&fau, "ny@example.test", Some(" Hei! ")), t0)
+    let id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
 
@@ -46,28 +45,32 @@ async fn an_access_request_reaches_the_admins_and_names_nobody() {
         outbox_count(&pool, "request.received", "admin@example.test").await,
         1
     );
-    let message: Option<String> =
-        sqlx::query_scalar("select message from access_requests where id = $1")
+    let sealed_message: Option<Vec<u8>> =
+        sqlx::query_scalar("select sealed_message from access_requests where id = $1")
             .bind(id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(message.as_deref(), Some("Hei!"));
-    let in_audit: i64 =
-        sqlx::query_scalar("select count(*) from audit_events where params::text like '%Hei%'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(in_audit, 0, "free text never reaches audit parameters");
+    assert!(
+        sealed_message.is_none(),
+        "no message field until the key service exists: nothing is stored as plaintext \
+         (ADR-003 decision 6)"
+    );
+    let in_audit: i64 = sqlx::query_scalar(
+        "select count(*) from audit_events where params::text like '%ny@example.test%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        in_audit, 0,
+        "the requester's address never reaches audit parameters"
+    );
     let params: String =
         sqlx::query_scalar("select params::text from outbox where template = 'request.received'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(
-        !params.contains("Hei"),
-        "the message never reaches the outbox either"
-    );
     assert!(
         !params.contains("ny@example.test"),
         "the requester's address never reaches the outbox: the admin is not told who asked"
@@ -85,63 +88,30 @@ async fn one_open_request_per_address_and_five_per_fau_per_day() {
     let t0 = at("2026-09-23T21:30:00Z");
     let fau = active_fau(&pool, "admin@example.test", t0).await;
 
-    create_access_request(&pool, access(&fau, "a@example.test", None), t0)
+    create_access_request(&pool, access(&fau, "a@example.test"), t0)
         .await
         .unwrap();
     assert_eq!(
-        create_access_request(&pool, access(&fau, "a@example.test", None), t0)
+        create_access_request(&pool, access(&fau, "a@example.test"), t0)
             .await
             .unwrap_err(),
         MembershipError::RequestLimit(RequestLimit::OpenRequestExists)
     );
     for n in 0..4 {
-        create_access_request(&pool, access(&fau, &format!("b{n}@example.test"), None), t0)
+        create_access_request(&pool, access(&fau, &format!("b{n}@example.test")), t0)
             .await
             .unwrap();
     }
     assert_eq!(
-        create_access_request(&pool, access(&fau, "c@example.test", None), t0)
+        create_access_request(&pool, access(&fau, "c@example.test"), t0)
             .await
             .unwrap_err(),
         MembershipError::RequestLimit(RequestLimit::TenantDailyLimit)
     );
     let tomorrow = at("2026-09-23T22:30:00Z");
-    create_access_request(&pool, access(&fau, "c@example.test", None), tomorrow)
+    create_access_request(&pool, access(&fau, "c@example.test"), tomorrow)
         .await
         .expect("the daily limit resets on the next Oslo date");
-}
-
-#[tokio::test]
-async fn the_message_is_at_most_five_hundred_characters() {
-    let db = TestDb::migrated().await;
-    let pool = db.app_pool().await;
-    let t0 = at(T0);
-    let fau = active_fau(&pool, "admin@example.test", t0).await;
-    let long = "ø".repeat(501);
-    assert_eq!(
-        create_access_request(&pool, access(&fau, "a@example.test", Some(&long)), t0)
-            .await
-            .unwrap_err(),
-        MembershipError::MessageTooLong
-    );
-}
-
-#[tokio::test]
-async fn a_message_with_a_control_character_is_refused_distinctly() {
-    let db = TestDb::migrated().await;
-    let pool = db.app_pool().await;
-    let t0 = at(T0);
-    let fau = active_fau(&pool, "admin@example.test", t0).await;
-    assert_eq!(
-        create_access_request(
-            &pool,
-            access(&fau, "a@example.test", Some("Hei\u{0}der")),
-            t0
-        )
-        .await
-        .unwrap_err(),
-        MembershipError::MessageControlCharacter
-    );
 }
 
 #[tokio::test]
@@ -150,7 +120,7 @@ async fn approving_issues_a_normal_invitation_linked_to_the_request() {
     let pool = db.app_pool().await;
     let t0 = at(T0);
     let fau = active_fau(&pool, "admin@example.test", t0).await;
-    let request_id = create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    let request_id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
 
@@ -198,7 +168,7 @@ async fn declining_tells_the_requester_and_nothing_more() {
     let pool = db.app_pool().await;
     let t0 = at(T0);
     let fau = active_fau(&pool, "admin@example.test", t0).await;
-    let request_id = create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    let request_id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
     let decision = RequestDecision {
@@ -240,7 +210,7 @@ async fn only_an_admin_decides() {
         t0,
     )
     .await;
-    let request_id = create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    let request_id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
     let err = decline_request(
@@ -304,7 +274,7 @@ async fn only_current_admins_receive_the_request_received_notice() {
     )
     .await;
 
-    create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
 
@@ -396,7 +366,7 @@ async fn approving_requires_an_admin_role_today_not_merely_a_handover_grant() {
         }]
     };
 
-    let request_id = create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    let request_id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
     assert_eq!(
@@ -451,7 +421,7 @@ async fn approving_a_request_that_is_already_decided_is_refused() {
         }]
     };
 
-    let approved_id = create_access_request(&pool, access(&fau, "ny1@example.test", None), t0)
+    let approved_id = create_access_request(&pool, access(&fau, "ny1@example.test"), t0)
         .await
         .unwrap();
     approve_request(&pool, decide(approved_id), roles(), t0)
@@ -465,7 +435,7 @@ async fn approving_a_request_that_is_already_decided_is_refused() {
         "approving an already-approved request is refused"
     );
 
-    let declined_id = create_access_request(&pool, access(&fau, "ny2@example.test", None), t0)
+    let declined_id = create_access_request(&pool, access(&fau, "ny2@example.test"), t0)
         .await
         .unwrap();
     decline_request(&pool, decide(declined_id), t0)
@@ -495,7 +465,7 @@ async fn a_frozen_fau_refuses_approving_and_proposing() {
         t0,
     )
     .await;
-    let request_id = create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    let request_id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
     sqlx::query("update tenants set frozen_at = now() where id = $1")
@@ -532,7 +502,6 @@ async fn a_frozen_fau_refuses_approving_and_proposing() {
                 successor: email("etterfolger@example.test"),
                 starts_on: day(2027, 9, 1),
                 ends_on_exclusive: day(2028, 9, 1),
-                message: None,
             },
             t0,
         )
@@ -563,7 +532,7 @@ async fn an_unhandled_request_lapses_after_thirty_days() {
     let pool = db.app_pool().await;
     let t0 = at(T0);
     let fau = active_fau(&pool, "admin@example.test", t0).await;
-    let request_id = create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+    let request_id = create_access_request(&pool, access(&fau, "ny@example.test"), t0)
         .await
         .unwrap();
 
@@ -599,7 +568,7 @@ async fn lapse_leaves_decided_requests_untouched_however_old() {
         request_id,
     };
 
-    let approved_id = create_access_request(&pool, access(&fau, "ny1@example.test", None), t0)
+    let approved_id = create_access_request(&pool, access(&fau, "ny1@example.test"), t0)
         .await
         .unwrap();
     approve_request(
@@ -613,7 +582,7 @@ async fn lapse_leaves_decided_requests_untouched_however_old() {
     )
     .await
     .unwrap();
-    let declined_id = create_access_request(&pool, access(&fau, "ny2@example.test", None), t0)
+    let declined_id = create_access_request(&pool, access(&fau, "ny2@example.test"), t0)
         .await
         .unwrap();
     decline_request(&pool, decide(declined_id), t0)
@@ -649,7 +618,6 @@ async fn a_member_proposes_a_successor_for_their_own_role() {
         successor: email("etterfolger@example.test"),
         starts_on: starts,
         ends_on_exclusive: ends,
-        message: None,
     };
 
     assert_eq!(
@@ -738,7 +706,6 @@ async fn a_member_may_propose_only_for_a_role_they_hold_today() {
         successor: email("etterfolger@example.test"),
         starts_on: day(2027, 10, 1),
         ends_on_exclusive: day(2028, 10, 1),
-        message: None,
     };
 
     assert_eq!(
@@ -800,7 +767,6 @@ async fn a_proposal_naming_an_unknown_or_foreign_assignment_reveals_nothing() {
                     successor: email("etterfolger@example.test"),
                     starts_on: day(2027, 10, 1),
                     ends_on_exclusive: day(2028, 10, 1),
-                    message: None,
                 },
                 t0
             )
@@ -840,14 +806,13 @@ async fn revoking_a_membership_withdraws_the_members_pending_requests() {
             successor: email("etterfolger@example.test"),
             starts_on: day(2027, 9, 1),
             ends_on_exclusive: day(2028, 9, 1),
-            message: None,
         },
         t0,
     )
     .await
     .unwrap();
     // ... an access request another member sent before they were invited in ...
-    let early = create_access_request(&pool, access(&fau, "tidlig@example.test", None), t0)
+    let early = create_access_request(&pool, access(&fau, "tidlig@example.test"), t0)
         .await
         .unwrap();
     let early_member = add_member(
@@ -860,7 +825,7 @@ async fn revoking_a_membership_withdraws_the_members_pending_requests() {
     )
     .await;
     // ... and an outsider's request, which must survive.
-    let outsider = create_access_request(&pool, access(&fau, "utenfor@example.test", None), t0)
+    let outsider = create_access_request(&pool, access(&fau, "utenfor@example.test"), t0)
         .await
         .unwrap();
 
@@ -915,7 +880,7 @@ async fn a_frozen_fau_takes_no_requests() {
         .await
         .unwrap();
     assert_eq!(
-        create_access_request(&pool, access(&fau, "ny@example.test", None), t0)
+        create_access_request(&pool, access(&fau, "ny@example.test"), t0)
             .await
             .unwrap_err(),
         MembershipError::TenantFrozen
@@ -923,15 +888,13 @@ async fn a_frozen_fau_takes_no_requests() {
 }
 
 #[tokio::test]
-async fn request_structs_never_print_addresses_or_free_text_in_debug() {
+async fn request_structs_never_print_addresses_in_debug() {
     let request = CreateAccessRequest {
         tenant_id: Uuid::now_v7(),
         requester: verified("hemmelig@example.test"),
-        message: Some("hemmelig melding".to_owned()),
     };
     let debug = format!("{request:?}");
     assert!(!debug.contains("hemmelig@example.test"));
-    assert!(!debug.contains("hemmelig melding"));
 
     let proposal = CreateReplacementProposal {
         tenant_id: Uuid::now_v7(),
@@ -940,9 +903,34 @@ async fn request_structs_never_print_addresses_or_free_text_in_debug() {
         successor: email("hemmelig-etterfolger@example.test"),
         starts_on: day(2027, 9, 1),
         ends_on_exclusive: day(2028, 9, 1),
-        message: Some("hemmelig melding".to_owned()),
     };
     let debug = format!("{proposal:?}");
     assert!(!debug.contains("hemmelig-etterfolger@example.test"));
-    assert!(!debug.contains("hemmelig melding"));
+}
+
+/// Coverage gap (audit section 5): `UnknownRequest`, reached only once the actor's
+/// admin authority is already established -- a three-line lookup a random
+/// `Uuid::now_v7()` cannot match, on both decision paths.
+#[tokio::test]
+async fn an_admin_deciding_an_unknown_request_gets_unknown_request() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+
+    let decision = |request_id| RequestDecision {
+        tenant_id: fau.tenant_id,
+        actor_membership_id: fau.admin_membership_id,
+        request_id,
+    };
+
+    let err = approve_request(&pool, decision(Uuid::now_v7()), vec![], t0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, MembershipError::UnknownRequest, "approve_request");
+
+    let err = decline_request(&pool, decision(Uuid::now_v7()), t0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, MembershipError::UnknownRequest, "decline_request");
 }

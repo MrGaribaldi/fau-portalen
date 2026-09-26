@@ -7,6 +7,7 @@
 
 mod common;
 use common::TestDb;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 fn sqlstate(err: &sqlx::Error) -> Option<String> {
@@ -21,11 +22,7 @@ fn constraint_name(err: &sqlx::Error) -> Option<String> {
         .map(|c| c.to_owned())
 }
 
-async fn tenant(
-    pool: &sqlx::PgPool,
-    status: &str,
-    school: Option<Uuid>,
-) -> Result<Uuid, sqlx::Error> {
+async fn tenant(pool: &PgPool, status: &str, school: Uuid) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::now_v7();
     sqlx::query("insert into tenants (id, name, status, school_id) values ($1, 'FAU', $2, $3)")
         .bind(id)
@@ -37,8 +34,11 @@ async fn tenant(
 }
 
 /// An active tenant with one membership and one role, for tables that reference them.
+/// Each call gets its own real school (a fresh label), so two calls within one test
+/// never collide on `tenants_one_live_per_school`.
 async fn seeded(pool: &sqlx::PgPool) -> (Uuid, Uuid, Uuid) {
-    let t = tenant(pool, "active", None).await.unwrap();
+    let school = common::membership::school(pool, &format!("seeded-{}", Uuid::now_v7())).await;
+    let t = tenant(pool, "active", school).await.unwrap();
     let (acc, m, r) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     sqlx::query("insert into accounts (id, email) values ($1, $2)")
         .bind(acc)
@@ -91,11 +91,11 @@ async fn invitation(
 async fn one_live_fau_per_school() {
     let db = TestDb::migrated().await;
     let pool = db.admin_pool();
-    let school = Uuid::now_v7();
+    let school = common::membership::school(&pool, "one_live_fau_per_school").await;
 
-    tenant(&pool, "pending", Some(school)).await.unwrap();
+    tenant(&pool, "pending", school).await.unwrap();
     for status in ["pending", "active"] {
-        let err = tenant(&pool, status, Some(school))
+        let err = tenant(&pool, status, school)
             .await
             .expect_err("a second live FAU for one school was accepted");
         assert_eq!(sqlstate(&err).as_deref(), Some("23505"), "{err:?}");
@@ -104,19 +104,21 @@ async fn one_live_fau_per_school() {
             Some("tenants_one_live_per_school")
         );
     }
-    // A closed FAU does not block, and FAU-er without a school yet never collide.
-    tenant(&pool, "closed", Some(school)).await.unwrap();
-    tenant(&pool, "active", None).await.unwrap();
-    tenant(&pool, "active", None).await.unwrap();
+    // A closed FAU does not block, and FAU-er with a different school never collide.
+    tenant(&pool, "closed", school).await.unwrap();
+    let other_a = common::membership::school(&pool, "one_live_fau_per_school-other-a").await;
+    let other_b = common::membership::school(&pool, "one_live_fau_per_school-other-b").await;
+    tenant(&pool, "active", other_a).await.unwrap();
+    tenant(&pool, "active", other_b).await.unwrap();
 }
 
 #[tokio::test]
 async fn deleting_a_pending_tenant_takes_its_signup_row() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
-    let t = tenant(&pool, "pending", Some(Uuid::now_v7()))
-        .await
-        .unwrap();
+    let school =
+        common::membership::school(&pool, "deleting_a_pending_tenant_takes_its_signup_row").await;
+    let t = tenant(&pool, "pending", school).await.unwrap();
     sqlx::query(
         "insert into tenant_signups
            (tenant_id, registrant_email, leader_email, admin_ends_on_exclusive, expires_at)
@@ -229,32 +231,24 @@ async fn access_request_constraints() {
     let pool = db.admin_pool();
     let (t, _, _) = seeded(&pool).await;
 
-    let insert = |email: &'static str, message: String| {
+    let insert = |email: &'static str| {
         sqlx::query(
             "insert into access_requests
-               (tenant_id, id, kind, requester_email, invitee_email, message, created_on, created_at)
-             values ($1, $2, 'access', $3, $3, $4, current_date, now())",
+               (tenant_id, id, kind, requester_email, invitee_email, created_on, created_at)
+             values ($1, $2, 'access', $3, $3, current_date, now())",
         )
         .bind(t)
         .bind(Uuid::now_v7())
         .bind(email)
-        .bind(message)
         .execute(&pool)
     };
-    insert("a@example.test", "ø".repeat(500)).await.unwrap();
-    let dup = insert("a@example.test", "igjen".into())
+    insert("a@example.test").await.unwrap();
+    let dup = insert("a@example.test")
         .await
         .expect_err("a second open request from one address was accepted");
     assert_eq!(
         constraint_name(&dup).as_deref(),
         Some("access_requests_one_open_per_address")
-    );
-    let long = insert("b@example.test", "ø".repeat(501))
-        .await
-        .expect_err("a 501-character message was accepted");
-    assert_eq!(
-        constraint_name(&long).as_deref(),
-        Some("access_request_message_is_short")
     );
 
     let replacement_without_role = sqlx::query(
@@ -270,6 +264,79 @@ async fn access_request_constraints() {
     assert_eq!(
         constraint_name(&replacement_without_role).as_deref(),
         Some("replacement_names_proposer_and_role")
+    );
+}
+
+#[tokio::test]
+async fn access_request_sealed_message_is_bounded() {
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+    let (t, _, _) = seeded(&pool).await;
+
+    let insert = |email: &'static str, sealed_message: Vec<u8>| {
+        sqlx::query(
+            "insert into access_requests
+               (tenant_id, id, kind, requester_email, invitee_email, sealed_message,
+                created_on, created_at)
+             values ($1, $2, 'access', $3, $3, $4, current_date, now())",
+        )
+        .bind(t)
+        .bind(Uuid::now_v7())
+        .bind(email)
+        .bind(sealed_message)
+        .execute(&pool)
+    };
+    insert("a@example.test", vec![0u8; 2200])
+        .await
+        .expect("2200 bytes is within the bound");
+    let too_long = insert("b@example.test", vec![0u8; 2201])
+        .await
+        .expect_err("2201 bytes was accepted");
+    assert_eq!(
+        sqlstate(&too_long).as_deref(),
+        Some("23514"),
+        "{too_long:?}"
+    );
+    assert_eq!(
+        constraint_name(&too_long).as_deref(),
+        Some("access_request_sealed_message_is_bounded")
+    );
+}
+
+#[tokio::test]
+async fn invitation_encrypted_message_is_bounded() {
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+    let (t, _, _) = seeded(&pool).await;
+
+    let insert = |hash: Vec<u8>, encrypted_message: Vec<u8>| {
+        sqlx::query(
+            "insert into invitations
+               (tenant_id, id, token_hash, mode, recipient_email, expires_at, created_at,
+                encrypted_message)
+             values ($1, $2, $3, 'activation', 'ny@example.test', now() + interval '14 days',
+                     now(), $4)",
+        )
+        .bind(t)
+        .bind(Uuid::now_v7())
+        .bind(hash)
+        .bind(encrypted_message)
+        .execute(&pool)
+    };
+    insert(vec![1u8; 32], vec![0u8; 2200])
+        .await
+        .expect("2200 bytes is within the bound");
+    let too_long = insert(vec![2u8; 32], vec![0u8; 2201])
+        .await
+        .expect_err("2201 bytes was accepted");
+    assert_eq!(
+        sqlstate(&too_long).as_deref(),
+        Some("23514"),
+        "{too_long:?}"
+    );
+    assert_eq!(
+        constraint_name(&too_long).as_deref(),
+        Some("invitation_encrypted_message_is_bounded")
     );
 }
 
@@ -383,13 +450,16 @@ async fn audit_and_outbox_codes_are_constrained() {
 }
 
 #[tokio::test]
-async fn the_contract_version_is_three() {
+async fn the_contract_version_is_four() {
+    // #3441's migration 0004 bumped this past 0003's own version; see also
+    // register_schema.rs's contract_version_is_four, which checks the same fact
+    // through the admin pool rather than fau_app's.
     let db = TestDb::migrated().await;
     let version: i32 = sqlx::query_scalar("select max(version) from schema_contract")
         .fetch_one(&db.app_pool().await)
         .await
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, common::migration_file_count());
 }
 
 // The tests below round out coverage of 0003's remaining check constraints -- every

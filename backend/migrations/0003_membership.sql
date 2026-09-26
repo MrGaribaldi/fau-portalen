@@ -159,8 +159,9 @@ create table access_requests (
   replaced_assignment_id     uuid,
   proposed_starts_on         date,
   proposed_ends_on_exclusive date,
-  message                    text
-    constraint access_request_message_is_short check (char_length(message) <= 500),
+  -- Sealed to the FAU's public key by the key service (ADR-003 decision 6), never plaintext.
+  sealed_message              bytea
+    constraint access_request_sealed_message_is_bounded check (octet_length(sealed_message) <= 2200),
   status                     text        not null default 'pending'
     check (status in ('pending', 'approved', 'declined', 'withdrawn', 'lapsed')),
   -- The Europe/Oslo date of creation, for the per-day limit and the 30-day lapse.
@@ -210,8 +211,11 @@ create table invitations (
   accepted_membership_id uuid,
   revoked_at             timestamptz,
   created_at             timestamptz not null,
+  -- Encrypted under a per-invitation key wrapped by the FAU's KEK, readable by the invitee before accepting (ADR-003 decision 6).
+  encrypted_message      bytea,
   primary key (tenant_id, id),
   constraint invitations_token_hash_unique unique (token_hash),
+  constraint invitation_encrypted_message_is_bounded check (octet_length(encrypted_message) <= 2200),
   constraint invitation_token_hash_is_sha256 check (octet_length(token_hash) = 32),
   foreign key (tenant_id, issued_by)              references memberships (tenant_id, id),
   foreign key (tenant_id, handover_grant_id)      references handover_grants (tenant_id, id),

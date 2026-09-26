@@ -120,10 +120,10 @@ impl ReadinessState {
     /// The shared implementation behind [`ReadinessState::probe`], parameterised
     /// over the check itself so a unit test can substitute a fake, instant check
     /// function -- proving the cache's exact behaviour (a failure is never cached, a
-    /// success is, for exactly [`CACHE_TTL`]) deterministically, without a live
-    /// database or a timing-dependent integration test. See
+    /// success is served from cache on the call right after it) deterministically,
+    /// without a live database or a timing-dependent integration test. See
     /// `tests::a_failure_is_never_cached_so_the_next_call_rechecks` and
-    /// `tests::a_success_is_cached_for_the_ttl`.
+    /// `tests::a_success_is_served_from_cache_on_the_very_next_call`.
     async fn probe_with<F, Fut>(&self, check: F) -> Readiness
     where
         F: FnOnce() -> Fut,
@@ -350,8 +350,15 @@ mod tests {
 
     /// The other half of the same property: a `Ready` result *is* cached, so an
     /// immediately following call does not re-check at all.
+    ///
+    /// Minor finding 5: this shows only that a fresh success is served from cache on
+    /// the very next call, never that the cache actually expires after `CACHE_TTL`
+    /// -- `tokio::time::pause` cannot drive `Instant` (only `tokio`'s own virtual
+    /// clock, which `Instant::now`/`elapsed` do not read), so making that half
+    /// testable would mean making the clock injectable. Named for what this
+    /// actually proves rather than promising TTL expiry it does not check.
     #[tokio::test]
-    async fn a_success_is_cached_for_the_ttl() {
+    async fn a_success_is_served_from_cache_on_the_very_next_call() {
         let state = ReadinessState::new();
         state.set_initialised();
 

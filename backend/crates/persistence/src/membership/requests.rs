@@ -6,7 +6,7 @@ use std::fmt;
 use fau_domain::email::{Email, VerifiedEmail};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::requests::{
-    check_replacement_dates, check_request_limits, lapse_cutoff, normalise_message,
+    check_replacement_dates, check_request_limits, lapse_cutoff,
 };
 use fau_domain::membership::vocabulary::{InvitationMode, RequestKind};
 use fau_domain::time::Moment;
@@ -24,23 +24,23 @@ use super::sql::{
     ts_param, usable_member_email, write_audit, ActorKind, Audit,
 };
 
+/// No message field until the key service exists: messages are never stored as
+/// plaintext (ADR-003 decision 6).
 #[derive(Clone)]
 pub struct CreateAccessRequest {
     pub tenant_id: Uuid,
     /// Confirmed with a Hanko passcode first (spec 3.2), so nobody can make the portal
     /// email an FAU's admins from an address they do not control.
     pub requester: VerifiedEmail,
-    pub message: Option<String>,
 }
 
-/// Hand-written so the message never reaches a log line the way a derived `Debug` would
-/// (`requester`'s own `Debug` already redacts the address).
+/// Hand-written so a future field never reaches a log line the way a derived `Debug`
+/// would (`requester`'s own `Debug` already redacts the address).
 impl fmt::Debug for CreateAccessRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CreateAccessRequest")
             .field("tenant_id", &self.tenant_id)
             .field("requester", &self.requester)
-            .field("message", &self.message.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -51,7 +51,6 @@ pub async fn create_access_request(
     req: CreateAccessRequest,
     at: Moment,
 ) -> Result<Uuid, MembershipError> {
-    let message = normalise_message(req.message.as_deref())?;
     let mut tx = pool.begin().await?;
     let state = lock_tenant(&mut tx, req.tenant_id).await?;
     require_open(&state)?;
@@ -69,7 +68,6 @@ pub async fn create_access_request(
             requester_membership_id: None,
             replaced_assignment_id: None,
             proposed: None,
-            message: message.as_deref(),
         },
     )
     .await?;
@@ -93,6 +91,8 @@ pub async fn create_access_request(
     Ok(request_id)
 }
 
+/// No message field until the key service exists: messages are never stored as
+/// plaintext (ADR-003 decision 6).
 #[derive(Clone)]
 pub struct CreateReplacementProposal {
     pub tenant_id: Uuid,
@@ -102,11 +102,10 @@ pub struct CreateReplacementProposal {
     pub successor: Email,
     pub starts_on: Date,
     pub ends_on_exclusive: Date,
-    pub message: Option<String>,
 }
 
-/// Hand-written so the message never reaches a log line the way a derived `Debug` would
-/// (`successor`'s own `Debug` already redacts the address).
+/// Hand-written so a future field never reaches a log line the way a derived `Debug`
+/// would (`successor`'s own `Debug` already redacts the address).
 impl fmt::Debug for CreateReplacementProposal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CreateReplacementProposal")
@@ -116,7 +115,6 @@ impl fmt::Debug for CreateReplacementProposal {
             .field("successor", &self.successor)
             .field("starts_on", &self.starts_on)
             .field("ends_on_exclusive", &self.ends_on_exclusive)
-            .field("message", &self.message.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -130,7 +128,6 @@ pub async fn create_replacement_proposal(
     req: CreateReplacementProposal,
     at: Moment,
 ) -> Result<Uuid, MembershipError> {
-    let message = normalise_message(req.message.as_deref())?;
     let mut tx = pool.begin().await?;
     let state = lock_tenant(&mut tx, req.tenant_id).await?;
     require_open(&state)?;
@@ -172,7 +169,6 @@ pub async fn create_replacement_proposal(
             requester_membership_id: Some(req.proposer_membership_id),
             replaced_assignment_id: Some(req.replaced_assignment_id),
             proposed: Some(proposed),
-            message: message.as_deref(),
         },
     )
     .await?;
@@ -236,7 +232,6 @@ struct NewRequest<'a> {
     requester_membership_id: Option<Uuid>,
     replaced_assignment_id: Option<Uuid>,
     proposed: Option<Period>,
-    message: Option<&'a str>,
 }
 
 async fn insert_request(
@@ -248,9 +243,9 @@ async fn insert_request(
     sqlx::query(
         "insert into access_requests
            (tenant_id, id, kind, requester_email, invitee_email, requester_membership_id,
-            replaced_assignment_id, proposed_starts_on, proposed_ends_on_exclusive, message,
+            replaced_assignment_id, proposed_starts_on, proposed_ends_on_exclusive,
             created_on, created_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::date, $10, $11::date, $12::timestamptz)",
+         values ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::date, $10::date, $11::timestamptz)",
     )
     .bind(r.tenant_id)
     .bind(id)
@@ -261,7 +256,6 @@ async fn insert_request(
     .bind(r.replaced_assignment_id)
     .bind(r.proposed.map(|p| date_param(p.starts_on())))
     .bind(r.proposed.map(|p| date_param(p.ends_on_exclusive())))
-    .bind(r.message)
     .bind(date_param(at.today()))
     .bind(ts_param(at.now()))
     .execute(&mut *conn)

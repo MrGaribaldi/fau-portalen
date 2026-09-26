@@ -22,7 +22,9 @@ set -eu
 psql -v ON_ERROR_STOP=1 \
      -v migrate_pw="${FAU_MIGRATE_PASSWORD:-fau_migrate}" \
      -v app_pw="${FAU_APP_PASSWORD:-fau_app}" \
+     -v register_pw="${FAU_REGISTER_PASSWORD:-fau_register}" \
      -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
-alter role fau_migrate login password :'migrate_pw';
-alter role fau_app     login password :'app_pw';
+alter role fau_migrate  login password :'migrate_pw';
+alter role fau_app      login password :'app_pw';
+alter role fau_register login password :'register_pw';
 SQL

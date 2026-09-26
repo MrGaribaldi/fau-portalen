@@ -138,13 +138,21 @@ async fn readiness_body_names_no_internal_address() {
     }
 
     db.sever_connections().await;
-    common::poll_until(
+    let dropped = common::poll_until(
         || app.get_async("/health/ready"),
         |r| r.status() == 503,
         std::time::Duration::from_secs(10),
     )
     .await;
-    let not_ready_body = app.get("/health/ready").await.text().await.unwrap();
+    // Minor finding 6: the discarded bool meant a readiness that never dropped to
+    // 503 would still have this test inspect (and pass on) a *ready* body below.
+    assert!(
+        dropped,
+        "readiness never went not-ready after severing connections"
+    );
+    let not_ready_response = app.get("/health/ready").await;
+    assert_eq!(not_ready_response.status(), 503);
+    let not_ready_body = not_ready_response.text().await.unwrap();
     for leak in leaks {
         assert!(
             !not_ready_body.contains(leak),
@@ -154,15 +162,16 @@ async fn readiness_body_names_no_internal_address() {
 }
 
 #[tokio::test]
-async fn a_failing_probe_is_not_cached() {
-    // This integration test can only honestly show that recovery becomes visible
-    // again once the outage ends -- polling on a wall-clock window cannot itself
-    // distinguish "never cached" from "cached for less than the window observed".
-    // The exact property (a failure is never cached; a success is cached for
-    // exactly `CACHE_TTL`) is proven deterministically, with no timing dependency,
-    // by `fau_app`'s own unit tests on `ReadinessState::probe_with`
+async fn readiness_recovers_after_an_outage() {
+    // Minor finding 5: renamed from `a_failing_probe_is_not_cached`, which this test
+    // cannot actually show -- it can only honestly prove that recovery becomes
+    // visible again once the outage ends -- polling on a wall-clock window cannot
+    // itself distinguish "never cached" from "cached for less than the window
+    // observed". The exact property (a failure is never cached; a success is cached
+    // for exactly `CACHE_TTL`) is proven deterministically, with no timing
+    // dependency, by `fau_app`'s own unit tests on `ReadinessState::probe_with`
     // (`a_failure_is_never_cached_so_the_next_call_rechecks` and
-    // `a_success_is_cached_for_the_ttl`).
+    // `a_success_is_served_from_cache_on_the_very_next_call`).
     let db = TestDb::migrated().await;
     let app = common::spawn_serve(&db).await;
     db.sever_connections().await;

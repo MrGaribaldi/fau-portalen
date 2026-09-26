@@ -511,6 +511,69 @@ async fn the_leader_accepts_and_may_adjust_the_end_date_within_range() {
     );
 }
 
+/// Coverage gap (audit section 5): `MembershipError::EmptyPeriod`
+/// (`invitations.rs:737`), reached when an admin-end override would put the end at
+/// or before the role's own start. Built by accepting *earlier* than activation: the
+/// leader's admin period starts on activation's own today (2026-09-23, as the test
+/// above shows), and `validate_admin_end` is checked against *this* call's own today,
+/// not activation's -- so accepting from a today early enough (here, two months
+/// before activation) admits an override equal to the period's start under
+/// `validate_admin_end`'s 1-24 month window, while still emptying the period itself.
+#[tokio::test]
+async fn an_override_that_would_empty_the_admin_period_is_refused() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let pending = create_pending_tenant(
+        &pool,
+        signup(
+            school(&pool, "empty-period-leader").await,
+            "reg@example.test",
+            "leder@example.test",
+            t0,
+        ),
+        t0,
+    )
+    .await
+    .unwrap();
+    let activated = activate_tenant(
+        &pool,
+        Activation {
+            tenant_id: pending.tenant_id,
+            registrant: verified("reg@example.test"),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let token = activated.leader_invitation.unwrap().token;
+
+    // t0's today is 2026-09-23 (see `the_leader_accepts_and_may_adjust_the_end_date_
+    // within_range` above); the admin period therefore starts there. Accepting from
+    // 2026-07-01 keeps the invitation unexpired (it expires 2026-10-07) and admits an
+    // override of 2026-09-23 under validate_admin_end's [today+1mo, today+24mo]
+    // window -- exactly equal to the period's start.
+    let early = at("2026-07-01T10:00:00Z");
+    let err = accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token: token.expose().to_owned(),
+            acceptor: verified("leder@example.test"),
+            admin_end_override: Some(day(2026, 9, 23)),
+        },
+        early,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, MembershipError::EmptyPeriod);
+    assert_eq!(
+        count(&pool, "select count(*) from memberships").await,
+        1,
+        "only the registrant's own membership exists; a refused acceptance must not \
+         create the leader's"
+    );
+}
+
 #[tokio::test]
 async fn only_an_activation_invitation_accepts_an_end_date_change() {
     let db = TestDb::migrated().await;

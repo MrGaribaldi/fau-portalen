@@ -1,8 +1,10 @@
 # School and municipality register: design for #3441
 
-Status: **draft for Erik's review**, written 23 September 2026 overnight, as authorised in
-docs/planning-decisions.md ("#3416, #3413 and #3485 accepted"). Nothing here is decided until Erik
-accepts it; section 12 lists what he is asked to decide. No data has been imported into any database.
+Status: **decided 24 September 2026.** Erik answered D1–D11 on #3441. Section 12 records each
+answer, and docs/planning-decisions.md ("School register decided (#3441)") records the agent's
+rulings on the parts his answers added. Those rulings are the Brreg FAU matching in 2.5 and 4.6,
+the weekly cadence and the submission lookup in 5.4. The draft was written 23 September 2026
+overnight, as authorised in docs/planning-decisions.md ("#3416, #3413 and #3485 accepted").
 User-facing strings are Bokmål source strings for the localisation mechanism (#3439), shown in quotes.
 
 Every online fact below was checked on **23 September 2026** unless another date is given. Figures
@@ -177,9 +179,9 @@ education was not checked.
   organisere seg på andre måtar." Mandatory, with an escape clause.
 - **Private grunnskole:** privatskolelova (LOV-2003-07-04-84; its current short title is
   *privatskolelova*, not friskolelova) § 5A-5: "Kvar grunnskole skal ha eit foreldreråd … Foreldrerådet
-  **kan** velje eit arbeidsutval." Optional, but common enough to include. ADR-002 §8 calls the
-  approval route "friskolelova". The title changed back, and the reviewer checklist should say
-  privatskolelova. NSR records approval under "privatskoleloven" for 285 schools and "opplæringsloven
+  **kan** velje eit arbeidsutval." Optional, but common enough to include. ADR-002 §8 called the
+  approval route "friskolelova". That was corrected on 24 September 2026, and the reviewer checklist
+  should say privatskolelova too. NSR records approval under "privatskoleloven" for 285 schools and "opplæringsloven
   § 22-1" for 5.
 - **Videregående is out of scope.** The same § 10-5 requires only an elevråd at upper secondary and no
   parents' body. The product premise is FAU.
@@ -224,6 +226,25 @@ change independently. The data above adds three cases the sync must handle:
    - A change whose old code still exists afterwards is a boundary adjustment and is ignored.
    - Schools that move municipality in a split keep their UUID. Their old paths 301 through history.
 
+### 2.5 The FAU-er themselves: Brreg's Enhetsregisteret (D1)
+
+Most FAU-er are registered in Brreg as their own entities, usually organisation form FLI
+("Forening/lag/innretning") with NACE 94.992. Erik's D1 answer links them to their schools, so an
+FAU whose name differs from the school's is named correctly from the start. Measured on
+24 September 2026:
+
+| Question | Finding |
+|---|---|
+| Source | `https://data.brreg.no/enhetsregisteret/api/enheter/lastned`, a gzip JSON array of every registered main unit: 1,175,297 units, 210 MB, about 40 s to download. Anonymous. Refreshed nightly. Licence NLOD, like every Brreg open dataset. |
+| Search API | Not usable for this. `navn=fau` returns 3,732 hits, including names such as "Fauske …". `navn=arbeidsutvalg` returns fewer hits than `navn=foreldrenes arbeidsutvalg`, so the filter is not a substring match. FLI with NACE 94.992 is 73,355 rows, and the API cannot page past 10,000. The CSV bulk endpoint needs authentication. |
+| Candidate set | FLI units whose name contains FAU, "foreldrenes arbeidsutvalg", "foreldrerådets arbeidsutvalg", "arbeidsutval(g)" or "foreldreråd(et)" on word boundaries: **2,477**. All but 14 have NACE 94.992. Some are kindergarten parents' councils, and those simply fail to match a school. |
+| Personal data | **913 of 2,477 carry a `c/o` or `v/` address line**, typically a named parent at a home address, e.g. "c/o <name>, <home street>". Brreg names are institutional ("BESTUM FAU"). |
+| Address match | Street line plus postcode, normalised, against the school's NSR visiting and postal addresses, ignoring `c/o`, `v/` and post-box lines: **1,256** FAU-er match exactly one school, **29** match several, and 1,192 match none. 28 schools have more than one FAU at their address. |
+| Name check | Where both address and a name core (the FAU name without FAU words, compared with the school name in the same municipality) identify a single school, they agree **876** times and disagree **4** times. The name alone identifies a single school for another **360** FAU-er with no address match. |
+
+So the address is a strong signal and the name a useful second one. The rules built on this are in
+4.6.
+
 ## 3. Principles
 
 1. **Identity is ours.** Every municipality and school row has a UUIDv7 we assign. Organisation
@@ -241,7 +262,9 @@ change independently. The data above adds three cases the sync must handle:
    merger or split, becomes a review item for Erik.
 6. **The register holds nothing about individuals.** The product never calls NSR's authenticated
    contact endpoint. Outreach contact data stays in #3431's prospect register, outside the product
-   database.
+   database. Brreg FAU addresses are used only in memory, during matching (4.6). They are never
+   stored, logged, put in a review item or shown, because many of them are a parent's home
+   address.
 
 ## 4. Data model
 
@@ -281,7 +304,7 @@ create unique index municipalities_slug_current on municipalities (slug);
 create table municipality_names (
   municipality_id uuid    not null references municipalities (id) on delete restrict,
   name            text    not null,
-  language        text    not null,                    -- BCP 47: 'nb', 'se', 'fkv', 'sma', 'smj'
+  language        text    not null,                    -- BCP 47: 'no', 'se', 'fkv', 'sma', 'smj'
   priority        integer not null,
   primary key (municipality_id, name)
 );
@@ -404,7 +427,8 @@ message, never to a 500.
 ### 4.3 NSR staging and sync bookkeeping
 
 ```sql
--- Last payload seen per organisation number, in scope or not. Provenance and debugging;
+-- Last NSR payload seen per organisation number, in scope or not. Provenance and debugging.
+-- NSR only: Brreg payloads are never stored, because their addresses are personal data (4.6);
 -- about 18,000 small rows if everything is kept, or about 2,800 if only grunnskoler are.
 create table register_source_records (
   source          text        not null check (source in ('nsr')),
@@ -414,7 +438,7 @@ create table register_source_records (
   source_changed_at timestamptz,
   fetched_at      timestamptz not null,
   in_scope        boolean     not null,
-  scope_reason    text        not null,                -- e.g. 'adult_education', 'abroad', 'vgs_only'
+  scope_reason    text        not null,                -- e.g. 'adult_education', 'abroad', 'upper_secondary'
   primary key (source, external_id)
 );
 
@@ -432,7 +456,9 @@ create table register_review_items (
   id          uuid        primary key,
   kind        text        not null check (kind in (
                 'closure_with_fau', 'possible_reregistration', 'possible_submission_match',
-                'municipality_split_or_merge', 'mass_change', 'unknown_municipality_number')),
+                'municipality_split_or_merge', 'mass_change', 'unknown_municipality_number',
+                'fau_several_at_school', 'fau_several_schools', 'fau_match_conflict',
+                'submission_matches_listed_school')),
   school_id   uuid        references schools (id) on delete restrict,
   other_school_id uuid    references schools (id) on delete restrict,
   municipality_id uuid    references municipalities (id) on delete restrict,
@@ -472,6 +498,16 @@ A submitted school is created with `origin = 'submitted'`, `verification = 'pend
 It works fully at `/s/<uuid>` and is `noindex` (ADR-002; flow §3.1). By default it is **not** listed
 in the picker or on the municipality page (D7).
 
+**Row-level security.** `schools`, `school_submissions` and `register_lookups` carry RLS. `fau_app`,
+the runtime role, may only ever *insert* a fresh, untouched-by-the-register row on each: a pending
+submitted school with no slug, orgnr, curated-name flag, closure, successor, scope override,
+provenance timestamp or register name; a submission still `pending` and unreviewed, with a
+`retrieval_status` the fetcher itself could have produced (never `attached_by_reviewer`); a lookup
+still unqueued and unprocessed. It has no update or delete grant on any of the three, and no select
+grant on `school_submissions` or `register_lookups` at all. `fau_register` alone reads, updates and
+(for a `held` school only) deletes. A future role granted none of this sees zero rows on these
+tables by default -- RLS with no matching policy is deny-by-default, not merely un-granted.
+
 ### 4.5 How a submitted school meets NSR later, and how re-registrations are handled
 
 **A submitted school appears in NSR.** When the sync sees a new in-scope organisation number:
@@ -503,13 +539,74 @@ municipality with the same or a very similar name within 30 days:
     `successor_id`, and `/s/<old>` 301s to the successor per ADR-002's error table.
   - **Unrelated.**
 
-**A genuine merger of two schools that both have an FAU** is left to the review. The one-live-FAU
-index allows only one of them on the successor, so the other stays on the closed school until the
-FAU-er agree. The product does not merge FAU-er.
+**A genuine merger of two schools that both have an FAU** is left to the review, which records the
+successor on every closed school. `successor_id` is many-to-one. **Merging FAU-er is a product
+requirement** (Erik, 24 September): a new FAU is created on the successor school, the old FAU-er's
+documents are shared into it read-only, and their members keep read-only access to the old FAU-er.
+The one-live-FAU index allows exactly that, because the old tenants stay on closed schools. The
+sharing itself depends on the document layer (#3419) and per-document keys (ADR-003 decision 5),
+and is its own card, #3498. Until it exists, the review records the successor and the FAU-er carry on
+where they are.
 
 **A school with an FAU closes.** The FAU keeps working, because closure changes nothing in the
 workspace. The public page returns 410 with a pointer to the municipality page (ADR-002), and the
 sync raises `closure_with_fau`. Nothing is deleted.
+
+### 4.6 Brreg FAU entities and their links (D1)
+
+```sql
+-- One row per Brreg entity that looks like an FAU (2.5). No address column, on purpose.
+create table registered_faus (
+  orgnr               text        primary key check (orgnr ~ '^[0-9]{9}$'),
+  registered_name     text        not null,            -- Brreg navn, as registered (capitals)
+  organisation_form   text        not null,            -- 'FLI'
+  municipality_number text,                            -- forretningsadresse.kommunenummer
+  status              text        not null check (status in ('active', 'deleted')),
+  last_seen_in_source_at timestamptz not null,
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now()
+);
+
+create table school_fau_links (
+  school_id   uuid        not null references schools (id) on delete restrict,
+  fau_orgnr   text        not null references registered_faus (orgnr) on delete restrict,
+  method      text        not null check (method in ('address', 'name', 'operator')),
+  -- linked: used for signup prefill; candidate: a name-only match awaiting confirmation;
+  -- rejected: an operator said no, and the sync never proposes the pair again.
+  state       text        not null check (state in ('linked', 'candidate', 'rejected')),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  primary key (school_id, fau_orgnr)
+);
+create unique index school_fau_links_one_per_school on school_fau_links (school_id) where state = 'linked';
+create unique index school_fau_links_one_per_fau    on school_fau_links (fau_orgnr) where state = 'linked';
+```
+
+**Matching, per weekly run**, entirely in memory:
+
+1. For each candidate entity, compute its address keys: every address line with a house number,
+   normalised and paired with its postcode. `c/o`, `v/` and post-box lines are skipped, with one
+   exception (Erik, 24 September). A `c/o` or `v/` line that names the school, such as
+   "c/o Hosle skole, Bispeveien 73", counts for that school only. It is checked against each
+   candidate school sharing the postcode. A line naming a person or another school never counts.
+2. Compute the same for every active in-scope school's visiting and postal address.
+3. **One FAU, one school** at that address. The pair is linked with `method = 'address'`, unless
+   the name core identifies a different single school. That raises `fau_match_conflict`, and
+   nothing is linked.
+4. **Several FAU-er at one school's address** raises `fau_several_at_school` (Erik's rule), and
+   nothing is linked. **One FAU address matching several schools** raises `fau_several_schools`,
+   also unlinked, even when the name would break the tie: a shared building is exactly where a
+   guess goes wrong.
+5. **No address match, and the name core identifies a single school in the FAU's municipality**,
+   stores a `candidate` link. It is not used for prefill and not queued. It waits for the admin
+   screen (D11b, #3499).
+6. An operator link (`method = 'operator'`) or rejection is never overwritten by the sync. An
+   entity missing from the bulk file becomes `deleted`, and its link stops being used.
+
+**What a link is used for.** The signup form's FAU name defaults to the linked entity's registered
+name, case-normalised (Brreg stores capitals, so "BESTUM FAU" becomes "Bestum FAU", keeping known
+acronyms such as FAU and SFO). Otherwise it defaults to the school's `display_name`. It is a
+suggestion like every other prefill, and it grants nothing.
 
 ## 5. Import and sync
 
@@ -521,11 +618,13 @@ permits creating everything on an empty register.
 
 - **Seed.** Run once by an operator (Erik, or the agent with his go-ahead) against each environment
   after the migration, `--dry-run` first. The seed is simply the first sync.
-- **Periodic sync.** A Kubernetes **CronJob** with the same image runs daily at 04:30 Europe/Oslo,
-  after NSR's 01:00-02:00 Brreg import. It uses `timeZone: Europe/Oslo`, supported since Kubernetes
+- **Periodic sync.** A Kubernetes **CronJob** with the same image runs **weekly (D9), Mondays at
+  04:30 Europe/Oslo**, after NSR's 01:00-02:00 Brreg import. It uses `timeZone: Europe/Oslo`, supported since Kubernetes
   1.27 (the cluster runs k3s v1.35.2), `concurrencyPolicy: Forbid`, and a PostgreSQL advisory lock
   inside the command, so a manual run and the CronJob cannot overlap. The manifest belongs to #3424's
-  deployment work. Egress is limited to `data-nsr.udir.no`, `api.kartverket.no` and `data.ssb.no`.
+  deployment work. Egress is limited to `data-nsr.udir.no`, `api.kartverket.no`, `data.ssb.no` and `data.brreg.no`.
+- **Submission lookups** (5.4). `fau register lookups` runs every few minutes as its own CronJob,
+  and exits at once when the queue is empty.
 
 ### 5.2 Order of work inside one run
 
@@ -537,8 +636,8 @@ permits creating everything on an empty register.
      in the affected municipalities.
 2. **NSR list.** Page `/v4/enheter` fully. There are only 19 pages, so the full list is cheaper
    and more trustworthy than `endretetter`.
-3. **NSR detail** for every grunnskole whose `DatoEndret` is newer than the stored one, plus a full
-   detail pass once a week, which takes about a minute at four in parallel.
+3. **NSR detail** for every grunnskole. The run is weekly, so it is always a full detail pass,
+   which takes about a minute at four in parallel.
 4. **Classify** each record in or out of scope (section 2.3, then `scope_override`), and upsert
    `register_source_records` by `(source, external_id)` with the payload hash.
 5. **Apply to `schools`:**
@@ -551,7 +650,8 @@ permits creating everything on an empty register.
    - An NSR municipality number unknown to `municipality_numbers` raises
      `unknown_municipality_number` and skips that row. That happens on 1 January if NSR moves before
      Kartverket.
-6. **Record** counts in `register_sync_runs`, and write one `audit_events` row per applied run. The
+6. **Brreg FAU entities** (4.6): stream the bulk file, keep the candidate set, match and link.
+7. **Record** counts in `register_sync_runs`, and write one `audit_events` row per applied run. The
    table comes forward in 0003 (flow decision 14). Register changes are system events with no tenant,
    so this needs #3421 to accept a null `tenant_id` for system events, or a separate system audit
    table. That is flagged for #3421, not decided here.
@@ -571,6 +671,38 @@ permits creating everything on an empty register.
   match review, since nothing can reference it.
 - Operational: subscribe the operational address (`fau@ewb-solutions.as`) to Udir's
   `nxr-teknisk@udir.no` change notices, and watch status.kartverket.no for API changes.
+
+### 5.4 Submission lookup (D9)
+
+A "Mangler skolen din?" submission inserts a row into `register_lookups` in the same transaction
+that creates the school and the submission. The runtime role may insert there and nowhere else in
+the register. `fau register lookups` runs as `fau_register`. For each queued row it fetches NSR's
+list for the submitted municipality (`/v4/enheter/kommune/{kommunenummer}`), then the detail of
+each in-scope grunnskole it does not already hold:
+
+- **Exactly one in-scope, active NSR school absent from the register has the same folded name**
+  (the section 7 folding) as the submission. The submitted school absorbs it, exactly as a
+  `possible_submission_match` resolved as "match" does: orgnr, attributes, `register_name` and
+  slug. It becomes `verified`, the submission becomes `matched`, and Erik is told by email rather
+  than asked. This is Erik's rule: the school is now known, so manual review has nothing to add.
+- **A similar but not identical name** raises `possible_submission_match` for review, as in 4.5.
+- **The school is already listed** in the register raises `submission_matches_listed_school`. The
+  registrant missed it in the picker, and moving a tenant between school rows is a human's call.
+- **Nothing found** leaves the submission in the ordinary review queue.
+
+```sql
+create table register_lookups (
+  id            uuid        primary key,
+  submission_id uuid        not null unique references school_submissions (id) on delete restrict,
+  queued_at     timestamptz not null,
+  processed_at  timestamptz,
+  outcome       text        check (outcome in ('approved', 'review', 'not_found', 'failed')),
+  attempts      integer     not null default 0
+);
+```
+
+A failed fetch leaves the row queued and counts an attempt. After five attempts the outcome is
+`failed`, and the submission waits for ordinary review.
 
 ## 6. Slug minting
 
@@ -603,8 +735,8 @@ Examples, all from the real data:
 - "Máze Skuvla/Masi skole Máze skole" → `maze-skuvla-masi-skole-maze-skole`, which argues for D5;
 - "Hosle skole" in 3201 Bærum → `/fau/3201-baerum/hosle-skole`.
 
-ADR-002's illustrative `3911-faerder/hosle-skole` pairs a real school with the wrong municipality, so
-tests should use real pairs.
+ADR-002's illustrative path used to be `3911-faerder/hosle-skole`, which paired a real school with the
+wrong municipality. It was corrected on 24 September 2026, and tests should use real pairs.
 
 **Collisions within a municipality.** There are none today *(measured)*. If one arises:
 
@@ -693,7 +825,8 @@ Nothing may `order by` a name column for presentation, and a test pins that Bokm
 
 - It pre-selects the school and its municipality in the form. The user can change both, and the
   form calls it "Forslag" rather than fact.
-- The FAU name defaults to `display_name`.
+- The FAU name defaults to the linked Brreg entity's case-normalised registered name, or else to
+  `display_name` (4.6).
 - It grants nothing and carries nothing but the school UUID.
 - An unknown or closed UUID lands on the ordinary picker with a neutral message. It never errors
   in a way that distinguishes "never existed" from "closed", beyond the public 410 page.
@@ -727,6 +860,8 @@ Nothing may `order by` a name column for presentation, and a test pins that Bokm
 
 - «Inneholder data under Norsk lisens for offentlige data (NLOD) tilgjengeliggjort av
   Utdanningsdirektoratet»;
+- «Inneholder data under Norsk lisens for offentlige data (NLOD) tilgjengeliggjort av
+  Brønnøysundregistrene»;
 - «Kommunedata: © Kartverket, CC BY 4.0» and «Statistisk sentralbyrå, CC BY 4.0»;
 - a note that display names may be adjusted by us, as NLOD §5 requires when data is changed.
 
@@ -751,8 +886,9 @@ is:
 5. **Outreach links.** They carry only a school UUID that is already public on the school page's
    canonical link. So they are **not secrets and must never be treated as one**. Their safety comes
    from granting nothing: the §3.2 duplicate block and the unique index apply whatever the entry
-   point, so a link cannot claim an existing FAU. No per-recipient token or identifier is ever added
-   (D10).
+   point, so a link cannot claim an existing FAU. No per-recipient token or identifier is ever added.
+   One campaign-level parameter shared by every recipient of a mailing, such as `?kampanje=2026-10`,
+   is allowed (D10).
 
 D6 asks Erik to confirm this reading.
 
@@ -774,7 +910,11 @@ leader's published address), and lives **outside the product database**. To avoi
 
 - **The product register is the only source of school identity.** #3431 keys every row on our school
   UUID and orgnr, taken from an export of the product register: `fau register export`, which lists
-  UUID, orgnr, municipality number, name and path. It never edits school data.
+  UUID, orgnr, municipality number, name, path and the linked FAU's Brreg orgnr. It never edits
+  school data.
+- **FAU contact e-mail is fetched live from Brreg by #3431 at send time,** by the FAU's orgnr, and
+  never stored in the product (Erik, 24 September). The register's parser does not read Brreg's
+  `epostadresse`, `mobil` or `telefon` fields at all.
 - **The flow is one-way.** Nothing from #3431 is imported into the product. If sales finds a school
   NSR lacks, it goes through "Mangler skolen din?" or the operator path like any other.
 - Outreach links are built from the export as `/bli-med/<uuid>`. Contact data stays in #3431, under
@@ -863,6 +1003,8 @@ extend to the new tables unchanged: no forbidden column names, and the global ta
 - slug minting and the resolver function in `crates/domain`;
 - search query functions in `crates/persistence`;
 - the review-item model, plus a minimal `fau register review list|resolve` CLI for Erik (D11);
+- Brreg FAU entities and their matching (4.6);
+- the submission lookup queue and `fau register lookups` (5.4);
 - the attribution text;
 - the seed run on each environment, with Erik's go-ahead.
 
@@ -889,10 +1031,26 @@ extend to the new tables unchanged: no forbidden column names, and the global ta
 - #3426: retention of `school_submissions` and archived decision documents;
 - #3421: system-level audit events (5.2 step 6);
 - #3431: consumes `fau register export`.
+- #3498: merging FAU-er, sharing the old FAU-er's documents into a successor FAU (4.5).
+- #3499: the D11(b) admin review screen, high priority after the MVP CLI.
 
-## 12. Open decisions for Erik
+## 12. Decisions
 
-Each has options, a recommendation and the consequence.
+Erik answered on #3441 on 24 September 2026:
+- **D1:** (a) and (b) combined, with Brreg's FAU entities matched to schools by address (2.5, 4.6).
+- **D2:** (a).
+- **D3:** (a).
+- **D4:** (a).
+- **D5:** (b).
+- **D6:** (a).
+- **D7:** (a).
+- **D8:** (a).
+- **D9:** (a), but weekly, plus an immediate NSR lookup on each submission (5.4).
+- **D10:** (b).
+- **D11:** (a), with (b) high priority after it.
+
+He also asked for FAU-er to be mergeable when schools merge (4.5). The options as they were put to
+him follow, unchanged.
 
 **D1. Data sources.**
 

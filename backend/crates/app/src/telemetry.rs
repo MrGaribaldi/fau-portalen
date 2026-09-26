@@ -1,6 +1,7 @@
 //! Structured JSON logging (design section 10), installed once at startup.
 //!
-//! JSON to stdout is the only log transport this crate has: every line carries a
+//! JSON lines are the only log transport this crate has -- on stdout for `serve`, on
+//! stderr for the `register` commands ([`LogStream`]) -- and every line carries a
 //! conventional top-level `level` (`TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR`), which is
 //! exactly what Alloy's `stage.json` promotes to a Loki label with no configuration
 //! on either side. Logs are never exported over OTLP -- Alloy's OTLP receiver would
@@ -77,14 +78,28 @@ const REQUEST_SPAN_DIRECTIVE: &str = "fau_request_span=trace";
 /// turns off ordinary application logging; see `config.rs`'s doc comment on that
 /// field for the full explanation).
 pub fn init(log_level: &str, service_version: &'static str) {
+    init_to(log_level, service_version, LogStream::Stdout);
+}
+
+/// Where [`JsonLineLayer`] writes. `serve` logs to stdout, its only log transport. The
+/// `register` commands log to stderr instead, because their stdout is their output: the
+/// dry-run plan and the export CSV. The container runtime collects both streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// As [`init`], writing every line to `stream`.
+pub fn init_to(log_level: &str, service_version: &'static str, stream: LogStream) {
     let filter = EnvFilter::try_new(format!(
         "{SQLX_DEFAULT_DIRECTIVE},{REQUEST_SPAN_DIRECTIVE},{log_level}"
     ))
-    .expect("LOG_LEVEL was already validated and trimmed by config::ServeConfig::from_env");
+    .expect("LOG_LEVEL was already validated and trimmed by config");
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(JsonLineLayer::new(service_version))
+        .with(JsonLineLayer::new(service_version, stream))
         .init();
 
     install_panic_hook();
@@ -153,16 +168,20 @@ impl Visit for JsonVisitor<'_> {
     }
 }
 
-/// Writes one JSON object per event, directly to stdout. See the module doc comment
+/// Writes one JSON object per event, directly to its [`LogStream`]. See the module doc comment
 /// for why this exists instead of `tracing_subscriber::fmt`'s built-in JSON
 /// formatter.
 struct JsonLineLayer {
     service_version: &'static str,
+    stream: LogStream,
 }
 
 impl JsonLineLayer {
-    fn new(service_version: &'static str) -> Self {
-        Self { service_version }
+    fn new(service_version: &'static str, stream: LogStream) -> Self {
+        Self {
+            service_version,
+            stream,
+        }
     }
 }
 
@@ -224,8 +243,10 @@ where
         );
 
         if let Ok(text) = serde_json::to_string(&Value::Object(line)) {
-            let mut stdout = std::io::stdout().lock();
-            let _ = writeln!(stdout, "{text}");
+            let _ = match self.stream {
+                LogStream::Stdout => writeln!(std::io::stdout().lock(), "{text}"),
+                LogStream::Stderr => writeln!(std::io::stderr().lock(), "{text}"),
+            };
         }
     }
 }

@@ -16,6 +16,7 @@ services:
       # independently-drifting pair of defaults.
       FAU_MIGRATE_PASSWORD: ${FAU_MIGRATE_PASSWORD:-fau_migrate}
       FAU_APP_PASSWORD: ${FAU_APP_PASSWORD:-fau_app}
+      FAU_REGISTER_PASSWORD: ${FAU_REGISTER_PASSWORD:-fau_register}
     ports:
       - "127.0.0.1:${FAU_DB_PORT:-5433}:5432"
     volumes:

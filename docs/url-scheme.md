@@ -46,7 +46,7 @@ leaks nothing meaningful to someone who can already open the resource. #3412's c
 
 ```
 PRETTY, mutable — for humans and search engines
-  /fau/3911-faerder/hosle-skole
+  /fau/3201-baerum/hosle-skole
   always reflects current names; 301s when anything is renamed
 
 PERMANENT, opaque — for anything we send, and for machines
@@ -78,6 +78,11 @@ Transliteration is the correct reversible form — `æ→ae`, `ø→oe`, `å→a
 municipalities use in their own `kommune.no` domains; the number prefix means we are not trying
 to mirror those addresses.
 
+**Beyond æ, ø and å** (amended 24 September 2026, #3441 decision D4): `ä→ae` and `ö→oe`, their
+Norwegian collation equivalents; `đ→d`, `ŋ→n`, `ŧ→t` and `ß→ss`; every other letter loses its
+diacritics (`á→a`, `č→c`, `š→s`, `ü→u`). The full algorithm is section 6 of
+docs/school-register-design.md.
+
 The canonical path is lowercase. Paths are case-sensitive, so a capitalised variant would be a
 second URL for the same page, splitting search signals and breaking hand-typed links; mixed-case
 requests 301 to the lowercase form. The register keeps the display name ("Færder") for rendering.
@@ -89,7 +94,7 @@ stays visible.
 
 ### 4. Schools are addressed by name alone
 
-`/fau/3911-faerder/hosle-skole`. The municipality pair already scopes them, so organisasjonsnummer
+`/fau/3201-baerum/hosle-skole`. The municipality pair already scopes them, so organisasjonsnummer
 in the path would cost readability on the segment humans actually recognise for no gain that the
 permanent `/s/<uuid>` form does not already provide. School slugs are unique within a
 municipality, enforced in the register.
@@ -101,8 +106,8 @@ PUBLIC (no login)
   /                                landing
   /priser  /om-oss  /hjelp  /personvern      product pages; the root stays ours
   /fau                             browse and search schools
-  /fau/3911-faerder                all FAU-er in the municipality + "Mangler skolen din?"
-  /fau/3911-faerder/hosle-skole    one school's FAU page + "Opprett FAU" button
+  /fau/3201-baerum                 all FAU-er in the municipality + "Mangler skolen din?"
+  /fau/3201-baerum/hosle-skole     one school's FAU page + "Opprett FAU" button
   /s/<school-uuid>                 permanent address for the same page
   /bli-med/<school-uuid>           outreach signup link, school prefilled
 
@@ -132,7 +137,7 @@ verified per request regardless of how the tenant was selected (#3412).
 
 Bokmål is served unprefixed, so today's URLs are final and nothing changes when Nynorsk arrives
 (#3439, where Nynorsk is design-only for now). A locale prefix, when introduced, is the outermost
-segment: `/nn/fau/3911-faerder/hosle-skole`, with `/nb/...` accepted and 301'd to the unprefixed
+segment: `/nn/fau/3201-baerum/hosle-skole`, with `/nb/...` accepted and 301'd to the unprefixed
 form so each page has one canonical URL. Because the prefix sits outside `/fau`, it cannot collide
 with a municipality slug. Workspace paths take no prefix; a signed-in user's locale comes from
 their account.
@@ -144,7 +149,8 @@ will always lag. The municipality page carries "Mangler skolen din?", which asks
 name and a link to the **establishing decision on an official domain**:
 
 - a public school: the municipal decision or minutes;
-- a friskole: the Utdanningsdirektoratet approval under friskolelova.
+- a private school: the Utdanningsdirektoratet approval under privatskolelova, the law's current
+  short title (earlier friskolelova; corrected 24 September 2026, #3441).
 
 The record stores the URL, the document title, the retrieval date and which kind of decision it
 is, and the school page displays it as provenance ("Opprettet etter vedtak i Færder kommune,

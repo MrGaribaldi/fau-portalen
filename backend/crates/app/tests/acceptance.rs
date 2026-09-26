@@ -162,7 +162,8 @@ fn clean_start_then_restart_against_the_existing_volume() {
 
     // Write a row through the database directly, then restart everything and prove
     // it survived -- spec section 15's "content preserved" evidence row. The tenants
-    // table's NOT NULL columns per migration 0002: id, name, status.
+    // table's NOT NULL columns per migration 0002 (id, name, status) plus 0004's
+    // school_id foreign key (#3441), so a municipality and a school are seeded first.
     let seed = compose_ok(&[
         "exec",
         "-T",
@@ -173,7 +174,15 @@ fn clean_start_then_restart_against_the_existing_volume() {
         "-d",
         "fau",
         "-c",
-        "insert into tenants (id, name, status) values (gen_random_uuid(), 'persist', 'active')",
+        "insert into municipalities (id, name, county_number, county_name, slug, status, source, search_text) \
+         values ('01990000-0000-7000-8000-000000000301', 'Oslo', '03', 'Oslo', '0301-oslo', 'active', 'manual', 'oslo'); \
+         insert into municipality_numbers (municipality_id, number, valid_from) \
+         values ('01990000-0000-7000-8000-000000000301', '0301', '1838-01-01'); \
+         insert into schools (id, municipality_id, origin, display_name, verification, orgnr, status, search_text) \
+         values ('01990000-0000-7000-8000-000000000302', '01990000-0000-7000-8000-000000000301', 'register', \
+                 'Persist skole', 'listed', '999999999', 'active', 'persist skole'); \
+         insert into tenants (id, name, status, school_id) \
+         values (gen_random_uuid(), 'persist', 'active', '01990000-0000-7000-8000-000000000302')",
     ]);
     assert!(seed.status.success());
 

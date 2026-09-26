@@ -1,6 +1,6 @@
 -- Database roles for FAU. Cluster-level objects, so not a migration.
 -- Applied by the Compose init script and by the integration-test harness;
--- #3424 provisions the same two names in production. Names are a fixed project
+-- #3424 provisions the same three names in production. Names are a fixed project
 -- contract: migration 0002 grants to `fau_app` by name.
 --
 -- No passwords here. roles.sql is committed; credentials are granted out of band --
@@ -28,6 +28,11 @@ begin
   exception when duplicate_object or unique_violation then
     null;
   end;
+  begin
+    create role fau_register nologin;
+  exception when duplicate_object or unique_violation then
+    null;
+  end;
 end
 $$;
 
@@ -37,6 +42,7 @@ do $$
 begin
   execute format('grant create, connect on database %I to fau_migrate', current_database());
   execute format('grant connect on database %I to fau_app', current_database());
+  execute format('grant connect on database %I to fau_register', current_database());
   -- Withhold TEMP too: the runtime role has no business creating temporary tables,
   -- and PostgreSQL grants CONNECT and TEMPORARY together by default.
   execute format('revoke temporary on database %I from public', current_database());
@@ -52,6 +58,11 @@ grant usage, create on schema public to fau_migrate;
 -- table by the migration that creates it, so a new table is inaccessible to the
 -- runtime until someone decides what it may do.
 grant usage on schema public to fau_app;
+
+-- The register role (#3441, D9) alone writes the school register, and runs the
+-- weekly sync and the submission lookups. Table privileges come from migration 0004.
+grant usage on schema public to fau_register;
+revoke create on schema public from fau_register;
 
 -- Explicitly withhold the default. Without this, PUBLIC can create objects in the
 -- public schema on PostgreSQL versions before 15 and, more importantly, the intent

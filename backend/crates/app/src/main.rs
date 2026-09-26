@@ -9,6 +9,7 @@ use clap::Parser;
 mod config;
 mod http;
 mod readiness;
+mod register;
 mod shutdown;
 mod telemetry;
 
@@ -41,6 +42,11 @@ enum Command {
     Serve,
     /// Apply pending migrations and exit.
     Migrate,
+    /// The school register (#3441): sync it from its public sources, or export it.
+    Register {
+        #[command(subcommand)]
+        command: register::RegisterCommand,
+    },
 }
 
 fn main() -> ExitCode {
@@ -55,8 +61,9 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Serve) => run(serve),
         Some(Command::Migrate) => run(migrate),
+        Some(Command::Register { command }) => register::run(command, SERVICE_VERSION),
         None => {
-            eprintln!("fau: no command given; expected `serve` or `migrate`");
+            eprintln!("fau: no command given; expected `serve`, `migrate` or `register`");
             ExitCode::FAILURE
         }
     }

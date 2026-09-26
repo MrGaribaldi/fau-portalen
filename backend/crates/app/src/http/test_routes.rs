@@ -59,19 +59,28 @@ struct SlowWriteParams {
     delay_ms: u64,
 }
 
-/// Opens a transaction on the runtime pool, inserts a tenant named `slow-write`,
-/// sleeps `delay_ms`, then commits and returns 200.
+/// Opens a transaction on the runtime pool, inserts a sentinel school and a tenant
+/// named `slow-write` pointed at it, sleeps `delay_ms`, then commits and returns
+/// 200.
 ///
 /// `tests/shutdown.rs::an_aborted_transaction_is_never_acknowledged` calls this with
 /// a `delay_ms` far past the 25-second drain bound: the drain-bound watchdog
 /// (`crate::shutdown`) force-exits the process while this handler is still asleep,
 /// which drops its connection -- including the still-open transaction -- before
 /// `commit` is ever reached. PostgreSQL rolls back a transaction whose connection
-/// disappears without a commit, so the row this handler inserted never actually
+/// disappears without a commit, so neither row this handler inserted ever actually
 /// lands, and the client never receives this handler's `200` either, since the
 /// connection carrying the response is gone too. That is what makes "an aborted
 /// transaction is never acknowledged" true of the real drain path, not just of this
 /// handler's own code.
+///
+/// `state.pool` runs as the runtime role `fau_app` (`compose.yaml`'s `DATABASE_URL`),
+/// and `tenants.school_id` (#3441, migration 0004) is `not null` with a foreign key
+/// to `schools`. `fau_app` may insert only a fresh, pending, submitted school (0004's
+/// row-level security), which itself needs an existing `municipality_id` --
+/// `fau_app` has no insert grant on `municipalities` at all, so this route borrows
+/// whichever municipality the test harness has already seeded
+/// (`tests/shutdown.rs` seeds one before spawning `serve`) rather than creating one.
 ///
 /// Logs its own started-marker first, synchronously, before opening the
 /// transaction -- see [`slow`]'s doc comment for why this exists and
@@ -91,11 +100,33 @@ async fn slow_write(
         .await
         .expect("begin transaction for /test/slow-write");
 
-    sqlx::query("insert into tenants (id, name, status) values ($1, 'slow-write', 'pending')")
-        .bind(Uuid::now_v7())
-        .execute(&mut *tx)
+    let municipality_id: Uuid = sqlx::query_scalar("select id from municipalities limit 1")
+        .fetch_one(&mut *tx)
         .await
-        .expect("insert sentinel tenant for /test/slow-write");
+        .expect(
+            "a municipality must already exist for /test/slow-write's sentinel school \
+             -- fau_app cannot create one itself",
+        );
+
+    let school_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into schools (id, municipality_id, origin, display_name, verification, status, search_text)
+         values ($1, $2, 'submitted', 'slow-write', 'pending', 'active', 'slow-write')",
+    )
+    .bind(school_id)
+    .bind(municipality_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert sentinel school for /test/slow-write");
+
+    sqlx::query(
+        "insert into tenants (id, name, status, school_id) values ($1, 'slow-write', 'pending', $2)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(school_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert sentinel tenant for /test/slow-write");
 
     tokio::time::sleep(Duration::from_millis(params.delay_ms)).await;
 

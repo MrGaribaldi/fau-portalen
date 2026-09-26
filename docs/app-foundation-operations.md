@@ -73,13 +73,21 @@ docker compose exec -T db psql -U postgres -d fau -v ON_ERROR_STOP=1 -c \
   "alter role fau_migrate login password 'fau_migrate'"
 docker compose exec -T db psql -U postgres -d fau -v ON_ERROR_STOP=1 -c \
   "alter role fau_app login password 'fau_app'"
+docker compose exec -T db psql -U postgres -d fau -v ON_ERROR_STOP=1 -c \
+  "alter role fau_register login password 'fau_register'"
 ```
 
-Replace the two literal passwords with whatever `.env` actually sets for
-`FAU_MIGRATE_PASSWORD` / `FAU_APP_PASSWORD` -- `fau_migrate`/`fau_app` above are only
-`.env.example`'s defaults. Do this once; every later `docker compose up` finds the
-roles already correctly configured, and `zz-compose-init.sh` is simply never invoked
-again on this volume (it is still skipped, but it no longer needs to run).
+Replace the three literal passwords with whatever `.env` actually sets for
+`FAU_MIGRATE_PASSWORD` / `FAU_APP_PASSWORD` / `FAU_REGISTER_PASSWORD` --
+`fau_migrate`/`fau_app`/`fau_register` above are only `.env.example`'s defaults. Do
+this once; every later `docker compose up` finds the roles already correctly
+configured, and `zz-compose-init.sh` is simply never invoked again on this volume (it
+is still skipped, but it no longer needs to run).
+
+The same applies to `fau_register` (#3441, migration 0004, `db/roles.sql`): a volume
+already initialised before this role existed never re-runs `zz-compose-init.sh`, so
+`fau_register` gets no login password on it until either the commands above are run
+by hand or the volume is recreated (option (b) below) so the init scripts run fresh.
 
 **(b) Recreate the volume.** `docker compose down -v` removes the named volume along
 with the containers -- **this destroys the dev database and everything in it.** Only
@@ -227,14 +235,16 @@ cargo test -p fau-app --test acceptance -- --ignored --test-threads=1
 ```
 
 **The harness resets role passwords on the target cluster.** Roles are cluster-wide,
-and the harness runs `alter role fau_app login password 'fau_app'` and
-`alter role fau_migrate login password 'fau_migrate'` (each role's password is its
+and the harness runs `alter role fau_app login password 'fau_app'`,
+`alter role fau_migrate login password 'fau_migrate'` and
+`alter role fau_register login password 'fau_register'` (each role's password is its
 own name) on whatever cluster `TEST_DATABASE_URL` points at. Pointing the suite at
-the dev Compose `db`, as above, therefore overwrites any custom `FAU_APP_PASSWORD` or
-`FAU_MIGRATE_PASSWORD` set in `.env` for that cluster: the dev stack's `migrate` and
-`app` then fail authentication until the roles are altered back (see "Keep the data"
-above for the commands). With the defaults the two agree and nothing changes. Never
-point `TEST_DATABASE_URL` at a cluster whose role passwords matter.
+the dev Compose `db`, as above, therefore overwrites any custom `FAU_APP_PASSWORD`,
+`FAU_MIGRATE_PASSWORD` or `FAU_REGISTER_PASSWORD` set in `.env` for that cluster: the
+dev stack's `migrate` and `app` then fail authentication until the roles are altered
+back (see "Keep the data" above for the commands). With the defaults the three agree
+and nothing changes. Never point `TEST_DATABASE_URL` at a cluster whose role
+passwords matter.
 
 The image-contract test (`backend/crates/app/tests/image.rs`) builds the real
 `fau/app:dev` image with the real `Dockerfile` and inspects it -- non-root,
@@ -259,6 +269,102 @@ networks) and are slow, which is why they are `#[ignore]`d rather than part of t
 default `cargo test` run; `--test-threads=1` matters for the acceptance test
 specifically, since its test functions each drive the same `fau-acceptance` project
 and would otherwise race each other's `up`/`down`.
+
+## The school register: `fau register sync` and `fau register export`
+
+`fau register sync` seeds the school register from NSR, Kartverket and SSB, and then keeps it in
+step with them (docs/school-register-design.md §5, #3441). `fau register export` prints the register's
+pickable schools as CSV for the prospect register (§9, #3431). Both run as `fau_register`, never as
+`fau_app`, and both log JSON lines on **stderr**: stdout carries only a dry run's plan or the CSV.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `REGISTER_DATABASE_URL` | yes | A `postgres://` URL for the `fau_register` role. Errors name the variable, never the value. |
+| `REGISTER_NSR_URL`, `REGISTER_KARTVERKET_URL`, `REGISTER_SSB_URL` | no | Base URLs that replace the public APIs, for tests. http or https, with a host and no userinfo. |
+| `REGISTER_SOURCE_RETRY_DELAYS_MS` | no | The waits before a source request's second and third attempt, as two comma-separated milliseconds, each at most 60000. Default `1000,4000`. Tests shorten it; production leaves it unset. |
+| `LOG_LEVEL` | no | As for `serve`; `info` when unset. |
+
+| Command | What it does |
+| --- | --- |
+| `fau register sync --seed --dry-run` | Plans the first run and prints it as JSON. Writes only a `dry_run` row to `register_sync_runs`. |
+| `fau register sync --seed` | The first run, on an empty register. Refuses a register that already holds a municipality or a school. |
+| `fau register sync --dry-run` | Plans a sync and prints it. |
+| `fau register sync` | The weekly sync. Refuses an empty register. |
+| `fau register sync --accept-mass-change` | A sync that applies a plan the mass-change circuit breaker stopped. See "Overriding the circuit breaker" below. Refused together with `--seed` (exit 2). |
+| `fau register export > register.csv` | `school_id,orgnr,municipality_number,display_name,path,fau_orgnr`, one row per pickable school, ordered by municipality number and id. A field that starts with `=`, `+`, `@`, a tab or a CR gets a leading `'`, so a spreadsheet shows it as text instead of running it as a formula. A leading `-` is left alone. |
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Done: applied, nothing to change, a dry run printed, or the export written |
+| 1 | Failed: configuration, the database or a source. A started run is recorded as `failed`. |
+| 2 | Bad arguments |
+| 3 | Aborted by the planner: a source returned nothing, or the circuit breaker tripped (§5.3). The run is recorded as `aborted`, and `register.sync_aborted` is queued to `fau@ewb-solutions.as`. |
+| 4 | Another run holds the register's advisory lock (`0x4641553000003441`) |
+| 5 | Refused: `--seed` on a non-empty register, or a sync on an empty one |
+| 101 | A panic. This is unexpected: treat it as failed. The run row may be left with no `finished_at`. |
+
+`fau register export` exits only 0 or 1 (or 2 for bad arguments). Codes 3, 4 and 5 belong to
+`sync`.
+
+**Retries and timeouts.** A source request that answers 5xx or fails in transport is tried three
+times in total, 1 s and then 4 s apart. A 4xx, or a response that does not parse, fails at once.
+A failed detail fetch is logged with the unit's orgnr and the error's source and kind, and never
+the URL or the body. The detail pass logs its progress every 500 units and once when it finishes,
+in counts only. Every register connection sets `statement_timeout = 60s` and
+`lock_timeout = 10s`, so a run blocked by another session's lock fails with exit 1. It is
+recorded as `failed` with `abort_reason = 'database_timeout'`, instead of hanging until the
+CronJob's deadline. Other database failures record `database_error`, and a failed apply records
+`apply_error`.
+
+**Overriding the circuit breaker.** A sync aborts (exit 3, `register.sync_aborted`) when more than
+2% of active schools would close, or more than 5% would be renamed or lose an attribute (§5.3).
+To see what tripped it, run `fau register sync --dry-run`. An aborted dry run still exits 3, and
+prints the abort reason and counts together with every op and review item of the plan it stopped.
+If the change is real, for example a municipality merger or a genuine NSR clean-up, run
+`fau register sync --accept-mass-change` once. It applies that plan and nothing else changes: an
+empty source still aborts, and the flag only acts when the breaker would have stopped the run.
+The run logs `mass change accepted by --accept-mass-change`, and its `register.sync_applied` audit
+entry carries `"mass_change_accepted": true` and the abort text under `"mass_change"`. Never put
+the flag in the CronJob. It is an operator's decision about one plan.
+
+**Seeding an environment.** After `fau migrate`, run `fau register sync --seed --dry-run` and read
+the plan, then `fau register sync --seed` once. The seed sends one `register.seed_summary` mail; later
+syncs send one `register.review_item` per new review item. Seed in full before the first sync is
+scheduled: with fewer than 50 active schools, a single closure trips the 2% circuit breaker. The SSB
+lookback starts on the seed's date, so a sync on a register with no applied seed fails.
+
+**The weekly CronJob** belongs to #3424: `fau register sync`, Mondays 04:30 with
+`timeZone: Europe/Oslo`, `concurrencyPolicy: Forbid`, the same image, and egress to
+`data-nsr.udir.no`, `api.kartverket.no` and `data.ssb.no` (and `data.brreg.no` once part 5 reads
+Brreg). The advisory lock keeps a manual run and the CronJob apart as well. Each run leaves one
+`register_sync_runs` row, which is the alert source (#3442): `aborted` or `failed`, or a row with no
+`finished_at` from a run that died.
+
+A checklist for #3424's CronJob manifest:
+
+- [ ] `backoffLimit: 0`, or a `podFailurePolicy` whose `FailJob` rule matches exit codes 3, 4 and 5.
+  An abort, a held lock or a refusal must not be retried: a retry would repeat the abort mail or
+  race the run that holds the lock. Exit 1 and 101 may be retried if #3424 wants it.
+- [ ] `activeDeadlineSeconds`, well above a normal run (about a minute of detail fetches, plus
+  the apply) and below the next schedule. A run killed at the deadline leaves its row with no
+  `finished_at`.
+- [ ] `REGISTER_DATABASE_URL` from a Secret (`secretKeyRef`), never a literal in the manifest.
+- [ ] An egress allowlist: `data-nsr.udir.no`, `api.kartverket.no` and `data.ssb.no` (and
+  `data.brreg.no` once part 5 reads Brreg), plus the database.
+- [ ] #3442's alerting on `register_sync_runs`: `outcome in ('aborted', 'failed')`, and a row whose
+  `finished_at` is still null after `started_at` plus the deadline.
+- [ ] No `--accept-mass-change`, no `--seed` and no `--dry-run` in the Job's arguments.
+
+Against the local Compose stack, from the host:
+
+```
+cd backend
+REGISTER_DATABASE_URL="postgres://fau_register:${FAU_REGISTER_PASSWORD:-fau_register}@localhost:${FAU_DB_PORT:-5433}/fau" \
+  cargo run -q -p fau-app --bin fau -- register sync --seed --dry-run
+```
+
+This calls the live public APIs. The test suites never do: `tests/register_cli.rs` serves the
+recorded fixtures from a local server instead.
 
 ## Port variables
 

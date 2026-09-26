@@ -72,7 +72,6 @@ async fn every_tenant_scoped_template_writes_its_tenant_id() {
     let request = |address: &str| CreateAccessRequest {
         tenant_id: fau.tenant_id,
         requester: verified(address),
-        message: None,
     };
     let declined = create_access_request(&pool, request("nei@example.test"), t0)
         .await

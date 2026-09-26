@@ -2408,3 +2408,296 @@ Erik decided on 24 September:
   backup root key.
 
 ADR-003 decision 5 and its closed items and standing risks are amended to match.
+
+## #3418 accepted; no upper bound on admin role periods for now — 24 September 2026
+
+Erik accepted #3418 on 24 September and merged the membership foundation (PR #2). On the open
+question he answered: admin role periods set through invitations, handover or recovery need no upper
+bound for now. Only the first signup date stays limited, to 1–24 months. He also confirmed the sealed
+access-request message on the card.
+
+## School register decided (#3441) — 24 September 2026
+
+Erik answered D1–D11 in docs/school-register-design.md §12 on #3441 on 24 September. Most accept
+the recommendation; four add to it.
+
+**Accepted as recommended:**
+- **D2** scope: the §2.3 filter (active grunnskoler, public and private, combined and special
+  schools in; adult education, VGS-only and abroad out), a manual 2100 Svalbard entry, and a
+  per-school operator override.
+- **D3** municipality slugs use the Norwegian name: `0301-oslo`, `5540-kaafjord`.
+- **D4** transliteration beyond æ/ø/å per §6. ADR-002 is amended.
+- **D5** an operator can override a display name, and the sync respects the override.
+- **D6** enumeration is read as §8 reads it. The register is open data and may be listed. What is
+  protected is personal data, unverified submissions, pending state and membership. Outreach links
+  are not secrets.
+- **D7** unverified submitted schools stay hidden from the picker until verified.
+- **D8** closures and re-registrations are automatic unless an FAU is attached, which makes them a
+  review item.
+- **D10** outreach links may carry one campaign-level parameter shared by every recipient of a
+  mailing (`?kampanje=2026-10`), never a per-recipient one. Outreach itself still needs its own
+  authorisation (#3426, #3427).
+
+**Changed or extended by Erik:**
+- **D1: NSR, Kartverket and SSB, plus Brreg's Enhetsregisteret for the FAU-er themselves.** Most
+  FAU-er are registered in Brreg as their own entities. The register links each one to its school
+  so that an FAU whose name differs from the school's is named correctly from the start. Matching
+  is by address: an FAU and a school at the same address are a match, and several FAU-er at one
+  address are flagged for manual inspection. The Udir `nxr-teknisk@udir.no` notice subscription is
+  part of D1.
+- **D9: a CronJob with its own `fau_register` role, but weekly, not daily.** A "Mangler skolen
+  din?" submission triggers an immediate lookup in NSR. If the school is there, the submission is
+  approved at once instead of waiting for manual review, because the school is now known.
+- **D11: the `fau register review` CLI plus email for the MVP.** The admin web screen (b) is high
+  priority immediately after, on #3499.
+- **Merging FAU-er when schools merge (new requirement).** When two schools combine, a new FAU for
+  the merged school gets the old FAU-er's documents shared into it. Members keep read-only access
+  to the old FAU-er and continue in the new one. This supersedes §4.5's "The product does not merge
+  FAU-er". It depends on the document layer (#3419) and per-document keys (ADR-003 decision 5), so
+  it is its own card, #3498. The register only has to record the merger (many closed schools, one
+  successor), and its schema already allows that.
+
+**Agent rulings on the new parts, for Erik's review.** Measured on 24 September 2026 against a full
+Brreg bulk download and a full NSR grunnskole download, both discarded afterwards:
+- **Brreg addresses are personal data in practice.** 913 of the 2,477 FAU-like entities carry a
+  `c/o` or `v/` line, which usually names a person at a home address. So addresses are used only
+  in memory, during matching. They are never stored, logged, placed in a review item or shown.
+  Stored per entity: organisation number, registered name, organisation form, municipality number,
+  status and the match outcome.
+- **Which entities count as an FAU.** Organisation form FLI with a name containing FAU,
+  "foreldrenes/foreldrerådets arbeidsutvalg", "arbeidsutval(g)" or "foreldreråd(et)", matched on
+  word boundaries: 2,477 entities today. The Brreg search API cannot serve this. Its `navn` filter
+  is not a substring match, and FLI with NACE 94.992 is 73,355 rows, past its 10,000-row paging cap.
+  So the weekly sync streams the bulk file `enheter/lastned` (210 MB gzip, 1.18 million units,
+  about 40 s) and keeps only those entities.
+- **Address matching.** The FAU's street line and postcode are compared with the school's visiting
+  and postal address, after normalisation. `c/o`, `v/` and post-box lines are ignored. Unique in
+  both directions (one FAU, one school) links automatically: 1,256 today. Where the name also
+  identifies a single school, the two agree 876 times and disagree 4 times. Everything else goes to
+  review:
+  - several FAU-er at one school: 28 schools;
+  - one FAU address matching several schools: 29;
+  - address and name disagreeing.
+
+  **Name-only matches (360) are stored as unconfirmed candidates**, not linked and not queued. They
+  wait for the admin screen (D11b, #3499), so the seed does not flood the queue.
+- **What a link does.** At signup the FAU name defaults to the linked entity's registered name,
+  case-normalised because Brreg stores names in capitals, and otherwise to the school's display
+  name. It is a suggestion the registrant edits, like every other prefill. The link grants nothing.
+- **Exception, decided by Erik the same day:** a `c/o` or `v/` line that names the school counts,
+  and one that does not stays excluded. "c/o Hosle skole, Bispeveien 73" is evidence for Hosle
+  skole. "c/o <a person>" or a line naming another school is not. Such a line is checked only
+  against a specific candidate school sharing the postcode, and its key counts only for that
+  school.
+- **The seed sends one summary email**, not one per review item. Later runs email each new item.
+- **The submission lookup keeps D9's privilege line.** The submission queues a lookup row, which
+  the runtime role may insert. `fau register lookups`, running as `fau_register`, reads NSR's
+  list for that municipality and processes the queue. It runs every few minutes as a CronJob
+  (#3424), so "immediately" means within minutes. Approval is automatic only when exactly one
+  active, in-scope NSR school in the submitted municipality, not already in the register, has the
+  same folded name. The submitted school then absorbs the NSR data, is verified, gets its slug,
+  and Erik is told rather than asked. A similar but not identical name, or a match with a school
+  already listed, becomes a review item.
+- **Weekly timing.** Mondays at 04:30 Europe/Oslo, after NSR's nightly Brreg import. The circuit
+  breaker keeps its thresholds of 2% closed and 5% renamed per run.
+
+## Register foundation built: rulings for Erik's review (#3441) — 24 September 2026
+
+Part 1 of the register was built on the branch `school-register-3441`, following
+docs/superpowers/plans/2026-09-24-register-foundation.md. It covers migration 0004, the
+`fau_register` role and the pure register rules in `fau-domain`. Every task was reviewed, and a
+whole-branch review followed. Nothing has been seeded or applied to any environment. The agent
+made these rulings on Erik's behalf:
+
+**Schema (0004 is unapplied, so all of these are still cheap to change):**
+- **Row-level security confines the runtime role on three tables.** On `schools`, `fau_app` may
+  insert only a fresh, pending, submitted row. On `school_submissions`, only a pending submission
+  that no reviewer has touched. On `register_lookups`, only an unprocessed lookup with no
+  attempts. D9 says the runtime role must not be able to assert register outcomes.
+- **`fau_register` may delete only `held` schools.** This guards against mistakes, not against
+  the role itself, which can relabel a row.
+- **Review items point at schools with `on delete set null`.** A held row named in a
+  `possible_submission_match` can then be deleted when the match is resolved (§4.5). Its orgnr and
+  name must be kept in the item's `details`. The sync must write neither orgnr history nor FAU
+  links for a held row, because those references would block the delete again.
+- **Checks added beyond the plan:**
+  - `scope_reason` is limited to the seven domain codes;
+  - slug format and length checks on every slug column;
+  - review-item `details` capped at 2 KB;
+  - `fau_register` may delete municipality names that Kartverket drops.
+
+**Brreg rules:**
+- **FAU words are exactly §2.5's list.** "Samarbeidsutvalg" and "foreldreutvalg" were removed:
+  a samarbeidsutvalg is a different statutory body, and one registered at the school's address
+  would block the real FAU's link.
+- **A line is personal wherever its marker sits.** That covers a `c/o` anywhere, a `v/` before
+  the house number, and a `v/` after the house number that is followed by more words. The cost is
+  losing some real addresses, such as "V. Slottsgate 2" and "Storgata 12 V 2". Privacy wins over
+  recall. A lone house letter ("Storgata 12 V") still counts.
+- **What counts as naming the school, under Erik's `c/o` exception.** The line must contain the
+  school's full name, or its distinctive part followed by a school word ("Hosle skule" for Hosle
+  skole). A line that names the school but has no street and number yields no key.
+- **Addresses cannot reach a log.** `AddressKey` prints its street as `<redacted>` in debug
+  output. Keys may only ever be compared for exact equality, and never logged or stored. The
+  matcher plan inherits that rule.
+
+**Search and scope:**
+- **An empty search matches nothing.** A query with no letters or digits folds to "", and the
+  search plan must then return no rows rather than run the match.
+- **`primary_nace` picks the priority-1 NACE code.** It is tested on a combined school, since 50
+  combined schools depend on it.
+
+## FAU contact e-mail: fetched live by outreach, never stored in the product (#3441, #3431) — 24 September 2026
+
+Erik wants to contact FAU-er registered in Brreg and invite them to FAU-portalen. He decided on
+24 September:
+- **The product stores only the FAU's organisation number.** `registered_faus.orgnr` is the key,
+  so the Brreg record can always be retrieved again. `fau register export` lists the linked FAU's
+  orgnr for each school.
+- **The contact e-mail is fetched live from Brreg by the outreach tooling (#3431), at send
+  time,** and kept there under #3426/#3427's retention. It never goes into the product database,
+  and the register's source parser never reads Brreg's `epostadresse`, `mobil` or `telefon`
+  fields.
+- **Why:** Brreg's FAU e-mail is often a parent's private address. Two of nine sampled records
+  had a private Gmail or Hotmail address. Keeping it out upholds "the register holds nothing about
+  individuals", and keeps parents' addresses out of every product backup.
+- **Still required before any mail is sent:** Erik's authorisation of outreach, and the legal
+  check on #3427. Markedsføringsloven §15 generally forbids unsolicited marketing e-mail to natural
+  persons without consent. Whether a private address registered for an FAU (a legal person)
+  counts as a natural person's is exactly the question that check must answer.
+
+## Register sources built: rulings for Erik's review (#3441) — 24 September 2026
+
+Part 2 of the register was built on `school-register-3441`, following
+docs/superpowers/plans/2026-09-24-register-sources.md. It adds a new crate, `fau-register-sources`,
+which parses NSR, Kartverket, SSB and Brreg from recorded fixtures, and a client tested against a
+real local HTTP server. Every task was reviewed, and a whole-branch review followed. Nothing calls
+the live APIs yet. The agent's rulings:
+
+- **Brreg records are read with no contact fields at all.** Recording the fixtures showed that
+  Brreg FAU records carry parents' private e-mail and mobile numbers, as well as `c/o` addresses.
+  The parser declares no field for them, so they are never even decoded. The committed fixtures have
+  every such value removed or replaced with invented ones (see the fixtures README). While checking
+  a sample, two real records' contact details were printed into this session's transcript before
+  they were stripped. That is public Brreg data, but it now sits in a stored transcript.
+- **Loud failure everywhere (§5.3):**
+  - NSR paging must end with exactly the advertised number of unique units. An early empty page
+    is an error, not a stop.
+  - The fields that decide scope (`ErPrivatskole`, `Skolekategorier`, `Naeringskoder`) are
+    required.
+  - SSB's change list is required.
+  - A half-empty Kartverket name entry is an error.
+  - A truncated or corrupt Brreg download is an I/O error.
+
+  The cost: an upstream change fails the weekly run until someone looks, rather than quietly
+  importing wrong data.
+- **The Brreg bulk file is streamed** one unit at a time and written to a `.partial` file that is
+  renamed on success. One gap is carried into part 4: a failed final rename leaves the `.partial`
+  file behind.
+- **Raw NSR payloads are kept** (`nsr_unit_with_payload`), for §4.3's provenance table.
+
+## Register sync planner built: rulings for Erik's review (#3441) — 25 September 2026
+
+Part 3 of the register was built overnight on `school-register-3441`, following
+docs/superpowers/plans/2026-09-25-register-sync-planner.md. It is a pure planner in `fau-domain`
+that compares the current register with freshly fetched NSR, Kartverket and SSB data, and returns
+the changes to make, the items for review and a circuit-breaker verdict. Nothing is applied to a
+database yet; that is part 4. Every task was reviewed, and a whole-branch review and fix wave
+followed. The agent's rulings, with the cost if wrong:
+
+- **Re-registration (a school continuing under a new orgnr) follows only NSR's F and S closure
+  codes** (§4.5). There is no 30-day window.
+  - If the new number appears before the old one closes, the new school gets a suffixed slug and
+    no successor link. Curation or the review screen (#3499) can fix that.
+  - If it appears after, it takes the plain slug, with no successor link.
+- **When a school splits, the best name match inherits it.** New and old schools are paired by
+  highest similarity, with ties broken by orgnr, not by fetch order. Every new school that matches
+  a school with an FAU is held for review, so nobody can open a second FAU on a copy. The cost:
+  extra review items when a school with an FAU splits.
+- **A school closing while it has an FAU raises a review and is not closed** (D8).
+- **Input order never matters.** Units are sorted and de-duplicated by orgnr, Kartverket records
+  are sorted, and SSB changes are applied in date order. Chains that can't be ordered become
+  review items.
+- **The circuit breaker (§5.3) stops a sync on any of these:**
+  - more than 2% of schools closing;
+  - more than 5% renamed;
+  - more than 5% losing an attribute (such as the website), which catches an upstream schema change.
+
+  With fewer than 50 active schools a single closure trips it, so each environment is seeded in
+  full first.
+- **Seeding:**
+  - `--seed` refuses a non-empty register;
+  - a seed gets no SSB changes;
+  - the SSB lookback starts at the seed date.
+
+  This is part 4's job, and is written into the plan's handover.
+- **Address fallback is all-or-nothing.** The visiting address is used when it has a street,
+  otherwise the whole postal address.
+- **A submission match only considers submitted schools that have not already been matched.**
+  Similarity takes the higher of the display name and the register name, so a curated name does
+  not hide a re-registration.
+- **Known limitations, left for later:**
+  - a renumber onto a name with no sluggable characters blocks that municipality for review
+    (practically unreachable);
+  - NSR's `Utgaattype` is optional in the parser, so closure codes vanishing upstream would not
+    fail loudly.
+
+## Register apply and CLI built: rulings for Erik's review (#3441) — 25 September 2026
+
+Part 4 of the register was built on `school-register-3441`, following
+docs/superpowers/plans/2026-09-25-register-apply-and-cli.md:
+- the SQL applier for the sync plans, running as `fau_register`;
+- run bookkeeping, the advisory lock, audit and outbox mail;
+- `fau register sync [--seed] [--dry-run] [--accept-mass-change]` and `fau register export`.
+
+Nothing has run against the dev `fau` database or a live API; every test uses throwaway databases
+and an in-process fixture server. The agent's rulings, with the cost if wrong:
+
+- **Each run plans inside the transaction that applies it.** The first snapshot only decides what
+  to fetch. The plan comes from a second snapshot under REPEATABLE READ, and apply, staging, the run
+  row, the audit entry and the mail commit together.
+- **Failures are recorded on a fresh connection, with a fixed code.** Examples are `source_error`,
+  `apply_error`, `database_error` and `database_timeout`. Neither an error's text nor a URL is
+  recorded. So a run killed by a broken connection still ends as `failed`.
+- **The lock sits on its own connection,** so it is released on every exit path, including a crash.
+- **Exit codes:**
+  - 0 done;
+  - 1 failed;
+  - 2 usage;
+  - 3 aborted by the circuit breaker;
+  - 4 another run holds the lock;
+  - 5 refused (`--seed` on a non-empty register, or a sync on an empty one).
+
+  A sync with no applied seed fails.
+- **Sources are retried,** three attempts with a 1 s then 4 s wait, on server errors and network
+  failures only, never on a 4xx or a parse error. A failed record is logged with its orgnr. The
+  database connections have a 60 s statement timeout and a 10 s lock timeout.
+- **There is a way past the circuit breaker (new).** `fau register sync --accept-mass-change`
+  applies a sync that the breaker would stop. It works only when given explicitly, and it is
+  logged and recorded in the audit entry. `--dry-run` shows the full list of changes for a stopped
+  plan, so an operator can see what tripped it first. The cost: an operator can override the
+  breaker, which is intended and audited.
+- **The export guards against spreadsheet formulas.** A field starting with `=`, `+`, `@`, a tab
+  or a carriage return gets a leading `'`. A leading `-` is left alone, since real names may start
+  with one. This replaces the plan's first choice not to rewrite values, because #3431's file is
+  opened by people in spreadsheets. The cost: a stray apostrophe if #3431 ever imports it by
+  program. #3431 is told.
+- **Staging is written only when a run applies.** A dry run records `no_change`. Mail goes to
+  `fau@ewb-solutions.as`:
+  - one `register.review_item` per new review on a sync;
+  - one `register.seed_summary` per seed;
+  - `register.sync_aborted` when a run aborts.
+- **Before the #3424 CronJob** (in the ops doc):
+  - `backoffLimit: 0`, or a failure policy for exits 3–5;
+  - `activeDeadlineSeconds`;
+  - the database URL from a Secret;
+  - an egress allowlist;
+  - #3442 alerting on `outcome in ('aborted','failed')` and on runs left unfinished.
+- **Known gaps carried forward from the final review:**
+  - #3424's CronJob deadline must allow for retries. The worst case is about an hour; a normal run
+    takes about a minute.
+  - The ops doc should say that `--accept-mass-change` re-plans from live sources. It does not
+    apply the exact plan an earlier dry run showed.
+  - A dry run given `--accept-mass-change` records no abort reason.
+  - sqlx logs the value of an unrecognised query parameter in `REGISTER_DATABASE_URL`. That is not
+    the password, but the config could reject unknown parameters.

@@ -19,8 +19,11 @@ test-routes = []
 [dependencies]
 fau-domain = { path = "../domain" }
 fau-persistence = { path = "../persistence" }
+fau-register-sources = { path = "../register-sources" }
 axum = { workspace = true }
 clap = { workspace = true }
+# The register sync's clock: `Moment::at(Timestamp::now())`.
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
@@ -33,9 +36,12 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-# Test-only: dates for the membership fixtures, and an independent SHA-256 to check
-# that invitations store the token's hash and never the token.
-jiff = { workspace = true }
+# The sync planner's test builders and in-memory applier, for the SQL applier's parity
+# tests (tests/register_apply.rs). A dev-dependency feature: resolver 2 keeps it out of
+# `cargo build --release`, so it never reaches the image.
+fau-domain = { path = "../domain", features = ["testkit"] }
+# Test-only: an independent SHA-256 to check that invitations store the token's hash
+# and never the token, and that staged NSR payloads carry their own.
 sha2 = { workspace = true }
 # Test-only HTTP client for the integration-test harness (`ServeHandle`). rustls,
 # no default features: no reliance on the platform's native TLS stack, matching the

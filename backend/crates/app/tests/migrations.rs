@@ -19,8 +19,11 @@ async fn migrate_applies_and_is_idempotent() {
         .fetch_one(&db.admin_pool())
         .await
         .unwrap();
-    // 0001, 0002 and 0003 are the migrations that exist today.
-    assert_eq!(version, 3, "contract version after all migrations");
+    assert_eq!(
+        version,
+        common::migration_file_count(),
+        "contract version after all migrations"
+    );
 }
 
 #[tokio::test]
@@ -93,12 +96,12 @@ async fn migrate_completes_a_partly_migrated_database() {
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, common::migration_file_count());
     let rows: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(rows, 3);
+    assert_eq!(rows, i64::from(common::migration_file_count()));
     let row_after: (String, String) = sqlx::query_as(
         "select c.applied_at::text, m.installed_on::text
            from schema_contract c, _sqlx_migrations m
@@ -122,12 +125,11 @@ async fn concurrent_migrate_processes_serialise() {
     );
 
     // Exactly one row per migration proves neither applied the same file twice.
-    // 0001, 0002 and 0003 are the migrations that exist today.
     let rows: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
         .fetch_one(&db.admin_pool())
         .await
         .unwrap();
-    assert_eq!(rows, 3);
+    assert_eq!(rows, i64::from(common::migration_file_count()));
 }
 
 #[tokio::test]

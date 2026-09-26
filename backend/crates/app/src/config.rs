@@ -12,6 +12,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use tracing::level_filters::LevelFilter;
 use url::Url;
@@ -217,28 +218,7 @@ impl ServeConfig {
             return Err(err("DB_POOL_MAX_CONNECTIONS", ConfigProblem::Invalid));
         }
 
-        let log_level_raw = optional("LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
-        // Validated as a `LevelFilter` -- not the fuller `tracing_subscriber::EnvFilter`
-        // grammar `telemetry::init` builds from it -- because `EnvFilter` treats an
-        // unrecognised bare word as a *target* name (matching every level for it)
-        // rather than rejecting it, so a typo such as `banana-sentinel`
-        // would silently be accepted as "log everything from a crate named
-        // banana-sentinel" instead of failing loudly. `LevelFilter::from_str` has no
-        // such fallback: it only accepts trace/debug/info/warn/error/off (or 0-5),
-        // which is all `LOG_LEVEL` is meant to carry. `parsed` (this module's helper)
-        // discards the parse error itself, since `EnvFilter`'s own parse errors quote
-        // the offending input, and a configuration value must never reach the output.
-        parsed::<LevelFilter>("LOG_LEVEL", &log_level_raw)?;
-        // Stored *trimmed*, not the raw value `parsed` validated: `parsed` trims
-        // before parsing (`raw.trim().parse()`), so a value like `"info "` passes
-        // validation, but `EnvFilter`'s own grammar does not tolerate the same
-        // trailing whitespace the same way -- an untrimmed bare word that fails
-        // `LevelFilter::from_str` is read by `EnvFilter` as a *target name* enabling
-        // only that one bogus target, not as the global default level, which
-        // silently turns off ordinary application logging. Trimming here, once,
-        // keeps `telemetry::init` (which builds the actual `EnvFilter` from this
-        // field) working from the same value that was actually validated.
-        let log_level = log_level_raw.trim().to_owned();
+        let log_level = log_level()?;
 
         // Read but never validated, never used -- see ACCEPTED_BUT_UNUSED's doc
         // comment. A missing or garbage value here must not fail startup.
@@ -258,6 +238,33 @@ impl ServeConfig {
             accepted_but_unused,
         })
     }
+}
+
+/// `LOG_LEVEL`, validated and trimmed; `info` when unset. Shared by every command that
+/// installs the JSON log subscriber.
+fn log_level() -> Result<String, ConfigError> {
+    let log_level_raw = optional("LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
+    // Validated as a `LevelFilter` -- not the fuller `tracing_subscriber::EnvFilter`
+    // grammar `telemetry::init` builds from it -- because `EnvFilter` treats an
+    // unrecognised bare word as a *target* name (matching every level for it)
+    // rather than rejecting it, so a typo such as `banana-sentinel`
+    // would silently be accepted as "log everything from a crate named
+    // banana-sentinel" instead of failing loudly. `LevelFilter::from_str` has no
+    // such fallback: it only accepts trace/debug/info/warn/error/off (or 0-5),
+    // which is all `LOG_LEVEL` is meant to carry. `parsed` (this module's helper)
+    // discards the parse error itself, since `EnvFilter`'s own parse errors quote
+    // the offending input, and a configuration value must never reach the output.
+    parsed::<LevelFilter>("LOG_LEVEL", &log_level_raw)?;
+    // Stored *trimmed*, not the raw value `parsed` validated: `parsed` trims
+    // before parsing (`raw.trim().parse()`), so a value like `"info "` passes
+    // validation, but `EnvFilter`'s own grammar does not tolerate the same
+    // trailing whitespace the same way -- an untrimmed bare word that fails
+    // `LevelFilter::from_str` is read by `EnvFilter` as a *target name* enabling
+    // only that one bogus target, not as the global default level, which
+    // silently turns off ordinary application logging. Trimming here, once,
+    // keeps `telemetry::init` (which builds the actual `EnvFilter` from this
+    // field) working from the same value that was actually validated.
+    Ok(log_level_raw.trim().to_owned())
 }
 
 fn validate_public_base_url(url: &Url, app_env: AppEnv) -> Result<(), ConfigError> {
@@ -323,6 +330,72 @@ impl MigrateConfig {
     }
 }
 
+/// `fau register ...` (#3441, docs/school-register-design.md §5.1). It connects as
+/// `fau_register` (D9), never as the runtime role. The source URLs default to the public
+/// APIs; the overrides exist for tests, which point them at a local server.
+#[derive(Debug, Clone)]
+pub struct RegisterConfig {
+    pub database_url: Secret<String>,
+    pub log_level: String,
+    pub nsr_url: Option<Url>,
+    pub kartverket_url: Option<Url>,
+    pub ssb_url: Option<Url>,
+    /// The waits before a source request's second and third attempt (final review, item 2).
+    /// `REGISTER_SOURCE_RETRY_DELAYS_MS`, two comma-separated milliseconds; the default is
+    /// the client's 1 s and 4 s. Tests shorten it.
+    pub source_retry_delays: [Duration; 2],
+}
+
+impl RegisterConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            database_url: postgres_url(
+                "REGISTER_DATABASE_URL",
+                required("REGISTER_DATABASE_URL")?,
+            )?,
+            log_level: log_level()?,
+            nsr_url: optional_source_url("REGISTER_NSR_URL")?,
+            kartverket_url: optional_source_url("REGISTER_KARTVERKET_URL")?,
+            ssb_url: optional_source_url("REGISTER_SSB_URL")?,
+            source_retry_delays: match optional("REGISTER_SOURCE_RETRY_DELAYS_MS") {
+                Some(raw) => retry_delays("REGISTER_SOURCE_RETRY_DELAYS_MS", &raw)?,
+                None => fau_register_sources::client::DEFAULT_RETRY_DELAYS,
+            },
+        })
+    }
+}
+
+/// Exactly two waits in milliseconds, each at most a minute: `"1000,4000"`.
+fn retry_delays(name: &'static str, raw: &str) -> Result<[Duration; 2], ConfigError> {
+    let invalid = || err(name, ConfigProblem::Invalid);
+    let ms: Vec<u64> = raw
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().map_err(|_| invalid()))
+        .collect::<Result<_, _>>()?;
+    match ms.as_slice() {
+        [a, b] if *a <= 60_000 && *b <= 60_000 => {
+            Ok([Duration::from_millis(*a), Duration::from_millis(*b)])
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn optional_source_url(name: &'static str) -> Result<Option<Url>, ConfigError> {
+    optional(name).map(|raw| source_url(name, &raw)).transpose()
+}
+
+/// An http(s) base URL with a host and no credentials: the sync logs which source failed,
+/// and a URL with userinfo must never be able to reach a log line.
+fn source_url(name: &'static str, raw: &str) -> Result<Url, ConfigError> {
+    let invalid = || err(name, ConfigProblem::Invalid);
+    let url = Url::parse(raw.trim()).map_err(|_| invalid())?;
+    let credentials = !url.username().is_empty() || url.password().is_some();
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || credentials {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,7 +442,8 @@ mod tests {
     #[test]
     fn production_rejects_a_plaintext_base_url() {
         let url = Url::parse("http://fau.example").unwrap();
-        assert!(validate_public_base_url(&url, AppEnv::Production).is_err());
+        let e = validate_public_base_url(&url, AppEnv::Production).unwrap_err();
+        assert_eq!(e.problem, ConfigProblem::NotPermitted);
     }
 
     #[test]
@@ -389,7 +463,8 @@ mod tests {
         // The localhost convenience is for development/test only; production must
         // never accept plaintext, not even to the loopback address.
         let url = Url::parse("http://localhost:8000").unwrap();
-        assert!(validate_public_base_url(&url, AppEnv::Production).is_err());
+        let e = validate_public_base_url(&url, AppEnv::Production).unwrap_err();
+        assert_eq!(e.problem, ConfigProblem::NotPermitted);
     }
 
     #[test]
@@ -433,6 +508,42 @@ mod tests {
     #[test]
     fn development_rejects_a_non_loopback_plaintext_url() {
         let url = Url::parse("http://example.org").unwrap();
-        assert!(validate_public_base_url(&url, AppEnv::Development).is_err());
+        let e = validate_public_base_url(&url, AppEnv::Development).unwrap_err();
+        assert_eq!(e.problem, ConfigProblem::NotPermitted);
+    }
+
+    #[test]
+    fn retry_delays_are_two_bounded_millisecond_values() {
+        assert_eq!(
+            retry_delays("R", "1000, 4000").unwrap(),
+            [Duration::from_secs(1), Duration::from_secs(4)]
+        );
+        assert_eq!(retry_delays("R", "0,0").unwrap(), [Duration::ZERO; 2]);
+        for raw in ["1000", "1,2,3", "a,b", "-1,5", "60001,1"] {
+            assert_eq!(
+                retry_delays("R", raw).unwrap_err().problem,
+                ConfigProblem::Invalid,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_url_must_be_http_with_a_host_and_no_credentials() {
+        assert!(source_url("REGISTER_NSR_URL", "http://127.0.0.1:9/nsr").is_ok());
+        assert!(source_url("REGISTER_NSR_URL", "https://data-nsr.udir.no").is_ok());
+        for raw in [
+            "ftp://data-nsr.udir.no",
+            "not a url",
+            "https://user:banana-sentinel@data-nsr.udir.no",
+            "https://banana-sentinel@data-nsr.udir.no",
+        ] {
+            let e = source_url("REGISTER_NSR_URL", raw).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "configuration variable REGISTER_NSR_URL is not a valid value",
+                "{raw}"
+            );
+        }
     }
 }

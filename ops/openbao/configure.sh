@@ -22,16 +22,20 @@ bao policy write fau-app "$HERE/policies/fau-app.hcl"
 bao policy write fau-keys-operator "$HERE/policies/fau-keys-operator.hcl"
 
 # Replaces the hand-written design's lease ceiling (§4.3); tuned under #3442.
-bao write sys/quotas/rate-limit/fau-transit path=transit/ rate=50 interval=1s >/dev/null
-
+# Rate differs by mode: `cluster` keeps the spec's starting value, but the dev server is
+# shared by every test binary (fau-keys, the upcoming cache tests, the fau-app end-to-end
+# test), so production's 50 req/s would turn their expected 403s into 429s under concurrent
+# test runs.
 case "$MODE" in
   dev)
+    bao write sys/quotas/rate-limit/fau-transit path=transit/ rate=1000 interval=1s >/dev/null
     for t in "dev-only-app:fau-app" "dev-only-operator:fau-keys-operator"; do
       id="${t%%:*}"; policy="${t#*:}"
       bao token lookup "$id" >/dev/null 2>&1 || bao token create -id="$id" -policy="$policy" -period=768h -orphan >/dev/null
     done
     ;;
   cluster)
+    bao write sys/quotas/rate-limit/fau-transit path=transit/ rate=50 interval=1s >/dev/null
     has auth kubernetes || bao auth enable kubernetes
     bao write auth/kubernetes/config kubernetes_host="https://kubernetes.default.svc" >/dev/null
     bao write auth/kubernetes/role/fau-app \

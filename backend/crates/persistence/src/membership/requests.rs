@@ -24,15 +24,27 @@ use super::sql::{
     ts_param, usable_member_email, write_audit, ActorKind, Audit,
 };
 
-/// No message field until the key service exists: messages are never stored as
-/// plaintext (ADR-003 decision 6).
+/// The message, when given, is OpenBao transit ciphertext produced with
+/// `Aad::new(tenant_id, ACCESS_REQUEST_MESSAGE_AAD.0, ACCESS_REQUEST_MESSAGE_AAD.1,
+/// message.request_id)` (docs/key-service-design.md §3.3). Persistence never sees plaintext.
 #[derive(Clone)]
 pub struct CreateAccessRequest {
     pub tenant_id: Uuid,
     /// Confirmed with a Hanko passcode first (spec 3.2), so nobody can make the portal
     /// email an FAU's admins from an address they do not control.
     pub requester: VerifiedEmail,
+    pub message: Option<AccessRequestMessage>,
 }
+
+#[derive(Debug, Clone)]
+pub struct AccessRequestMessage {
+    pub request_id: Uuid,
+    pub ciphertext: fau_crypto::MessageCiphertext,
+}
+
+pub const ACCESS_REQUEST_MESSAGE_AAD: (&str, &str) = ("access_requests", "encrypted_message");
+/// The `*_encrypted_message_is_bounded` checks in migration 0005.
+pub const MESSAGE_MAX_BYTES: usize = 4096;
 
 /// Hand-written so a future field never reaches a log line the way a derived `Debug`
 /// would (`requester`'s own `Debug` already redacts the address).
@@ -41,6 +53,7 @@ impl fmt::Debug for CreateAccessRequest {
         f.debug_struct("CreateAccessRequest")
             .field("tenant_id", &self.tenant_id)
             .field("requester", &self.requester)
+            .field("message", &self.message.as_ref().map(|_| "[encrypted]"))
             .finish()
     }
 }
@@ -51,6 +64,13 @@ pub async fn create_access_request(
     req: CreateAccessRequest,
     at: Moment,
 ) -> Result<Uuid, MembershipError> {
+    if req
+        .message
+        .as_ref()
+        .is_some_and(|m| m.ciphertext.as_str().len() > MESSAGE_MAX_BYTES)
+    {
+        return Err(MembershipError::MessageTooLong);
+    }
     let mut tx = pool.begin().await?;
     let state = lock_tenant(&mut tx, req.tenant_id).await?;
     require_open(&state)?;
@@ -61,6 +81,7 @@ pub async fn create_access_request(
         &mut tx,
         at,
         NewRequest {
+            id: req.message.as_ref().map(|m| m.request_id),
             tenant_id: req.tenant_id,
             kind: RequestKind::Access,
             requester_email: requester,
@@ -68,6 +89,10 @@ pub async fn create_access_request(
             requester_membership_id: None,
             replaced_assignment_id: None,
             proposed: None,
+            encrypted_message: req
+                .message
+                .as_ref()
+                .map(|m| m.ciphertext.as_str().as_bytes()),
         },
     )
     .await?;
@@ -91,8 +116,7 @@ pub async fn create_access_request(
     Ok(request_id)
 }
 
-/// No message field until the key service exists: messages are never stored as
-/// plaintext (ADR-003 decision 6).
+/// Carries no message (flow spec §5.3).
 #[derive(Clone)]
 pub struct CreateReplacementProposal {
     pub tenant_id: Uuid,
@@ -162,6 +186,7 @@ pub async fn create_replacement_proposal(
         &mut tx,
         at,
         NewRequest {
+            id: None,
             tenant_id: req.tenant_id,
             kind: RequestKind::Replacement,
             requester_email: &proposer_email,
@@ -169,6 +194,7 @@ pub async fn create_replacement_proposal(
             requester_membership_id: Some(req.proposer_membership_id),
             replaced_assignment_id: Some(req.replaced_assignment_id),
             proposed: Some(proposed),
+            encrypted_message: None,
         },
     )
     .await?;
@@ -225,6 +251,7 @@ async fn check_limits(
 }
 
 struct NewRequest<'a> {
+    id: Option<Uuid>,
     tenant_id: Uuid,
     kind: RequestKind,
     requester_email: &'a str,
@@ -232,6 +259,7 @@ struct NewRequest<'a> {
     requester_membership_id: Option<Uuid>,
     replaced_assignment_id: Option<Uuid>,
     proposed: Option<Period>,
+    encrypted_message: Option<&'a [u8]>,
 }
 
 async fn insert_request(
@@ -239,13 +267,13 @@ async fn insert_request(
     at: Moment,
     r: NewRequest<'_>,
 ) -> Result<Uuid, MembershipError> {
-    let id = Uuid::now_v7();
+    let id = r.id.unwrap_or_else(Uuid::now_v7);
     sqlx::query(
         "insert into access_requests
            (tenant_id, id, kind, requester_email, invitee_email, requester_membership_id,
             replaced_assignment_id, proposed_starts_on, proposed_ends_on_exclusive,
-            created_on, created_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::date, $10::date, $11::timestamptz)",
+            created_on, created_at, encrypted_message)
+         values ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::date, $10::date, $11::timestamptz, $12)",
     )
     .bind(r.tenant_id)
     .bind(id)
@@ -258,6 +286,7 @@ async fn insert_request(
     .bind(r.proposed.map(|p| date_param(p.ends_on_exclusive())))
     .bind(date_param(at.today()))
     .bind(ts_param(at.now()))
+    .bind(r.encrypted_message)
     .execute(&mut *conn)
     .await?;
     Ok(id)
@@ -371,6 +400,8 @@ pub async fn approve_request(
             roles: roles.into_iter().map(|(id, _, p)| (id, p)).collect(),
             actor_kind: ActorKind::Member,
             actor_membership_id: Some(decision.actor_membership_id),
+            id: None,
+            encrypted_message: None,
         },
     )
     .await?;
@@ -501,4 +532,32 @@ pub async fn lapse_requests(pool: &PgPool, at: Moment) -> Result<u64, Membership
     }
     tx.commit().await?;
     Ok(lapsed.len() as u64)
+}
+
+/// The message on a request, for the approval screen (flow spec §5.2). Authority first.
+pub async fn access_request_message(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    request_id: Uuid,
+    actor_membership_id: Uuid,
+    at: Moment,
+) -> Result<Option<fau_crypto::MessageCiphertext>, MembershipError> {
+    let mut tx = pool.begin().await?;
+    require_admin(&mut tx, tenant_id, actor_membership_id, at.today()).await?;
+    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+        "select encrypted_message from access_requests where tenant_id = $1 and id = $2",
+    )
+    .bind(tenant_id)
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    row.flatten()
+        .map(|b| {
+            String::from_utf8(b)
+                .ok()
+                .and_then(fau_crypto::MessageCiphertext::new)
+                .ok_or_else(MembershipError::decode)
+        })
+        .transpose()
 }

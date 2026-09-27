@@ -203,6 +203,7 @@ fn handover_invite(
             period: period(day(2027, 11, 1), day(2028, 10, 1)),
         }],
         handover_grant_id: Some(grant_id),
+        message: None,
     }
 }
 
@@ -333,6 +334,7 @@ async fn handover_allows_nothing_else() {
         CreateAccessRequest {
             tenant_id: fau.tenant_id,
             requester: verified("sporsmal@example.test"),
+            message: None,
         },
         inside,
     )
@@ -1262,6 +1264,7 @@ async fn a_removed_admin_does_not_regain_handover_through_reopen_and_the_sweep()
                 period: period(day(2027, 10, 1), day(2028, 9, 1)),
             }],
             handover_grant_id: None,
+            message: None,
         },
         d,
     )

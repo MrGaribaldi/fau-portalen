@@ -33,12 +33,15 @@ pub use access::effective_access;
 pub use error::{ExistingFau, MembershipError};
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{
-    accept_invitation, issue_invitation, resend_invitation, withdraw_invitation, AcceptInvitation,
-    Accepted, InvitationChange, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,
+    accept_invitation, invitation_message, issue_invitation, resend_invitation,
+    withdraw_invitation, AcceptInvitation, Accepted, InvitationChange, InvitationMessage,
+    InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,
+    INVITATION_MESSAGE_AAD,
 };
 pub use requests::{
-    approve_request, create_access_request, create_replacement_proposal, decline_request,
-    lapse_requests, CreateAccessRequest, CreateReplacementProposal, RequestDecision,
+    access_request_message, approve_request, create_access_request, create_replacement_proposal,
+    decline_request, lapse_requests, AccessRequestMessage, CreateAccessRequest,
+    CreateReplacementProposal, RequestDecision, ACCESS_REQUEST_MESSAGE_AAD, MESSAGE_MAX_BYTES,
 };
 pub use roles::{
     grant_role, revoke_membership, revoke_role_assignment, GrantRole, RevokeAssignment,

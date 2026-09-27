@@ -125,6 +125,7 @@ pub async fn add_member(
             recipient: email(address),
             roles: vec![OfferedRole { role, period }],
             handover_grant_id: None,
+            message: None,
         },
         at,
     )

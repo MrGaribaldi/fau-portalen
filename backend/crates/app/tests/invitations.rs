@@ -4,13 +4,15 @@
 mod common;
 use common::membership::*;
 use common::TestDb;
+use fau_crypto::MessageCiphertext;
 use fau_domain::membership::acceptance::AcceptanceRefusal;
 use fau_domain::membership::rules::AdminEndError;
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_persistence::membership::{
-    accept_invitation, activate_tenant, create_pending_tenant, issue_invitation, resend_invitation,
-    withdraw_invitation, AcceptInvitation, Activation, InvitationChange, IssueInvitation,
-    IssuedInvitation, MembershipError, OfferedRole, RoleChoice,
+    accept_invitation, activate_tenant, create_pending_tenant, invitation_message,
+    issue_invitation, resend_invitation, withdraw_invitation, AcceptInvitation, Activation,
+    InvitationChange, InvitationMessage, IssueInvitation, IssuedInvitation, MembershipError,
+    OfferedRole, RoleChoice,
 };
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -35,6 +37,7 @@ async fn invite(
                 period: period(day(2026, 9, 23), day(2027, 9, 1)),
             }],
             handover_grant_id: None,
+            message: None,
         },
         t,
     )
@@ -679,6 +682,7 @@ async fn offered_roles_are_validated() {
                 recipient: email("ny@example.test"),
                 roles,
                 handover_grant_id: None,
+                message: None,
             },
             t0,
         )
@@ -938,4 +942,121 @@ async fn concurrent_acceptance_of_the_same_token_succeeds_exactly_once() {
     .await
     .unwrap();
     assert_eq!(assignments, 1, "exactly one set of roles was granted");
+}
+
+async fn invite_with(
+    pool: &sqlx::PgPool,
+    fau: &Fau,
+    to: &str,
+    t: fau_domain::time::Moment,
+) -> fau_persistence::membership::IssuedInvitation {
+    let invitation_id = Uuid::now_v7();
+    let issued = issue_invitation(
+        pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            recipient: email(to),
+            roles: vec![OfferedRole {
+                role: new_role("Medlem", CapabilityClass::Member),
+                period: period(day(2026, 9, 1), day(2027, 9, 1)),
+            }],
+            handover_grant_id: None,
+            message: Some(InvitationMessage {
+                invitation_id,
+                ciphertext: MessageCiphertext::new("vault:v1:bWVsZGluZw==".into()).unwrap(),
+            }),
+        },
+        t,
+    )
+    .await
+    .unwrap();
+    assert_eq!(issued.invitation_id, invitation_id);
+    issued
+}
+
+#[tokio::test]
+async fn only_the_recipient_with_a_live_token_reads_the_message() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let issued = invite_with(&pool, &fau, "ny@example.test", t0).await;
+    let token = issued.token.expose().to_owned();
+    let view = invitation_message(&pool, &token, &verified("ny@example.test"), t0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (view.tenant_id, view.invitation_id, view.ciphertext.as_str()),
+        (fau.tenant_id, issued.invitation_id, "vault:v1:bWVsZGluZw==")
+    );
+    for (tok, reader) in [
+        (token.as_str(), "annen@example.test"),
+        (&"0".repeat(64)[..], "ny@example.test"),
+        ("short", "ny@example.test"),
+    ] {
+        assert!(
+            matches!(
+                invitation_message(&pool, tok, &verified(reader), t0).await,
+                Err(MembershipError::UnknownInvitation)
+            ),
+            "{reader}"
+        );
+    }
+    assert!(
+        matches!(
+            invitation_message(
+                &pool,
+                &token,
+                &verified("ny@example.test"),
+                at("2027-01-01T00:00:00Z")
+            )
+            .await,
+            Err(MembershipError::UnknownInvitation)
+        ),
+        "expired"
+    );
+}
+
+#[tokio::test]
+async fn resend_keeps_the_message_and_acceptance_ends_it() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let issued = invite_with(&pool, &fau, "ny@example.test", t0).await;
+    let resent = resend_invitation(
+        &pool,
+        InvitationChange {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            invitation_id: issued.invitation_id,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let token = resent.token.expose().to_owned();
+    assert!(
+        invitation_message(&pool, &token, &verified("ny@example.test"), t0)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token: token.clone(),
+            acceptor: verified("ny@example.test"),
+            admin_end_override: None,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        invitation_message(&pool, &token, &verified("ny@example.test"), t0).await,
+        Err(MembershipError::UnknownInvitation)
+    ));
 }

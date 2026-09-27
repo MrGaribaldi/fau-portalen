@@ -61,6 +61,8 @@ pub(crate) struct NewInvitation {
     pub(crate) roles: Vec<(Uuid, Period)>,
     pub(crate) actor_kind: ActorKind,
     pub(crate) actor_membership_id: Option<Uuid>,
+    pub(crate) id: Option<Uuid>,
+    pub(crate) encrypted_message: Option<Vec<u8>>,
 }
 
 /// Writes an invitation, its roles, its audit entry and its outbox message. Every path
@@ -72,13 +74,13 @@ pub(crate) async fn insert_invitation(
     new: NewInvitation,
 ) -> Result<IssuedInvitation, MembershipError> {
     let token = InvitationToken::generate()?;
-    let invitation_id = Uuid::now_v7();
+    let invitation_id = new.id.unwrap_or_else(Uuid::now_v7);
     let expires_at = invitation_expiry(at.now());
     sqlx::query(
         "insert into invitations
            (tenant_id, id, token_hash, mode, recipient_email, issued_by, handover_grant_id,
-            access_request_id, recovery_holder, expires_at, created_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz)",
+            access_request_id, recovery_holder, expires_at, created_at, encrypted_message)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz, $12)",
     )
     .bind(new.tenant_id)
     .bind(invitation_id)
@@ -91,6 +93,7 @@ pub(crate) async fn insert_invitation(
     .bind(new.recovery_holder.map(RecoveryHolder::code))
     .bind(ts_param(expires_at))
     .bind(ts_param(at.now()))
+    .bind(new.encrypted_message)
     .execute(&mut *conn)
     .await?;
     for (role_id, period) in &new.roles {
@@ -225,6 +228,24 @@ pub struct IssueInvitation {
     /// `Some` issues a `handover` invitation under the actor's own handover grant
     /// (spec 6.3); `None` issues a `normal` one and requires an admin role valid today.
     pub handover_grant_id: Option<Uuid>,
+    pub message: Option<InvitationMessage>,
+}
+
+/// OpenBao transit ciphertext produced with `Aad::new(tenant_id, INVITATION_MESSAGE_AAD.0,
+/// INVITATION_MESSAGE_AAD.1, invitation_id)`, and the invitation row it is bound to.
+#[derive(Debug, Clone)]
+pub struct InvitationMessage {
+    pub invitation_id: Uuid,
+    pub ciphertext: fau_crypto::MessageCiphertext,
+}
+
+pub const INVITATION_MESSAGE_AAD: (&str, &str) = ("invitations", "encrypted_message");
+
+#[derive(Debug, Clone)]
+pub struct InvitationMessageView {
+    pub tenant_id: Uuid,
+    pub invitation_id: Uuid,
+    pub ciphertext: fau_crypto::MessageCiphertext,
 }
 
 /// Issues an invitation (spec 5.1, 6.3).
@@ -242,6 +263,13 @@ pub async fn issue_invitation(
     req: IssueInvitation,
     at: Moment,
 ) -> Result<IssuedInvitation, MembershipError> {
+    if req
+        .message
+        .as_ref()
+        .is_some_and(|m| m.ciphertext.as_str().len() > super::requests::MESSAGE_MAX_BYTES)
+    {
+        return Err(MembershipError::MessageTooLong);
+    }
     let mut tx = pool.begin().await?;
     let state = lock_tenant(&mut tx, req.tenant_id).await?;
     require_open(&state)?;
@@ -302,6 +330,11 @@ pub async fn issue_invitation(
             roles: roles.into_iter().map(|(id, _, p)| (id, p)).collect(),
             actor_kind: ActorKind::Member,
             actor_membership_id: Some(req.actor_membership_id),
+            id: req.message.as_ref().map(|m| m.invitation_id),
+            encrypted_message: req
+                .message
+                .as_ref()
+                .map(|m| m.ciphertext.as_str().as_bytes().to_vec()),
         },
     )
     .await?;
@@ -809,6 +842,46 @@ pub async fn accept_invitation(
         membership_id,
         assignment_ids,
     })
+}
+
+/// The invitee's view of the message (decision of 24 September 2026). Every failure is
+/// `UnknownInvitation`, so the answer never says which part failed.
+pub async fn invitation_message(
+    pool: &PgPool,
+    token: &str,
+    reader: &VerifiedEmail,
+    at: Moment,
+) -> Result<Option<InvitationMessageView>, MembershipError> {
+    if !looks_like_token(token) {
+        return Err(MembershipError::UnknownInvitation);
+    }
+    let row: Option<(Uuid, Uuid, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "select tenant_id, id, recipient_email, encrypted_message from invitations
+          where token_hash = $1 and accepted_at is null and revoked_at is null
+            and expires_at > $2::timestamptz",
+    )
+    .bind(hash_token(token))
+    .bind(ts_param(at.now()))
+    .fetch_optional(pool)
+    .await?;
+    let (tenant_id, invitation_id, recipient, message) =
+        row.ok_or(MembershipError::UnknownInvitation)?;
+    if recipient != reader.email().as_str() {
+        return Err(MembershipError::UnknownInvitation);
+    }
+    message
+        .map(|b| {
+            let ciphertext = String::from_utf8(b)
+                .ok()
+                .and_then(fau_crypto::MessageCiphertext::new)
+                .ok_or_else(MembershipError::decode)?;
+            Ok(InvitationMessageView {
+                tenant_id,
+                invitation_id,
+                ciphertext,
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

@@ -256,6 +256,8 @@ pub async fn recovery_grant_admin(
             roles: vec![(role_id, period)],
             actor_kind,
             actor_membership_id: None,
+            id: None,
+            encrypted_message: None,
         },
     )
     .await?;

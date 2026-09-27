@@ -411,6 +411,8 @@ pub async fn activate_tenant(
                     roles: vec![(admin_role_id, period)],
                     actor_kind: ActorKind::Registrant,
                     actor_membership_id: Some(membership_id),
+                    id: None,
+                    encrypted_message: None,
                 },
             )
             .await?,

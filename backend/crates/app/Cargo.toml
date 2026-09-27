@@ -18,6 +18,7 @@ test-routes = []
 
 [dependencies]
 fau-domain = { path = "../domain" }
+fau-keys = { path = "../keys" }
 fau-persistence = { path = "../persistence" }
 fau-register-sources = { path = "../register-sources" }
 axum = { workspace = true }

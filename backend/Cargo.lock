@@ -678,6 +678,7 @@ dependencies = [
  "clap",
  "fau-crypto",
  "fau-domain",
+ "fau-keys",
  "fau-persistence",
  "fau-register-sources",
  "jiff",

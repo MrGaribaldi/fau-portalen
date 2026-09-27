@@ -108,5 +108,36 @@ services:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
       MP_SMTP_AUTH_ALLOW_INSECURE: "true"
 
+  # OpenBao's dev server (docs/key-service-design.md §6): in-memory, auto-unsealed, fixed
+  # dev root token. Development and tests only; production is the Helm chart (§4.1).
+  openbao:
+    image: openbao/openbao:2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315
+    # -config merges ops/openbao/dev-server.hcl into the built-in -dev config: OpenBao 2.7
+    # blocks audit device creation via the API unless unsafe_allow_api_audit_creation is set
+    # (see that file's header). Deviation from the plan's literal compose block, needed
+    # because configure.sh's `bao audit enable` fails against this image otherwise.
+    command: ["server", "-dev", "-dev-root-token-id=dev-only-root", "-dev-listen-address=0.0.0.0:8200", "-config=/ops/dev-server.hcl"]
+    cap_add: [IPC_LOCK]
+    volumes:
+      - ${FAU_HOST_PATH:-.}/ops/openbao:/ops:ro
+    healthcheck:
+      test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  openbao-config:
+    image: openbao/openbao:2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315
+    entrypoint: ["/bin/sh", "/ops/configure.sh", "dev"]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      BAO_TOKEN: dev-only-root
+    volumes:
+      - ${FAU_HOST_PATH:-.}/ops/openbao:/ops:ro
+    depends_on:
+      openbao:
+        condition: service_healthy
+    restart: "no"
+
 volumes:
   db-data:

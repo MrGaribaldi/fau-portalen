@@ -13,8 +13,10 @@ has() { bao "$1" list -format=json 2>/dev/null | grep -q "\"$2/\""; }
 
 has secrets transit || bao secrets enable transit
 has secrets fau-keys-queue || bao secrets enable -path=fau-keys-queue -version=1 kv
-# HMACs every value; key material and plaintext never reach the log (§4.4).
-has audit stdout || bao audit enable -path=stdout file file_path=stdout
+# The stdout audit device (HMACs every value; key material and plaintext never reach the
+# log, §4.4) is declared in the server configuration, not here: OpenBao refuses to create
+# audit devices via the API by default, so dev-server.hcl and Task 9's helm-values.yaml each
+# carry the same `audit "file" "stdout"` stanza instead.
 
 bao policy write fau-app "$HERE/policies/fau-app.hcl"
 bao policy write fau-keys-operator "$HERE/policies/fau-keys-operator.hcl"

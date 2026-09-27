@@ -78,7 +78,8 @@ fn has_transit_prefix(s: &str) -> bool {
 }
 
 /// A data key as OpenBao wrapped it (`vault:v1:…`). Useless once its transit key is gone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Its `Debug` prints the length only (spec §7).
+#[derive(Clone, PartialEq, Eq)]
 pub struct WrappedKey(String);
 
 impl WrappedKey {
@@ -87,6 +88,12 @@ impl WrappedKey {
     }
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for WrappedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WrappedKey({} bytes)", self.0.len())
     }
 }
 
@@ -187,5 +194,17 @@ mod tests {
         assert!(WrappedKey::new("plain".into()).is_none());
         assert!(MessageCiphertext::new("vault:v12:abc".into()).is_some());
         assert!(MessageCiphertext::new("vault:x:abc".into()).is_none());
+    }
+
+    /// Spec §7: a type holding ciphertext prints its length, never its value.
+    #[test]
+    fn transit_ciphertexts_debug_redacts_the_value() {
+        let body = "SECRETCIPHERTEXTBODY";
+        let wrapped = WrappedKey::new(format!("vault:v1:{body}")).unwrap();
+        let message = MessageCiphertext::new(format!("vault:v1:{body}")).unwrap();
+        for debug in [format!("{wrapped:?}"), format!("{message:?}")] {
+            assert!(!debug.contains(body), "{debug}");
+            assert!(debug.contains("29 bytes"), "{debug}");
+        }
     }
 }

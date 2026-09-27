@@ -94,3 +94,37 @@ async fn only_transit_ciphertext_is_accepted_by_the_schema() {
     .await;
     assert!(bad_scope.is_err(), "a record key has no scope");
 }
+
+/// Spec §3.2: the key is `(tenant_id, unit, scope)`. A primary key cannot include the
+/// nullable `scope` (a record key has none), so it is a table constraint with
+/// `nulls not distinct`, which also covers the null-scope case in the same constraint.
+#[tokio::test]
+async fn the_table_is_keyed_on_tenant_unit_and_scope() {
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+    let key: Option<(String, bool)> = sqlx::query_as(
+        "select string_agg(a.attname, ',' order by k.ord), bool_and(i.indnullsnotdistinct)
+           from pg_constraint con
+           join pg_index i on i.indexrelid = con.conindid
+           cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
+           join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+          where con.conrelid = 'wrapped_keys'::regclass and con.contype in ('p', 'u')
+          group by con.oid",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(key, Some(("tenant_id,unit,scope".into(), true)));
+
+    let fau = active_fau(&db.app_pool().await, "admin@example.test", at(T0)).await;
+    let insert = || {
+        sqlx::query(
+            "insert into wrapped_keys (tenant_id, unit, scope, wrapped_key) values ($1, 'record', null, $2)",
+        )
+        .bind(fau.tenant_id)
+        .bind(b"vault:v1:abc".to_vec())
+        .execute(&pool)
+    };
+    insert().await.unwrap();
+    assert!(insert().await.is_err(), "one record key per FAU");
+}

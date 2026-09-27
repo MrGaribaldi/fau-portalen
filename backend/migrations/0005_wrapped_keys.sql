@@ -11,11 +11,13 @@ create table wrapped_keys (
   -- OpenBao transit ciphertext, `vault:v<n>:<base64>`.
   wrapped_key  bytea       not null,
   created_at   timestamptz not null default now(),
+  -- The key is (tenant_id, unit, scope), spec §3.2. It cannot be a primary key, which would
+  -- force scope not null; `nulls not distinct` makes one constraint cover the record key too.
+  constraint wrapped_keys_one_per_unit unique nulls not distinct (tenant_id, unit, scope),
   constraint wrapped_keys_scope_matches_unit check ((unit = 'record') = (scope is null)),
   constraint wrapped_keys_is_transit_ciphertext
     check (substring(wrapped_key from 1 for 7) = 'vault:v'::bytea and octet_length(wrapped_key) <= 512)
 );
-create unique index wrapped_keys_one_per_unit on wrapped_keys (tenant_id, unit, coalesce(scope, ''));
 grant select, insert, delete on wrapped_keys to fau_app;
 
 -- The #3418 messages are now OpenBao transit ciphertext (vault:v1: + base64), about 2,713 bytes

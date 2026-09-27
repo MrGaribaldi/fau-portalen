@@ -30,7 +30,7 @@ pub async fn load_wrapped_key(
 ) -> Result<Option<WrappedKey>, WrappedKeyError> {
     let (u, scope) = row(unit)?;
     let found: Option<Vec<u8>> = sqlx::query_scalar(
-        "select wrapped_key from wrapped_keys where tenant_id = $1 and unit = $2 and coalesce(scope, '') = coalesce($3, '')")
+        "select wrapped_key from wrapped_keys where tenant_id = $1 and unit = $2 and scope is not distinct from $3")
         .bind(unit.tenant()).bind(u).bind(scope).fetch_optional(&mut *conn).await?;
     found.map(decode).transpose()
 }
@@ -43,7 +43,7 @@ pub async fn store_wrapped_key(
     let (u, scope) = row(unit)?;
     sqlx::query(
         "insert into wrapped_keys (tenant_id, unit, scope, wrapped_key) values ($1, $2, $3, $4)
-         on conflict (tenant_id, unit, coalesce(scope, '')) do nothing",
+         on conflict (tenant_id, unit, scope) do nothing",
     )
     .bind(unit.tenant())
     .bind(u)

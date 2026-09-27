@@ -888,10 +888,11 @@ pub async fn invitation_message(
 mod tests {
     use super::*;
 
-    /// Every other struct in this module either carries no raw secret (`IssueInvitation`,
-    /// `InvitationChange`, `OfferedRole`, `RoleChoice`, `Accepted`) or already redacts one
-    /// through its own type (`IssuedInvitation`'s `InvitationToken`). `AcceptInvitation`
-    /// is the one place a raw token string crosses this module's boundary.
+    /// Every other struct in this module either carries no raw secret (`InvitationChange`,
+    /// `OfferedRole`, `RoleChoice`, `Accepted`) or already redacts one through its own type
+    /// (`IssuedInvitation`'s `InvitationToken`; `IssueInvitation`'s optional message, whose
+    /// transit ciphertext is a `MessageCiphertext` that prints its length only).
+    /// `AcceptInvitation` is the one place a raw token string crosses this module's boundary.
     #[test]
     fn accept_invitation_debug_redacts_the_token() {
         let token = "a".repeat(64);

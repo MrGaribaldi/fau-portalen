@@ -2853,3 +2853,45 @@ member type and one authorization function) and keep going while he is away over
 plans #3501 from the accepted #3500 design (docs/groups-directory-chat-calendar-design.md) and executes
 it on branch `groups-3501` without a separate plan review. Nothing is applied to the cluster; merging
 and pushing stay Erik's.
+
+## External review of the encryption design — 27 September 2026
+
+Erik ran the encryption brief (docs/encryption-review-brief.md) past an outside expert. The verdict:
+the envelope design is sound for its goal (a stolen database or bucket does not reveal content),
+but **it must not hold real FAU data yet**. Production approval should depend on four things:
+- an independent recovery and deletion system, tested;
+- cache-aware revocation;
+- real proof of MFA for administrative actions;
+- audit alerts that are running.
+
+The agent checked every finding against the documents and the code. All hold, and there is no
+pushback.
+
+| Finding | Priority | Where it goes |
+|---|---|---|
+| The 7-day window is enforced only by `shred.sh`, and the operator credential can hard-delete at once | Critical | #3507. Final deletion authority moves off the application cluster; the scheduler loses hard delete; an independent finalizer checks its own deadline; recovery from an unauthorized delete is rehearsed. Recorded in key-service-design §5 |
+| A hard delete does not reach earlier copies of OpenBao state, or Raft/BoltDB remnants on the live volume | Critical | #3507 must define how key copies expire across every recoverable copy. Until then crypto-shredding is described as *proposed*. Key-service-design §5 now separates soft delete, hard delete and expiry of all copies |
+| Soft delete does not revoke keys already held in `KeyCache` | High | The card that wires `KeyCache` into the app (#3417) and #3509. Order: stop reads, evict on every instance, refuse new keys, then soft-delete; test with requests in flight. Key-service-design §5 |
+| The admin guard checks that a second factor is *enrolled*, not that it was *used* | High | #3414. Require proof of the authentication method and time (`amr`/`auth_time` or a fresh challenge), verify what Hanko actually returns, and enforce it server-side. The guard is not built, so nothing is exposed yet |
+| The backend can decrypt across tenants, and the mass-decryption detector is not live | High | Kept as an explicit trust assumption; the ADR-003 trust statement is corrected. #3442 alerts: distinct-key decrypts, direct hard deletes, restores, audit-pipeline failure and Job failure, with audit records sent somewhere independent of the app cluster |
+| One OpenBao instance and one human unseal holder are single points of failure | High | #3507 and the restore rehearsal #3425 are hard launch gates, as already decided. The custody choice (availability or separation of authority) is Erik's |
+
+Smaller items, recorded for their cards:
+- A revision in the AAD alone does not stop rollback. Where rollback matters, the expected revision
+  needs trusted monotonic state (#3419).
+- Put the unit/key id in a future envelope version.
+- Test that a substituted wrapped key is detected (it causes data loss or tampered new content,
+  not disclosure).
+- Specify the upload quarantine boundary and its purge path (#3447).
+- Specify published-output deletion (#3419).
+
+**Corrected at once, because it is public wording.** The ADR-003 trust statement claimed that a
+stolen database was inert, and that reading an FAU meant seating a member with every step
+notifying members. It now says the database leak is a privacy event, that a compromised backend
+is not held to the application path, and that bulk exfiltration may not be called slow or loud
+until the alerts are live.
+
+**Trade-offs the reviewer would keep:** server-side encryption over E2E; XChaCha20-Poly1305 with
+random nonces (plan a rotation, but it does not block launch); one transit key per document and
+chat month (benchmark key count, list pagination, Raft growth and full-tenant deletion first); the
+session key cache; and direct transit encryption for short messages.

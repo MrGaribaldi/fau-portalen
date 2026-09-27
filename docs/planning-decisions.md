@@ -2825,3 +2825,24 @@ Erik decided to measure it rather than trust the estimate: **k6** load tests, wi
 1,000 simultaneous connections editing documents**, tracked on #3508. It waits on the document
 authority (#3419) and a staging deployment (#3424). k6 is an internal tool run against our own
 staging, never k6 Cloud.
+
+## Archiving an FAU for non-payment — 27 September 2026
+
+Erik asked for an "archive FAU" option next to deletion: an FAU that falls behind on payment is
+paused rather than deleted, can pay and continue, or can ask for a hard delete. Agreed in chat
+(docs/fau-archive-design.md):
+- **Two phases.** Read-only first, with keys live, a pay-to-reactivate notice on every login and no
+  promised length ("might be a few weeks"). Then the FAU's transit keys are soft-deleted for up to
+  a year, and destroyed after that.
+- **What survives the lock:** published pages stay online, and a completed export stays
+  downloadable. An FAU without an export can contact us, and we may export manually or ask them to
+  pay a month.
+- **Operator-driven transitions** in the MVP. Automation follows once billing exists.
+- **Exports live 90 days**, under their own transit key.
+- **Memberships are suspended, not ended**, so emails are kept.
+- **Transactional email** goes to the administrators and the recovery contact at archive, at lock,
+  and 30 days before destruction.
+
+The agent ruled that the 365 days count from the soft delete. Open: the terms and DPA must provide
+for the retention before this ships, and the replica (#3507) must follow the per-reason window.
+Separate from #3506, whose deletion script's queue `reason` field it builds on.

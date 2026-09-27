@@ -1,5 +1,9 @@
-# Key Service Implementation Plan (#3506)
+# Key Service Implementation Plan (#3506) — SUPERSEDED
 
+
+> **Superseded 27 September 2026** by `2026-09-27-key-service-openbao.md`. Erik chose OpenBao over a
+> hand-written key service (docs/planning-decisions.md, "OpenBao replaces the hand-written key
+> service"). Kept as history; do not execute.
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the ADR-003 key service as a separate, sealed-on-start binary with its own SQLite store, the backend crates that talk to it and encrypt with its keys, and the two #3418 messages as its first consumers.

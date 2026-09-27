@@ -79,11 +79,11 @@ destroy on its own gets its own transit key, named so that an FAU's keys can be 
 |---|---|
 | `tenant_id` | composite key, as every tenant table |
 | `unit` | `record`, `document`, `chat` |
-| `subject` | document id or `YYYY-MM`; null for `record` |
+| `scope` | document id or `YYYY-MM`; null for `record`. Not `subject`, which ADR-003 decision 3 reserves for `identity_mappings` |
 | `wrapped_key` | `bytea`: transit ciphertext of the data key (the `vault:v1:…` string) |
 | `created_at` | |
 
-The primary key is `(tenant_id, unit, subject)`, with a unique index for the null-subject case.
+The primary key is `(tenant_id, unit, scope)`, with a unique index for the null-scope case.
 
 **Why a wrapped key in our database is safe:** ADR-003's original rule came from one global master
 key that was never destroyed, so a wrapped key in a backup stayed recoverable. Here the wrapping
@@ -162,13 +162,13 @@ it changes.
     delete one);
   - denies everything else: list, export, backup, delete, `config`, `soft-delete` and restore.
 - **`fau-keys-operator`**, Kubernetes auth bound to the deletion job's service account:
-  - allows `transit/keys/fau-*/config` (to set `deletion_allowed`), `soft-delete`,
-    `soft-delete-restore`, delete, and list on `transit/keys`;
+  - allows key metadata reads, `config` (to set `deletion_allowed`), `soft-delete`,
+    `soft-delete-restore`, delete, and list on `transit/keys`, plus its queue mount
+    `fau-keys-queue/` (section 5);
   - **no encrypt, decrypt or datakey**, so the job that can destroy keys cannot read anything.
 - **Rate-limit quotas** on the `fau-app` role's transit paths. These replace the 26 September
   design's lease-enforced ceiling.
-- **Ruling:** starting quotas of 50 requests/second for the app and 5/second for the operator,
-  tuned under #3442.
+- **Ruling:** one starting quota of 50 requests/second on `transit/`, tuned under #3442.
 
 ### 4.4 Audit and alerts
 
@@ -253,8 +253,11 @@ keep working.
   - sweeping is not activity;
   - logout releases only that session.
 - **Schema review** allows exactly `wrapped_keys.wrapped_key`.
-- **Sealed at the edge:** a sealed dev OpenBao makes the API answer `content_unavailable`.
-- **No key material or plaintext** appears in the app's logs.
+- **Sealed at the edge:** OpenBao's 503 maps to `Sealed`, and `Sealed` to `content_unavailable`.
+  These are tested as two mappings, because sealing the shared dev server would disturb every other
+  test.
+- **No key material or plaintext in logs:** every type holding a key, token or ciphertext has a
+  redacting `Debug`, and each has a test.
 
 ## 8. What this changes elsewhere
 

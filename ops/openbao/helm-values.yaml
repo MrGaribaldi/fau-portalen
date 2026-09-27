@@ -25,7 +25,7 @@ server:
     BAO_CACERT: /openbao/userconfig/openbao-server-tls/ca.crt
   dataStorage:
     enabled: true
-    size: 1Gi
+    size: 10Gi                     # Hetzner's hcloud-volumes minimum; a smaller claim is rounded up
     storageClass: hcloud-volumes   # explicit: two default StorageClasses exist (#3488)
   auditStorage:
     enabled: false           # the audit device writes to stdout -> Loki (§4.4)
@@ -36,7 +36,8 @@ server:
     enabled: true
     config: |
       ui = false
-      disable_mlock = false
+      # No disable_mlock: OpenBao 2.x dropped mlock and refuses to start with the line present.
+      # The control is no swap on the nodes (docs/key-service-design.md §4.1, verified in #3424).
       listener "tcp" {
         address       = "[::]:8200"
         tls_cert_file = "/openbao/userconfig/openbao-server-tls/tls.crt"

@@ -128,8 +128,9 @@ ADR-003 decision 6 is amended to match.
 - **TLS on the listener**, with the certificate from a cert-manager internal CA Issuer, separate
   from the ACME issuers.
 - **Hardening:**
-  - `disable_mlock` stays false, since the chart runs with `IPC_LOCK`;
-  - no swap on the nodes;
+  - OpenBao has dropped mlock (2.7.0 refuses a config that sets `disable_mlock`, and the 0.29.6
+    chart has no `IPC_LOCK` and sets `SKIP_SETCAP=true`), so the control is **no swap on the
+    nodes**, to be verified on the cx23 nodes (#3424);
   - non-root, as the chart does;
   - core dumps are disabled by OpenBao itself.
 - The UI is disabled.

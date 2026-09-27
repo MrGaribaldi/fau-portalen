@@ -118,7 +118,6 @@ services:
     # block, needed because configure.sh's `bao audit enable` failed against this image
     # otherwise.
     command: ["server", "-dev", "-dev-root-token-id=dev-only-root", "-dev-listen-address=0.0.0.0:8200", "-config=/ops/dev-server.hcl"]
-    cap_add: [IPC_LOCK]
     volumes:
       - ${FAU_HOST_PATH:-.}/ops/openbao:/ops:ro
     healthcheck:

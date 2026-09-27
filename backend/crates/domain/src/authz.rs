@@ -150,6 +150,7 @@ mod tests {
         assert_eq!(all(Member, Target::Group(facts(Open, false))), [A, F, F]);
         assert_eq!(all(Member, Target::Group(facts(Closed, false))), [H, H, H]);
         assert_eq!(all(Guest, Target::Group(facts(Open, false))), [H, H, H]);
+        assert_eq!(all(Guest, Target::Group(facts(Closed, false))), [H, H, H]);
     }
 
     #[test]
@@ -177,5 +178,29 @@ mod tests {
         assert_eq!(all(Member, Target::GroupContent(archived)), [A, F, F]);
         assert_eq!(all(Guest, Target::GroupContent(archived)), [A, F, F]);
         assert_eq!(all(Admin, Target::Group(archived)), [A, A, A]);
+
+        // Hidden comes before archived: a viewer who cannot read the group at all gets
+        // `Hidden` for every action, never `Forbidden` from the archived check.
+        let hidden_archived = GroupFacts {
+            visibility: Closed,
+            archived: true,
+            viewer_in_group: false,
+        };
+        assert_eq!(
+            all(Member, Target::GroupContent(hidden_archived)),
+            [H, H, H]
+        );
+        assert_eq!(all(Guest, Target::Group(hidden_archived)), [H, H, H]);
+
+        let archived_open_outside = GroupFacts {
+            visibility: Open,
+            archived: true,
+            viewer_in_group: false,
+        };
+        assert_eq!(all(Guest, Target::Group(archived_open_outside)), [H, H, H]);
+        assert_eq!(
+            all(Guest, Target::GroupContent(archived_open_outside)),
+            [H, H, H]
+        );
     }
 }

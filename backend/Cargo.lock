@@ -676,6 +676,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "fau-crypto",
  "fau-domain",
  "fau-persistence",
  "fau-register-sources",
@@ -735,6 +736,7 @@ dependencies = [
 name = "fau-persistence"
 version = "0.1.0"
 dependencies = [
+ "fau-crypto",
  "fau-domain",
  "getrandom 0.4.3",
  "jiff",

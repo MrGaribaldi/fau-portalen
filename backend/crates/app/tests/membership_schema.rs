@@ -268,30 +268,30 @@ async fn access_request_constraints() {
 }
 
 #[tokio::test]
-async fn access_request_sealed_message_is_bounded() {
+async fn access_request_encrypted_message_is_bounded() {
     let db = TestDb::migrated().await;
     let pool = db.admin_pool();
     let (t, _, _) = seeded(&pool).await;
 
-    let insert = |email: &'static str, sealed_message: Vec<u8>| {
+    let insert = |email: &'static str, encrypted_message: Vec<u8>| {
         sqlx::query(
             "insert into access_requests
-               (tenant_id, id, kind, requester_email, invitee_email, sealed_message,
+               (tenant_id, id, kind, requester_email, invitee_email, encrypted_message,
                 created_on, created_at)
              values ($1, $2, 'access', $3, $3, $4, current_date, now())",
         )
         .bind(t)
         .bind(Uuid::now_v7())
         .bind(email)
-        .bind(sealed_message)
+        .bind(encrypted_message)
         .execute(&pool)
     };
-    insert("a@example.test", vec![0u8; 2200])
+    insert("a@example.test", vec![0u8; 4096])
         .await
-        .expect("2200 bytes is within the bound");
-    let too_long = insert("b@example.test", vec![0u8; 2201])
+        .expect("4096 bytes is within the bound");
+    let too_long = insert("b@example.test", vec![0u8; 4097])
         .await
-        .expect_err("2201 bytes was accepted");
+        .expect_err("4097 bytes was accepted");
     assert_eq!(
         sqlstate(&too_long).as_deref(),
         Some("23514"),
@@ -299,7 +299,7 @@ async fn access_request_sealed_message_is_bounded() {
     );
     assert_eq!(
         constraint_name(&too_long).as_deref(),
-        Some("access_request_sealed_message_is_bounded")
+        Some("access_request_encrypted_message_is_bounded")
     );
 }
 
@@ -323,12 +323,12 @@ async fn invitation_encrypted_message_is_bounded() {
         .bind(encrypted_message)
         .execute(&pool)
     };
-    insert(vec![1u8; 32], vec![0u8; 2200])
+    insert(vec![1u8; 32], vec![0u8; 4096])
         .await
-        .expect("2200 bytes is within the bound");
-    let too_long = insert(vec![2u8; 32], vec![0u8; 2201])
+        .expect("4096 bytes is within the bound");
+    let too_long = insert(vec![2u8; 32], vec![0u8; 4097])
         .await
-        .expect_err("2201 bytes was accepted");
+        .expect_err("4097 bytes was accepted");
     assert_eq!(
         sqlstate(&too_long).as_deref(),
         Some("23514"),

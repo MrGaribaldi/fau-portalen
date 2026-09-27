@@ -46,7 +46,7 @@ async fn an_access_request_reaches_the_admins_and_names_nobody() {
         1
     );
     let sealed_message: Option<Vec<u8>> =
-        sqlx::query_scalar("select sealed_message from access_requests where id = $1")
+        sqlx::query_scalar("select encrypted_message from access_requests where id = $1")
             .bind(id)
             .fetch_one(&pool)
             .await

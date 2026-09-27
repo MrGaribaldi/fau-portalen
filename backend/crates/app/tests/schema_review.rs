@@ -113,8 +113,14 @@ async fn no_application_table_contains_key_material() {
         "nonce",
         "wrapped",
     ];
+    // The one deliberate exception (docs/key-service-design.md §3.2): OpenBao-wrapped data
+    // keys, useless without their transit key.
+    const ALLOWED: &[&str] = &["wrapped_keys.wrapped_key"];
     let mut offenders = Vec::new();
     for (table, column) in &columns {
+        if ALLOWED.contains(&format!("{table}.{column}").as_str()) {
+            continue;
+        }
         let c = column.to_ascii_lowercase();
         for needle in FORBIDDEN {
             // Substring, not equality: key_id, wrapped_dek and encryption_key all fail.
@@ -465,4 +471,15 @@ async fn no_column_stores_a_raw_token() {
             "{table}.{column} ({data_type}) looks like a stored token"
         );
     }
+}
+
+#[test]
+fn the_key_material_exception_list_is_exactly_one_column() {
+    let source = include_str!("schema_review.rs");
+    assert_eq!(
+        source
+            .matches("const ALLOWED: &[&str] = &[\"wrapped_keys.wrapped_key\"];")
+            .count(),
+        1
+    );
 }

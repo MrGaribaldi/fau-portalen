@@ -2846,3 +2846,10 @@ paused rather than deleted, can pay and continue, or can ask for a hard delete. 
 The agent ruled that the 365 days count from the soft delete. Open: the terms and DPA must provide
 for the retention before this ships, and the replica (#3507) must follow the per-reason window.
 Separate from #3506, whose deletion script's queue `reason` field it builds on.
+## Erik's go-ahead for #3501 — 27 September 2026
+
+Erik closed #3506 as complete after PR #4 merged, and asked the agent to start #3501 (groups, the guest
+member type and one authorization function) and keep going while he is away overnight. The agent
+plans #3501 from the accepted #3500 design (docs/groups-directory-chat-calendar-design.md) and executes
+it on branch `groups-3501` without a separate plan review. Nothing is applied to the cluster; merging
+and pushing stay Erik's.

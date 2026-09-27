@@ -15,7 +15,11 @@ spec:
         spec:
           serviceAccountName: fau-keys-operator
           restartPolicy: Never
-          securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+          # runAsUser/runAsGroup: the pinned image's /etc/passwd names its user "openbao", not a
+          # number (uid 100, gid 1000, confirmed against the image and matching the chart's own
+          # rendered StatefulSet, Task 9 fix round 1). Without a numeric runAsUser, kubelet
+          # refuses the container under runAsNonRoot: true ("cannot verify non-root").
+          securityContext: { runAsNonRoot: true, runAsUser: 100, runAsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
           containers:
             - name: shred
               image: openbao/openbao:2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315
@@ -51,7 +55,9 @@ spec:
         spec:
           serviceAccountName: fau-keys-operator
           restartPolicy: Never
-          securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+          # See the fau-keys-finalize CronJob above: numeric uid/gid, matching the image and the
+          # chart's rendered StatefulSet.
+          securityContext: { runAsNonRoot: true, runAsUser: 100, runAsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
           containers:
             - name: shred
               image: openbao/openbao:2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315

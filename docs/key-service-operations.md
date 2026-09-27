@@ -21,6 +21,13 @@ agent transcript persists (docs/key-service-design.md §4.2).
 kubectl -n openbao exec -it openbao-0 -- bao operator init -key-shares=1 -key-threshold=1
 ```
 
+This runs `bao` inside the pod, which already has `BAO_ADDR=https://127.0.0.1:8200` and
+`BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt` set as container environment (the
+chart's default `BAO_ADDR` plus `server.extraEnvironmentVars` in `ops/openbao/helm-values.yaml`,
+Task 9 fix round 1) — no extra export needed for this command. The server certificate carries a
+`127.0.0.1`/`localhost` SAN (`ops/openbao/k8s/certificates.yaml`) precisely so this in-pod TLS
+connection validates.
+
 - Store the unseal key in Proton Pass as "OpenBao unseal key" (#3481).
 - Use the initial root token for step 3 below, then revoke it. No standing all-powerful token
   should exist afterwards.
@@ -32,11 +39,20 @@ roles, quotas):
 
 ```bash
 kubectl -n openbao port-forward svc/openbao 8200:8200 &
-export BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=<path to the CA from openbao-server-tls>
+# Copy out only ca.crt — never tls.key — so no private key is printed to the terminal.
+kubectl -n openbao get secret openbao-server-tls -o jsonpath='{.data.ca\.crt}' \
+  | base64 -d > /tmp/openbao-ca.crt
+export BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/tmp/openbao-ca.crt
 export BAO_TOKEN=<root token>          # typed, never pasted into an agent session
 sh ops/openbao/configure.sh cluster
 bao token revoke -self
+rm -f /tmp/openbao-ca.crt
 ```
+
+The port-forwarded connection is to `127.0.0.1` from outside the pod, over the same listener, so
+it needs the same `127.0.0.1` SAN the certificate now carries (Task 9 fix round 1) and an
+explicit `BAO_CACERT`, since nothing on the operator's own machine trusts OpenBao's internal CA
+by default.
 
 `configure.sh cluster` is idempotent: enables the transit engine and the `fau-keys-queue/` KV
 mount, writes the `fau-app` and `fau-keys-operator` policies, sets the transit rate-limit quota,
@@ -48,7 +64,9 @@ and configures Kubernetes auth with the `fau-app` and `fau-keys-operator` roles.
 kubectl -n openbao exec -it openbao-0 -- bao operator unseal
 ```
 
-Paste the unseal key from Proton Pass when prompted.
+Paste the unseal key from Proton Pass when prompted. Like `init` (§2), this runs inside the pod,
+so `BAO_ADDR`/`BAO_CACERT` are already set in the container's environment and the command needs no
+extra exports.
 
 ## 5. Generating a root token when one is needed
 

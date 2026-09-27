@@ -16,6 +16,13 @@ server:
     tag: "2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315"
   authDelegator:
     enabled: true            # lets OpenBao call TokenReview for Kubernetes auth
+  # Task 9 fix round 1: the server's own readiness/liveness probes and any in-pod `bao` CLI use
+  # BAO_ADDR=https://127.0.0.1:8200 (chart default), and the server cert (certificates.yaml) now
+  # carries a 127.0.0.1/localhost SAN for that, but nothing trusts it without a CA. This is the
+  # same CA distributed as `ca.crt` inside the openbao-server-tls secret already mounted via
+  # extraVolumes below.
+  extraEnvironmentVars:
+    BAO_CACERT: /openbao/userconfig/openbao-server-tls/ca.crt
   dataStorage:
     enabled: true
     size: 1Gi

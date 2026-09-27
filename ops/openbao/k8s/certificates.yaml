@@ -26,7 +26,10 @@ metadata: { name: openbao-server, namespace: openbao }
 spec:
   secretName: openbao-server-tls
   commonName: openbao.openbao.svc
-  dnsNames: [openbao, openbao.openbao, openbao.openbao.svc, openbao.openbao.svc.cluster.local]
+  # localhost / 127.0.0.1: the chart's own probes and any in-pod `bao` CLI use
+  # BAO_ADDR=https://127.0.0.1:8200 (Task 9 fix round 1).
+  dnsNames: [openbao, openbao.openbao, openbao.openbao.svc, openbao.openbao.svc.cluster.local, localhost]
+  ipAddresses: [127.0.0.1]
   duration: 2160h
   renewBefore: 360h
   privateKey: { algorithm: ECDSA, size: 256, rotationPolicy: Always }

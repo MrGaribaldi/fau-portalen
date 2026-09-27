@@ -20,6 +20,9 @@ kind: Issuer
 metadata: { name: openbao-internal-ca, namespace: openbao }
 spec: { ca: { secretName: openbao-internal-ca } }
 ---
+# OpenBao reads this certificate only at start and on SIGHUP, so every renewal (about every 75
+# days) needs a SIGHUP to the bao process — never a restart, which seals it. Procedure:
+# docs/key-service-operations.md §11. The alert on the served certificate's expiry is #3442's.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata: { name: openbao-server, namespace: openbao }

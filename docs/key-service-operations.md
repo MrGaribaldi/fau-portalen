@@ -70,14 +70,18 @@ extra exports.
 
 ## 5. Generating a root token when one is needed
 
+Erik's alone, on his own terminal (§2). Like `init` and `unseal`, it runs inside the pod, so
+`BAO_ADDR`/`BAO_CACERT` are already set and no port-forward is needed:
+
 ```bash
-bao operator generate-root -init
+kubectl -n openbao exec -it openbao-0 -- bao operator generate-root -init
 # then, with the unseal key and the OTP from the -init step:
-bao operator generate-root
+kubectl -n openbao exec -it openbao-0 -- bao operator generate-root
+kubectl -n openbao exec -it openbao-0 -- bao operator generate-root -decode=<encoded token> -otp=<otp>
 ```
 
-Decode with `-decode` using the OTP, and revoke the resulting token as soon as the task that
-needed it is done.
+Use the decoded token through the §3 port-forward setup (`BAO_ADDR`, `BAO_CACERT`), and revoke it
+(`bao token revoke -self`) as soon as the task that needed it is done.
 
 ## 6. What sealed means
 
@@ -119,6 +123,21 @@ kubectl apply -f /tmp/job.yaml
   `ops/openbao/shred.sh` for the full state machine.
 - **Restore** is available any time before hard deletion (`restore <key>`) and un-queues the key.
 
+`shred.sh`'s exit codes, which `job.sh` passes through as the Job's result; every non-zero one
+except 2 logs a `shred: CRITICAL` line:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | Done. Keys already soft-deleted and queued, or gone, are skipped. | Nothing. |
+| 1 | OpenBao error: unreachable, sealed, token rejected, permission denied, or a failed read or write. Nothing is treated as "empty" or "gone" unless OpenBao said so, and `finalize` unqueues nothing it could not read. | Read the CRITICAL line, fix the cause (unseal, NetworkPolicy, auth role), re-run the job. Re-running is safe. |
+| 2 | Bad input (usage). | Fix the command. |
+| 3 | `finalize` refused a young chat month (above). | Investigate the queue entry. |
+| 4 | `fau <tenant>` matched no keys: a wrong tenant id, or an FAU that never stored content. | Check the tenant id. If it is right, there was nothing to shred. |
+
+A `shred: CRITICAL re-queued …` line with exit 0 means a key was found soft-deleted but not
+queued — an earlier run stopped between its two writes — and has now been queued from this run's
+time; its 7-day window starts now.
+
 ## 8. Until #3507: volume loss is total
 
 No Raft snapshots are configured — deliberately: a snapshot history of key material would keep
@@ -134,7 +153,7 @@ while no real FAU data exists yet.
 | `KeyServiceRateLimited` | `increase(vault_quota_rate_limit_violation[15m]) > 0` | warning | The `fau-app` role hit the transit rate-limit quota. Check for a runaway client or a real traffic increase before raising the quota (§4.3, tuned under #3442). |
 | `KeyServiceManyDistinctKeysDecrypted` (Loki rule, not yet enabled — #3442 verifies field names against a real audit line first) | audit log, `transit/decrypt/fau-*` count by key over 1h | critical | The mass-decryption signal. Investigate which credential is decrypting many distinct units; this is the pattern a compromised app credential would produce. |
 | `KeyServiceSoftDeleteOrRestore` (Loki rule, same caveat) | audit log, any `soft-delete` / `soft-delete-restore` | critical | Every soft-delete or restore is a deliberate, rare action (ADR-003 decision 7). Confirm it corresponds to an authorized deletion, expiry, or restore request. |
-| `KeyServiceShredCritical` (Loki rule, same caveat) | audit log, `shred: CRITICAL` lines from the `shred` container | critical | Covers `finalize`'s refusal to destroy a young chat month (exit 3, §7), a malformed queue entry, and a key found queued but not soft-deleted. Read the log line for which case, and check `ops/openbao/shred.sh`. |
+| `KeyServiceShredCritical` (Loki rule, same caveat) | audit log, `shred: CRITICAL` lines from the `shred` container | critical | Covers any OpenBao error in a job (exit 1), `finalize`'s refusal to destroy a young chat month (exit 3), `fau` matching no keys (exit 4), a malformed queue entry, a key found queued but not soft-deleted, and a soft-deleted key re-queued (all in §7). Read the log line for which case, and check `ops/openbao/shred.sh`. |
 
 The Loki rules are commented out in `ops/openbao/k8s/alerts.yaml` pending that field-name
 verification; only the two Prometheus rules are live in the `PrometheusRule` object as written.
@@ -152,3 +171,51 @@ docker compose -f compose.yaml run --rm openbao-config
   `configure.sh dev` idempotently against it.
 - `ops/openbao/test-shred.sh` exercises `shred.sh` against the dev server; run it with
   `docker compose -f compose.yaml exec -T -e BAO_TOKEN=dev-only-root openbao sh /ops/test-shred.sh`.
+
+## 11. After every server certificate renewal: reload with SIGHUP
+
+cert-manager renews `openbao-server` (`ops/openbao/k8s/certificates.yaml`, 90 days, renewed 15
+days before expiry, so about every 75 days) and updates the `openbao-server-tls` Secret, but
+OpenBao reads its listener certificate only at start and on SIGHUP. Until it is signalled it keeps
+serving the old certificate, and clients start failing when that one expires.
+
+**A restart is not the remedy: a restarted OpenBao comes up sealed**, and every content request
+answers `content_unavailable` until Erik unseals it (§4, §6). Send SIGHUP instead, which reloads
+the listener certificates (and the declared audit device) without sealing.
+
+1. See when renewal happened or is due:
+
+   ```bash
+   kubectl -n openbao get certificate openbao-server \
+     -o jsonpath='{.status.renewalTime}{"  notAfter="}{.status.notAfter}{"\n"}'
+   ```
+
+2. Wait until the pod sees the renewed file — the kubelet refreshes a mounted Secret within a
+   minute or two. Compare the two hashes (certificates only, never `tls.key`):
+
+   ```bash
+   kubectl -n openbao get secret openbao-server-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | sha256sum
+   kubectl -n openbao exec openbao-0 -- sha256sum /openbao/userconfig/openbao-server-tls/tls.crt
+   ```
+
+3. Signal the server. PID 1 in the chart's container is the `/bin/sh -ec` wrapper that starts
+   `bao`, not `bao` itself — a SIGHUP to PID 1 would kill the shell and restart the pod, sealing
+   it — so signal the `bao` process by name, as the chart's own `preStop` hook does:
+
+   ```bash
+   kubectl -n openbao exec openbao-0 -- sh -c 'kill -HUP "$(pidof bao)"'
+   ```
+
+4. Confirm the new certificate is served, through the §3 port-forward:
+
+   ```bash
+   openssl s_client -connect 127.0.0.1:8200 -servername openbao.openbao.svc </dev/null 2>/dev/null \
+     | openssl x509 -noout -serial -enddate
+   kubectl -n openbao get secret openbao-server-tls -o jsonpath='{.data.tls\.crt}' | base64 -d \
+     | openssl x509 -noout -serial -enddate
+   ```
+
+   The serials and end dates must match, and `bao status` must still report `Sealed false`.
+
+An alert on the served certificate nearing expiry — which is what catches a missed SIGHUP —
+belongs to #3442.

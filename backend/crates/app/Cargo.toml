@@ -18,6 +18,7 @@ test-routes = []
 
 [dependencies]
 fau-domain = { path = "../domain" }
+fau-keys = { path = "../keys" }
 fau-persistence = { path = "../persistence" }
 fau-register-sources = { path = "../register-sources" }
 axum = { workspace = true }
@@ -40,6 +41,9 @@ uuid = { workspace = true }
 # tests (tests/register_apply.rs). A dev-dependency feature: resolver 2 keeps it out of
 # `cargo build --release`, so it never reaches the image.
 fau-domain = { path = "../domain", features = ["testkit"] }
+# Unit, ChatMonth and WrappedKey for tests/wrapped_keys.rs. Test-only: the app crate
+# itself does not yet call into fau-crypto.
+fau-crypto = { path = "../crypto" }
 # Test-only: an independent SHA-256 to check that invitations store the token's hash
 # and never the token, and that staged NSR payloads carry their own.
 sha2 = { workspace = true }

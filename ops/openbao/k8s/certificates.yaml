@@ -1,0 +1,42 @@
+# The internal CA for OpenBao's TLS listener, separate from the ACME issuers (§4.1).
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: { name: openbao-bootstrap, namespace: openbao }
+spec: { selfSigned: {} }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: openbao-internal-ca, namespace: openbao }
+spec:
+  isCA: true
+  commonName: fau-openbao-internal-ca
+  secretName: openbao-internal-ca
+  duration: 87600h
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { name: openbao-bootstrap, kind: Issuer }
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: { name: openbao-internal-ca, namespace: openbao }
+spec: { ca: { secretName: openbao-internal-ca } }
+---
+# OpenBao reads this certificate only at start and on SIGHUP, so every renewal (about every 75
+# days) needs a SIGHUP to the bao process — never a restart, which seals it. Procedure:
+# docs/key-service-operations.md §11. The alert on the served certificate's expiry is #3442's.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: openbao-server, namespace: openbao }
+spec:
+  secretName: openbao-server-tls
+  commonName: openbao.openbao.svc
+  # localhost / 127.0.0.1: the chart's own probes and any in-pod `bao` CLI use
+  # BAO_ADDR=https://127.0.0.1:8200 (Task 9 fix round 1).
+  dnsNames: [openbao, openbao.openbao, openbao.openbao.svc, openbao.openbao.svc.cluster.local, localhost]
+  ipAddresses: [127.0.0.1]
+  duration: 2160h
+  renewBefore: 360h
+  privateKey: { algorithm: ECDSA, size: 256, rotationPolicy: Always }
+  issuerRef: { name: openbao-internal-ca, kind: Issuer }
+# The app trusts this CA through `ca.crt` of openbao-server-tls, distributed to the fau-app
+# namespace by #3424 (trust-manager, or a copied ConfigMap). The app authenticates with its
+# service account, not a client certificate (§4.3), so no client certificate is issued.

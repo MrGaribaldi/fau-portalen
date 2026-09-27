@@ -198,6 +198,17 @@ marketing pages with Bokmål unprefixed, cookie + `Accept-Language` inside the a
 from a spreadsheet, and plan for more than two locales (English or Sámi named) — so nothing may
 hard-code two or assume Latin collation.
 
+**Groups, guests, directory, chat, calendar and date poll** were designed 26 September
+(docs/groups-directory-chat-calendar-design.md, #3500 in Waiting for spec review; build cards #3501–#3505
+in that order). Binding before anything is built:
+- Groups are arbitrary, open by default and closable.
+- A third capability class, `guest`, reaches only its own groups.
+- One authorization function covers every read and the SSE stream.
+- Folders carry an audience, and a meeting *is* an event. Both bind #3419.
+- Chat has no DMs and expires after 12 months by destroying monthly epoch keys.
+- The calendar feed is redacted and never touches the key service.
+- Notifications are in-app only; an email digest may be a paid add-on.
+
 Open with the user: #3481, #3485, #3447, #3488 and #3489 in Waiting. #3485 the next stage 2 pass, #3487 the infra-tools raw-chart issue and #3486 the
 favro-cli attachment issue. **#3490 is accepted and Done**, and #3420 is closed with its
 requirements moved into that architecture — so #3416, #3419, #3421, #3422, #3491 and #3492 have

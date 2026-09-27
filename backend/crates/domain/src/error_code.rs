@@ -25,6 +25,11 @@ pub enum ErrorCode {
     /// client, so the message is a fixed word and the diagnosis lives in the
     /// server-side log line the same request id ties it to, never in the response.
     InternalError,
+    /// Encrypted content cannot be read right now: OpenBao is sealed, unreachable or rate
+    /// limited (docs/key-service-design.md §6). Navigation, login and authorization still
+    /// work. Bokmål source string for the client catalogue (#3439):
+    /// "Innholdet er midlertidig utilgjengelig. Vi jobber med saken."
+    ContentUnavailable,
 }
 
 /// A bounded parameter value for an error response. An error can carry context (an
@@ -51,6 +56,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::InternalError).unwrap(),
             "\"internal_error\""
+        );
+    }
+
+    #[test]
+    fn content_unavailable_serialises_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ContentUnavailable).unwrap(),
+            "\"content_unavailable\""
         );
     }
 

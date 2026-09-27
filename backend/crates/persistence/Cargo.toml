@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fau-crypto = { path = "../crypto" }
 fau-domain = { path = "../domain" }
 # Invitation tokens: 32 bytes straight from the operating system's CSPRNG. Already in
 # Cargo.lock through `uuid`, so it adds no crate.

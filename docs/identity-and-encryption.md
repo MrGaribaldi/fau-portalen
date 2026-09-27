@@ -350,6 +350,18 @@ side. Whether passkeys are offered in the MVP at all is open item 3.
 
 ### 5. Key hierarchy, and no bulk decryption
 
+*Amended 27 September 2026, docs/key-service-design.md §3.* The key service is **OpenBao**
+(MPL-2.0, self-hosted) and its transit engine, which has no key hierarchy. Each unit that must be
+shreddable gets its own transit key: one per FAU for records, one per document, one per chat month,
+and one per FAU for inbound messages. Crypto-shredding destroys that transit key. **Data keys are
+wrapped by it and stored in the application database** (`wrapped_keys`), which replaces point 2
+below. That is safe for the reason this section was revised on 22 September: the wrapping key now
+exists at exactly the granularity it must be destroyed at, so a wrapped key surviving in a backup
+is useless once its transit key is gone. The rule is now **no usable key material in the
+application database**. Points 3 and 4 map onto OpenBao: its barrier and Shamir seal replace the
+root key, and there is no separate per-FAU KEK. The rest of this section is kept as the reasoning
+it records.
+
 Revised 22 September 2026. The first version wrapped every FAU's data key under one global master
 key, which made decision 7's deletion claim false - see that section. The tier that changes is the
 middle one: the wrapping key is now **per FAU**, and it never touches the application database.
@@ -446,6 +458,14 @@ ask once. The control that matters is the rate and the ceiling, not the interval
 **The rule.** The backend obtains an FAU data key **once per user session per FAU**, and holds it
 as a handle in memory only.
 
+*Amended 27 September 2026 (docs/key-service-design.md §3.2, §4.3).* The key service is
+**OpenBao's transit engine**. The "FAU data key" in this section is the FAU's **record data key**,
+which protects small fields outside documents. Document and chat-month data keys follow the same
+rule: held while in use, and released when the last client leaves. The ceiling is **rate-limit
+quotas plus a critical alert on many distinct keys decrypted per hour**. It is no longer a limit
+the key service enforces itself: OpenBao has no notion of what a backend still holds, and a
+hand-built lease table was rejected on 27 September in favour of battle-proven components.
+
 - Held for the session, with an idle timeout in the tens of minutes.
 - Refreshed by **real user activity only** - no background timer, no keep-alive on an idle tab.
   The same rule the cost section applies to token refresh, for the same reason: manufactured
@@ -485,6 +505,12 @@ co-editing remains deferred; this is notification, not collaboration.
 
 **Encrypted under the FAU data key:** document bodies, change sets, uploaded object bytes,
 document titles, and original filenames.
+
+*Amended 27 September 2026 (docs/key-service-design.md §3.3):* the two inbound messages below
+(access-request and invitation) are encrypted with OpenBao transit `encrypt` on the FAU's
+`fau-<tenant>-messages` key, bound to their row. That replaces the sealing key pair and the
+per-invitation keys. Where each message may be decrypted is unchanged: the approval screen, and
+the invitation page for the verified recipient. It is never decrypted for email.
 
 **Sealed to the FAU, decided 24 September 2026:** free text sent *into* an FAU by someone who is
 not a member. The first case is the message on an access request (flow spec §5.2). No member session
@@ -623,6 +649,11 @@ replica is what makes deletion hard, and the queue is what makes it honest.
   offline password manager is the obvious answer and connects to #3481.
 - The replica uses **different credentials from the key service**, so one compromise does not
   reach both.
+
+*Amended 27 September 2026:* with OpenBao, "queued" is **soft delete**: every key of the FAU
+stops working at once, can be restored during the 7-day window, and is hard-deleted after it by
+the deletion job (docs/key-service-design.md §5). Whether that hard delete must run from the replica
+side is for #3507.
 
 **Deletion is queued, not immediate.**
 

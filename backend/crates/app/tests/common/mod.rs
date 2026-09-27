@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex as TokioMutex;
@@ -60,6 +61,14 @@ const TEMPLATE_LOCK: i64 = 0x0FA0_0001;
 /// never on a connection to the per-test database it is about to modify.
 const ROLES_LOCK: i64 = 0x0FA0_0002;
 
+/// Cap for every ephemeral pool this harness opens. `PgPool`'s default max is 10;
+/// with up to 24 tests running in parallel per binary on a 24-core box, that peaks
+/// at up to 240 connections against dev Postgres's `max_connections=100`, which
+/// `tests/access.rs` was observed to flake under. Capped at 3 instead -- enough for
+/// any one test's own concurrency, low enough that 24 tests' worth of these pools
+/// still fit comfortably under 100.
+const TEST_POOL_MAX_CONNECTIONS: u32 = 3;
+
 /// `roles.sql`'s contents, embedded at compile time -- both applied to the template
 /// and folded into [`template_name`]'s content hash.
 const ROLES_SQL: &str = include_str!("../../../../db/roles.sql");
@@ -73,7 +82,9 @@ pub fn admin_url() -> String {
 /// A pool connected to the maintenance database as superuser -- for creating and
 /// dropping per-test databases.
 pub async fn admin_pool() -> PgPool {
-    PgPool::connect(&admin_url())
+    PgPoolOptions::new()
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
+        .connect(&admin_url())
         .await
         .expect("connect to the test-database superuser account")
 }
@@ -235,7 +246,10 @@ impl TestDb {
     /// on its own.
     pub fn admin_pool(&self) -> PgPool {
         let url = with_database(&self.admin_url, &self.name);
-        PgPool::connect_lazy(&url).expect("build lazy admin pool")
+        PgPoolOptions::new()
+            .max_connections(TEST_POOL_MAX_CONNECTIONS)
+            .connect_lazy(&url)
+            .expect("build lazy admin pool")
     }
 
     /// A pool connected as the runtime role `fau_app` to this database.
@@ -243,7 +257,9 @@ impl TestDb {
     /// template was built -- must have run first, or the role has no password to
     /// connect with.
     pub async fn app_pool(&self) -> PgPool {
-        PgPool::connect(&self.url())
+        PgPoolOptions::new()
+            .max_connections(TEST_POOL_MAX_CONNECTIONS)
+            .connect(&self.url())
             .await
             .expect("connect as fau_app")
     }
@@ -251,7 +267,9 @@ impl TestDb {
     /// A pool connected as the register role `fau_register` (D9), which alone writes
     /// the school register.
     pub async fn register_pool(&self) -> PgPool {
-        PgPool::connect(&self.role_url("fau_register"))
+        PgPoolOptions::new()
+            .max_connections(TEST_POOL_MAX_CONNECTIONS)
+            .connect(&self.role_url("fau_register"))
             .await
             .expect("connect as fau_register")
     }
@@ -333,7 +351,11 @@ impl Drop for TestDb {
                 .build()
                 .expect("drop runtime");
             rt.block_on(async {
-                let pool = match sqlx::PgPool::connect(&url).await {
+                let pool = match PgPoolOptions::new()
+                    .max_connections(TEST_POOL_MAX_CONNECTIONS)
+                    .connect(&url)
+                    .await
+                {
                     Ok(pool) => pool,
                     Err(_) => {
                         // Never the URL -- it carries a password. Never a panic

@@ -1,0 +1,24 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: { name: openbao, namespace: openbao }
+spec:
+  groups:
+    - name: openbao
+      rules:
+        - alert: KeyServiceSealed
+          expr: max(vault_core_unsealed) == 0
+          for: 2m
+          labels: { severity: critical }
+        - alert: KeyServiceRateLimited
+          expr: increase(vault_quota_rate_limit_violation[15m]) > 0
+          labels: { severity: warning }
+# Loki ruler rules for the audit log, which #3442 installs where Loki's ruler reads them.
+# Label and field names follow the file audit device's JSON; #3442 verifies them against a real
+# audit line before enabling:
+#   KeyServiceManyDistinctKeysDecrypted (critical):
+#     count(count by (key) (label_replace(count_over_time({namespace="openbao"} | json
+#       | request_path=~"transit/decrypt/fau-.*" [1h]), "key", "$1", "request_path", "transit/decrypt/(.*)"))) > 50
+#   KeyServiceSoftDeleteOrRestore (critical):
+#     count_over_time({namespace="openbao"} | json | request_path=~"transit/keys/.+/(soft-delete|soft-delete-restore)" [15m]) > 0
+#   KeyServiceShredCritical (critical):
+#     count_over_time({namespace="openbao", container="shred"} |= "shred: CRITICAL" [15m]) > 0

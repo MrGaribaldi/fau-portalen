@@ -1,0 +1,63 @@
+# docs/key-service-design.md §4.1. Standalone, one replica, Raft on hcloud-volumes, TLS,
+# no UI, no injector. Raft snapshots are deliberately not configured (§4.1): #3507.
+#
+# Value names checked against `helm show values openbao/openbao --version 0.29.6` on 27
+# September 2026 (Task 9, ruling R3). All paths below exist in that chart version; see
+# task-9-report.md for the check.
+global:
+  tlsDisable: false
+injector:
+  enabled: false
+ui:
+  enabled: false
+server:
+  image:
+    repository: openbao/openbao
+    tag: "2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315"
+  authDelegator:
+    enabled: true            # lets OpenBao call TokenReview for Kubernetes auth
+  # Task 9 fix round 1: the server's own readiness/liveness probes and any in-pod `bao` CLI use
+  # BAO_ADDR=https://127.0.0.1:8200 (chart default), and the server cert (certificates.yaml) now
+  # carries a 127.0.0.1/localhost SAN for that, but nothing trusts it without a CA. This is the
+  # same CA distributed as `ca.crt` inside the openbao-server-tls secret already mounted via
+  # extraVolumes below.
+  extraEnvironmentVars:
+    BAO_CACERT: /openbao/userconfig/openbao-server-tls/ca.crt
+  dataStorage:
+    enabled: true
+    size: 10Gi                     # Hetzner's hcloud-volumes minimum; a smaller claim is rounded up
+    storageClass: hcloud-volumes   # explicit: two default StorageClasses exist (#3488)
+  auditStorage:
+    enabled: false           # the audit device writes to stdout -> Loki (§4.4)
+  extraVolumes:
+    - type: secret
+      name: openbao-server-tls
+  standalone:
+    enabled: true
+    config: |
+      ui = false
+      # No disable_mlock: OpenBao 2.x dropped mlock and refuses to start with the line present.
+      # The control is no swap on the nodes (docs/key-service-design.md §4.1, verified in #3424).
+      listener "tcp" {
+        address       = "[::]:8200"
+        tls_cert_file = "/openbao/userconfig/openbao-server-tls/tls.crt"
+        tls_key_file  = "/openbao/userconfig/openbao-server-tls/tls.key"
+        telemetry { unauthenticated_metrics_access = true }
+      }
+      storage "raft" {
+        path    = "/openbao/data"
+        node_id = "openbao-0"
+      }
+      telemetry {
+        prometheus_retention_time = "24h"
+        disable_hostname = true
+      }
+      # Ruling R4 (Task 9): OpenBao 2.7 refuses to create audit devices via the API, so the
+      # device is declared here, applied on start and on SIGHUP. Same stanza as
+      # ops/openbao/dev-server.hcl (docs/key-service-design.md §4.4).
+      audit "file" "stdout" {
+        description = "HMACed audit log to stdout, collected into Loki (docs/key-service-design.md §4.4)."
+        options {
+          file_path = "stdout"
+        }
+      }

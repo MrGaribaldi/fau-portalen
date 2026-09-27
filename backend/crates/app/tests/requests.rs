@@ -3,21 +3,27 @@
 mod common;
 use common::membership::*;
 use common::TestDb;
+use fau_crypto::MessageCiphertext;
 use fau_domain::membership::requests::{ReplacementDateError, RequestLimit};
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_persistence::membership::{
-    accept_invitation, approve_request, create_access_request, create_replacement_proposal,
-    decline_request, lapse_requests, revoke_membership, AcceptInvitation, CreateAccessRequest,
-    CreateReplacementProposal, MembershipError, OfferedRole, RequestDecision, RevokeMembership,
-    RoleChoice,
+    accept_invitation, access_request_message, approve_request, create_access_request,
+    create_replacement_proposal, decline_request, lapse_requests, revoke_membership,
+    AcceptInvitation, AccessRequestMessage, CreateAccessRequest, CreateReplacementProposal,
+    MembershipError, OfferedRole, RequestDecision, RevokeMembership, RoleChoice,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
+
+fn ct(s: &str) -> MessageCiphertext {
+    MessageCiphertext::new(format!("vault:v1:{s}")).unwrap()
+}
 
 fn access(fau: &Fau, requester: &str) -> CreateAccessRequest {
     CreateAccessRequest {
         tenant_id: fau.tenant_id,
         requester: verified(requester),
+        message: None,
     }
 }
 
@@ -45,17 +51,13 @@ async fn an_access_request_reaches_the_admins_and_names_nobody() {
         outbox_count(&pool, "request.received", "admin@example.test").await,
         1
     );
-    let sealed_message: Option<Vec<u8>> =
-        sqlx::query_scalar("select sealed_message from access_requests where id = $1")
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("select encrypted_message from access_requests where id = $1")
             .bind(id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(
-        sealed_message.is_none(),
-        "no message field until the key service exists: nothing is stored as plaintext \
-         (ADR-003 decision 6)"
-    );
+    assert!(stored.is_none(), "no message given, none stored");
     let in_audit: i64 = sqlx::query_scalar(
         "select count(*) from audit_events where params::text like '%ny@example.test%'",
     )
@@ -892,6 +894,7 @@ async fn request_structs_never_print_addresses_in_debug() {
     let request = CreateAccessRequest {
         tenant_id: Uuid::now_v7(),
         requester: verified("hemmelig@example.test"),
+        message: None,
     };
     let debug = format!("{request:?}");
     assert!(!debug.contains("hemmelig@example.test"));
@@ -933,4 +936,79 @@ async fn an_admin_deciding_an_unknown_request_gets_unknown_request() {
         .await
         .unwrap_err();
     assert_eq!(err, MembershipError::UnknownRequest, "decline_request");
+}
+
+#[tokio::test]
+async fn a_message_is_stored_as_given_and_read_back_only_by_an_admin() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let request_id = Uuid::now_v7();
+    let id = create_access_request(
+        &pool,
+        CreateAccessRequest {
+            tenant_id: fau.tenant_id,
+            requester: verified("ny@example.test"),
+            message: Some(AccessRequestMessage {
+                request_id,
+                ciphertext: ct("c2VhbGVk"),
+            }),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        id, request_id,
+        "the row takes the id the message is bound to"
+    );
+    assert_eq!(
+        access_request_message(&pool, fau.tenant_id, id, fau.admin_membership_id, t0)
+            .await
+            .unwrap(),
+        Some(ct("c2VhbGVk"))
+    );
+
+    let member = add_member(
+        &pool,
+        &fau,
+        "m@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    for request in [id, Uuid::now_v7()] {
+        assert!(
+            matches!(
+                access_request_message(&pool, fau.tenant_id, request, member.membership_id, t0)
+                    .await,
+                Err(MembershipError::NotAuthorized)
+            ),
+            "authority is checked before the row"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_message_is_refused() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let r = create_access_request(
+        &pool,
+        CreateAccessRequest {
+            tenant_id: fau.tenant_id,
+            requester: verified("ny@example.test"),
+            message: Some(AccessRequestMessage {
+                request_id: Uuid::now_v7(),
+                ciphertext: ct(&"A".repeat(4096)),
+            }),
+        },
+        t0,
+    )
+    .await;
+    assert!(matches!(r, Err(MembershipError::MessageTooLong)));
 }

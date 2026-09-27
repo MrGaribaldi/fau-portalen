@@ -2701,3 +2701,148 @@ and an in-process fixture server. The agent's rulings, with the cost if wrong:
   - A dry run given `--accept-mass-change` records no abort reason.
   - sqlx logs the value of an unrecognised query parameter in `REGISTER_DATABASE_URL`. That is not
     the password, but the config could reject unknown parameters.
+
+## Groups, guests, directory, chat, calendar and date poll designed — 26 September 2026
+
+Talks with potential customers surfaced chat and a calendar. Erik designed them with the agent in
+chat, section by section, and agreed each section. The spec is
+docs/groups-directory-chat-calendar-design.md, and its section 2 lists the decisions (D1–D12).
+The ones that bind other work:
+
+- **Groups are first-class and arbitrary.** A year or unit is just one way to fill a group.
+  Groups are open to members by default, and an admin can mark one closed.
+- **A third capability class, `guest`,** reads and writes only within its own groups and folders.
+  There is one authorization function for every resource, and the SSE stream is filtered through
+  it.
+- **Folders carry an audience,** and documents inherit access from their folder. A meeting is an
+  event, and its documents anchor to `event_id`. Both bind #3419's document migration.
+- **The directory shows every current member's name and contact email to the FAU.** Names are
+  kept for history after a membership ends; contact emails are not.
+- **Chat has channels and no direct messages.** Messages use a small Markdown subset with links
+  to documents, and expire after 12 months when monthly epoch keys are destroyed.
+- **The calendar feed is redacted:** times and a generic label only, and the feed never touches
+  the key service. Full details come only through an `.ics` download inside the session. A public
+  calendar is designed for but not built.
+- **Notifications are in-app only in the MVP.** An email digest may become a paid add-on per FAU.
+- **The date poll has open votes, and the organiser decides.** Deciding creates the event.
+
+Agent ruling, open to challenge: a closed group's existence and name are hidden from anyone who
+cannot read it.
+
+## #3500 accepted — 26 September 2026
+
+Erik reviewed and accepted docs/groups-directory-chat-calendar-design.md on #3500, with one
+comment: the chat composer has no live preview in the MVP, and one may be implemented later. That
+is now in the spec's deferred list. The agent's closed-group ruling (a closed group's existence
+and name are hidden from anyone who cannot read it) stands with the acceptance.
+
+## Key service first, phased with its replica — 26 September 2026
+
+While planning #3501, the agent found that no key service exists and no card holds one, although
+every feature on #3500 and the documents migration (#3419) store encrypted fields. Erik decided,
+and agreed the design section by section (docs/key-service-design.md):
+
+- **Build the key service before #3501**, rather than building features against a stand-in
+  cipher.
+- **Phase the replica.** Card 1 is the key service, with the 7-day destruction queue modelled.
+  Card 2, the ransomware replica, is a hard gate before any real FAU data.
+- **The backend is trusted by service credential plus limits:** mTLS, a NetworkPolicy, and rate
+  limits and a lease-enforced ceiling. There are no membership checks and no Hanko call in the key
+  service.
+- **The key service is a separate binary with SQLite on its own volume**, never backed up. It
+  runs with `secure_delete` and a rollback journal.
+- **Key classes:** KEK, record key, document key, monthly chat epoch key, sealing pair and
+  invitation key. ADR-003 5a's "FAU data key" is the record key; ADR-003 is amended.
+
+Agent rulings open to challenge:
+- the key service gets its own image, not a `fau` subcommand (spec §6.1);
+- invitation keys are destroyed with the KEK only for now (spec §3.1).
+
+Erik asked for card 1's implementation plan to start the same evening.
+
+## OpenBao replaces the hand-written key service — 27 September 2026
+
+Reviewing the #3506 plan, Erik asked whether an open-source key service could replace one we would
+write and own. He then set a standing rule: **use battle-proven solutions wherever possible, and
+avoid implementing and owning code that is not part of FAU's core product.**
+
+He decided to use **OpenBao** (the Linux Foundation fork of Vault's last MPL-2.0 version; v2.7.0
+released 23 September 2026) and its transit engine. The engine provides named keys that never leave
+the service, XChaCha20-Poly1305 with associated data, data-key generation, key deletion gated by
+`deletion_allowed`, soft delete and restore, Shamir seal and unseal, audit devices, rate-limit
+quotas and per-path policies.
+
+The alternatives, rejected:
+- **Cosmian KMS:** BUSL-1.1, which is not open source.
+- **HashiCorp Vault:** BUSL-1.1, and US-owned.
+- **Tink:** a library, not a key service.
+
+Consequences:
+- docs/key-service-design.md is revised around OpenBao.
+- The 27 September implementation plan is superseded; it stays in git history.
+- Accepted losses: the lease-enforced ceiling becomes rate limits plus alerting, and the per-FAU KEK
+  hierarchy becomes flat keys deleted by prefix.
+- ADR-003's security model is otherwise unchanged.
+
+## Key service design with OpenBao agreed — 27 September 2026
+
+Erik agreed the revised design (docs/key-service-design.md):
+- **Envelope encryption.** OpenBao generates the data keys; only their wrapped form is stored, in
+  Postgres (`wrapped_keys`); the backend unwraps once per session and encrypts locally. Storing the
+  wrapped keys in OpenBao's KV store was rejected: two stores with no shared transaction, and two
+  deletion paths.
+- **ADR-003's rule becomes "no usable key material in the application database".** That is safe
+  because each transit key exists at the granularity it must be shredded at.
+- **The two #3418 messages use direct transit encryption.** The sealing pair and the
+  per-invitation keys are withdrawn.
+- **Custody:** Proton Pass holds the unseal key only. The root token is revoked after setup and
+  regenerated on demand (Erik offered to store tokens; revoking is OpenBao's own guidance, since a
+  standing root token bypasses every policy).
+- **Deployment:** OpenBao's official Helm chart, and a `bao` shell script for configuration and
+  deletion. `vaultrs` is the backend's client.
+
+ADR-003 decisions 5, 5a, 6 and 7 are amended. The 27 September hand-written implementation plan is
+superseded.
+
+## #3506 plan accepted and executed — 27 September 2026
+
+Erik accepted the OpenBao implementation plan (docs/superpowers/plans/2026-09-27-key-service-openbao.md),
+including its four rulings, and asked for it to be executed at once. Helm 4.3.0 was installed in the
+running agent session for rendering the chart values; it is baked into Dockerfile.agent for the next
+rebuild, which Erik starts after the work is done.
+
+## Load testing with k6, baseline 1,000 simultaneous editors — 27 September 2026
+
+Erik asked how many concurrent users the setup can serve at 1,000 FAU-er with 20 members each
+(20,000 accounts), with evening peaks likely. The agent's first-principles estimate:
+- about 2,000 concurrent sessions and about 400 requests/second at peak;
+- that needs only a handful of busy database connections;
+- Postgres's node size is the real constraint, and a dedicated 4-vCPU node is recommended at that
+  scale;
+- the SSE stream must use one `LISTEN` connection per pod, never one per viewer.
+
+Erik decided to measure it rather than trust the estimate: **k6** load tests, with a **baseline of
+1,000 simultaneous connections editing documents**, tracked on #3508. It waits on the document
+authority (#3419) and a staging deployment (#3424). k6 is an internal tool run against our own
+staging, never k6 Cloud.
+
+## Archiving an FAU for non-payment — 27 September 2026
+
+Erik asked for an "archive FAU" option next to deletion: an FAU that falls behind on payment is
+paused rather than deleted, can pay and continue, or can ask for a hard delete. Agreed in chat
+(docs/fau-archive-design.md):
+- **Two phases.** Read-only first, with keys live, a pay-to-reactivate notice on every login and no
+  promised length ("might be a few weeks"). Then the FAU's transit keys are soft-deleted for up to
+  a year, and destroyed after that.
+- **What survives the lock:** published pages stay online, and a completed export stays
+  downloadable. An FAU without an export can contact us, and we may export manually or ask them to
+  pay a month.
+- **Operator-driven transitions** in the MVP. Automation follows once billing exists.
+- **Exports live 90 days**, under their own transit key.
+- **Memberships are suspended, not ended**, so emails are kept.
+- **Transactional email** goes to the administrators and the recovery contact at archive, at lock,
+  and 30 days before destruction.
+
+The agent ruled that the 365 days count from the soft delete. Open: the terms and DPA must provide
+for the retention before this ships, and the replica (#3507) must follow the per-reason window.
+Separate from #3506, whose deletion script's queue `reason` field it builds on.

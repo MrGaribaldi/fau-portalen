@@ -38,6 +38,36 @@ impl ApiError {
     pub fn internal_error() -> Self {
         Self::new(ErrorCode::InternalError, StatusCode::INTERNAL_SERVER_ERROR)
     }
+
+    pub fn content_unavailable() -> Self {
+        Self::new(
+            ErrorCode::ContentUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    }
+}
+
+/// The key-service chain's edge mapping (docs/key-service-design.md §6): a client sees
+/// either ordinary content, `not_found`, or `content_unavailable` -- never OpenBao's own
+/// vocabulary, and never a stack of "internal_error"s for what is an outage, not a bug.
+impl From<fau_keys::KeyError> for ApiError {
+    fn from(e: fau_keys::KeyError) -> Self {
+        use fau_keys::KeyError::*;
+        match e {
+            Sealed | Unavailable | RateLimited => {
+                tracing::warn!(key_error = ?e, "encrypted content unavailable");
+                Self::content_unavailable()
+            }
+            NotFound => Self::not_found(),
+            Forbidden | Invalid => {
+                tracing::error!(
+                    key_error = ?e,
+                    "OpenBao refused a request the backend should not have sent"
+                );
+                Self::internal_error()
+            }
+        }
+    }
 }
 
 /// The wire shape: `{code, params, request_id}`. A separate type from `ApiError`
@@ -109,6 +139,30 @@ mod tests {
         assert!(
             !raw.contains("sentinel panic payload"),
             "the panic payload leaked into the response: {raw}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_error_tests {
+    use super::*;
+    use fau_keys::KeyError;
+
+    #[test]
+    fn a_sealed_openbao_is_content_unavailable() {
+        for (e, status) in [
+            (KeyError::Sealed, StatusCode::SERVICE_UNAVAILABLE),
+            (KeyError::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+            (KeyError::RateLimited, StatusCode::SERVICE_UNAVAILABLE),
+            (KeyError::NotFound, StatusCode::NOT_FOUND),
+            (KeyError::Forbidden, StatusCode::INTERNAL_SERVER_ERROR),
+            (KeyError::Invalid, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            assert_eq!(ApiError::from(e).status, status, "{e:?}");
+        }
+        assert_eq!(
+            ApiError::from(KeyError::Sealed).code,
+            ErrorCode::ContentUnavailable
         );
     }
 }

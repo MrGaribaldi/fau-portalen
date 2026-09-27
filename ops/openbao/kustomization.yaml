@@ -1,0 +1,17 @@
+# docs/key-service-design.md §4. #3424 deploys this together with the Helm chart
+# (helm-values.yaml) and runs configure.sh cluster once, with a root token Erik generates.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: openbao
+resources:
+  - k8s/namespace.yaml
+  - k8s/certificates.yaml
+  - k8s/networkpolicy.yaml
+  - k8s/operator.yaml
+  - k8s/cronjobs.yaml
+  - k8s/alerts.yaml
+configMapGenerator:
+  - name: fau-keys-scripts
+    files: [shred.sh, job.sh]
+generatorOptions:
+  disableNameSuffixHash: true

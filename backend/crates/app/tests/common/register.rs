@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -16,7 +17,9 @@ pub async fn admin_on_same_database(pool: &PgPool) -> PgPool {
         .fetch_one(pool)
         .await
         .expect("read current_database()");
-    PgPool::connect(&super::with_database(&super::admin_url(), &db))
+    PgPoolOptions::new()
+        .max_connections(super::TEST_POOL_MAX_CONNECTIONS)
+        .connect(&super::with_database(&super::admin_url(), &db))
         .await
         .expect("connect as superuser to the test database")
 }

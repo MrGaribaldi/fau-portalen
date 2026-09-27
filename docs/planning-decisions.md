@@ -2803,3 +2803,10 @@ Erik agreed the revised design (docs/key-service-design.md):
 
 ADR-003 decisions 5, 5a, 6 and 7 are amended. The 27 September hand-written implementation plan is
 superseded.
+
+## #3506 plan accepted and executed — 27 September 2026
+
+Erik accepted the OpenBao implementation plan (docs/superpowers/plans/2026-09-27-key-service-openbao.md),
+including its four rulings, and asked for it to be executed at once. Helm 4.3.0 was installed in the
+running agent session for rendering the chart values; it is baked into Dockerfile.agent for the next
+rebuild, which Erik starts after the work is done.

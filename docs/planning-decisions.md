@@ -2759,3 +2759,47 @@ Agent rulings open to challenge:
 - invitation keys are destroyed with the KEK only for now (spec §3.1).
 
 Erik asked for card 1's implementation plan to start the same evening.
+
+## OpenBao replaces the hand-written key service — 27 September 2026
+
+Reviewing the #3506 plan, Erik asked whether an open-source key service could replace one we would
+write and own. He then set a standing rule: **use battle-proven solutions wherever possible, and
+avoid implementing and owning code that is not part of FAU's core product.**
+
+He decided to use **OpenBao** (the Linux Foundation fork of Vault's last MPL-2.0 version; v2.7.0
+released 23 September 2026) and its transit engine. The engine provides named keys that never leave
+the service, XChaCha20-Poly1305 with associated data, data-key generation, key deletion gated by
+`deletion_allowed`, soft delete and restore, Shamir seal and unseal, audit devices, rate-limit
+quotas and per-path policies.
+
+The alternatives, rejected:
+- **Cosmian KMS:** BUSL-1.1, which is not open source.
+- **HashiCorp Vault:** BUSL-1.1, and US-owned.
+- **Tink:** a library, not a key service.
+
+Consequences:
+- docs/key-service-design.md is revised around OpenBao.
+- The 27 September implementation plan is superseded; it stays in git history.
+- Accepted losses: the lease-enforced ceiling becomes rate limits plus alerting, and the per-FAU KEK
+  hierarchy becomes flat keys deleted by prefix.
+- ADR-003's security model is otherwise unchanged.
+
+## Key service design with OpenBao agreed — 27 September 2026
+
+Erik agreed the revised design (docs/key-service-design.md):
+- **Envelope encryption.** OpenBao generates the data keys; only their wrapped form is stored, in
+  Postgres (`wrapped_keys`); the backend unwraps once per session and encrypts locally. Storing the
+  wrapped keys in OpenBao's KV store was rejected: two stores with no shared transaction, and two
+  deletion paths.
+- **ADR-003's rule becomes "no usable key material in the application database".** That is safe
+  because each transit key exists at the granularity it must be shredded at.
+- **The two #3418 messages use direct transit encryption.** The sealing pair and the
+  per-invitation keys are withdrawn.
+- **Custody:** Proton Pass holds the unseal key only. The root token is revoked after setup and
+  regenerated on demand (Erik offered to store tokens; revoking is OpenBao's own guidance, since a
+  standing root token bypasses every policy).
+- **Deployment:** OpenBao's official Helm chart, and a `bao` shell script for configuration and
+  deletion. `vaultrs` is the backend's client.
+
+ADR-003 decisions 5, 5a, 6 and 7 are amended. The 27 September hand-written implementation plan is
+superseded.

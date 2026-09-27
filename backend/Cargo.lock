@@ -722,8 +722,11 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "fau-crypto",
+ "fau-persistence",
+ "jiff",
  "reqwest",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

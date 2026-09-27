@@ -9,7 +9,10 @@ publish = false
 # vaultrs, the session cache, and the data-key flow over persistence. No crypto of its own.
 [dependencies]
 fau-crypto = { path = "../crypto" }
+fau-persistence = { path = "../persistence" }
 base64 = { workspace = true }
+jiff = { workspace = true }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }

@@ -81,8 +81,10 @@ Rules that fall out of the existing commands:
 
 - **A deletion request during the archive re-queues.** After 7a's confirmation, `shred.sh fau`
   rewrites each `archive` queue entry to `reason=fau` with `soft_deleted_at` set to now. The
-  365-day window becomes the 7-day one, counted from the confirmation. Today `soft()` skips a key
-  that is already soft-deleted, so this needs a new branch rather than the skip.
+  365-day window becomes the 7-day one, counted from the confirmation. `soft()` skips a key that
+  is already soft-deleted and queued. The #3506 final review added a branch that re-queues a
+  soft-deleted key with no queue entry. This rule is a third branch: an existing `archive` entry
+  is rewritten.
 - **Chat expiry keeps its promise during the archive.** A chat month under `reason=archive` that
   reaches 12 months must be destroyed on time. So `chat-expire` rewrites the entry to
   `reason=chat-expire` (keeping `soft_deleted_at`) rather than skipping the key. Otherwise a locked
@@ -121,7 +123,12 @@ would outlive the FAU indefinitely.
 | lock | the same | content locked; published pages stay up; any export stays for its 90 days; the destruction date; contact us to reactivate |
 | 30 days before destruction | the same | the destruction date; the last chance to pay |
 
-The destruction date is `soft_deleted_at + 365 days` from the queue, so the backend can compute it.
+**The backend cannot read the queue.** `fau-app` is denied `fau-keys-queue/` by design, and that
+denial is tested. So the application records the lock time on the tenant row when it moves the
+FAU to archived-locked. It computes the destruction date as that time plus 365 days. The operator
+runs `shred.sh archive` straight after the state change, so the two clocks agree to within the
+operator's delay, and the script's clock, which is the later of the two, is the one that destroys.
+The notice promises the application's date, so the FAU is never destroyed before it.
 These are transactional emails through the email provider (#3410), in Bokmål source strings with
 the localisation mechanism (#3439). They are not the in-app notifications that the #3500 design
 keeps in-app only.

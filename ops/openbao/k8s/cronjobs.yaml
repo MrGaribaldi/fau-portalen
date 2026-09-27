@@ -1,0 +1,70 @@
+# The 7-day finalize runs daily; chat expiry monthly. FAU deletion, document purge and restore
+# are run as one-off Jobs from this template by an operator (docs/key-service-operations.md).
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: fau-keys-finalize, namespace: openbao }
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        metadata: { labels: { app.kubernetes.io/name: fau-keys-operator } }
+        spec:
+          serviceAccountName: fau-keys-operator
+          restartPolicy: Never
+          securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+          containers:
+            - name: shred
+              image: openbao/openbao:2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315
+              command: ["/bin/sh", "/ops/job.sh", "finalize"]
+              env:
+                - { name: BAO_ADDR, value: "https://openbao.openbao.svc:8200" }
+                - { name: BAO_CACERT, value: /tls/ca.crt }
+              securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+              volumeMounts:
+                - { name: ops, mountPath: /ops }
+                - { name: tls, mountPath: /tls }
+          volumes:
+            - name: ops
+              configMap: { name: fau-keys-scripts }
+            - name: tls
+              secret: { secretName: openbao-server-tls, items: [{ key: ca.crt, path: ca.crt }] }
+---
+# Exit codes propagate all the way up (job.sh's comment): a Job that fails because finalize
+# refused a young chat month shows as a failed Kubernetes Job, which is what should alert
+# alongside KeyServiceShredCritical (ops/openbao/k8s/alerts.yaml).
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: fau-keys-chat-expire, namespace: openbao }
+spec:
+  schedule: "41 3 2 * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        metadata: { labels: { app.kubernetes.io/name: fau-keys-operator } }
+        spec:
+          serviceAccountName: fau-keys-operator
+          restartPolicy: Never
+          securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+          containers:
+            - name: shred
+              image: openbao/openbao:2.7.0@sha256:71156a1c6623a5fa3f5e61b0c6a8ead0faf0df29a778339188443551995d1315
+              command: ["/bin/sh", "/ops/job.sh", "chat-expire"]
+              env:
+                - { name: BAO_ADDR, value: "https://openbao.openbao.svc:8200" }
+                - { name: BAO_CACERT, value: /tls/ca.crt }
+              securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+              volumeMounts:
+                - { name: ops, mountPath: /ops }
+                - { name: tls, mountPath: /tls }
+          volumes:
+            - name: ops
+              configMap: { name: fau-keys-scripts }
+            - name: tls
+              secret: { secretName: openbao-server-tls, items: [{ key: ca.crt, path: ca.crt }] }

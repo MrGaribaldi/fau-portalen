@@ -1,0 +1,4 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: fau-keys-operator, namespace: openbao }
+automountServiceAccountToken: true

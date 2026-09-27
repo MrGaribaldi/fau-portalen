@@ -18,8 +18,14 @@
 //! `create_pending_tenant` (no tenant exists yet), `expire_pending_tenants` and
 //! `lapse_requests` (row locks and a READ COMMITTED re-check suffice). The read-only
 //! `effective_access` takes no lock and reads one REPEATABLE READ snapshot instead.
+//!
+//! **Authorization** (groups design §3.3, #3501): `authorize` is the one function that
+//! reads the database to decide what a membership may do with a resource. Every read path
+//! and every change-stream delivery goes through it or through `fau_domain::authz::decide`
+//! on the same facts.
 
 mod access;
+mod authz;
 mod error;
 mod handover;
 mod invitations;
@@ -30,6 +36,7 @@ mod sql;
 mod token;
 
 pub use access::effective_access;
+pub use authz::{authorize, read_transaction, Resource, Viewer};
 pub use error::{ExistingFau, MembershipError};
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{

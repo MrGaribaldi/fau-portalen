@@ -4,3 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+# The backend's use of OpenBao (docs/key-service-design.md §3, §6): a thin wrapper over
+# vaultrs, the session cache, and the data-key flow over persistence. No crypto of its own.
+[dependencies]
+fau-crypto = { path = "../crypto" }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+vaultrs = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+serde_json = { workspace = true }

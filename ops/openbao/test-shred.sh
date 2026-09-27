@@ -82,6 +82,8 @@ root_restore "$YK"; root_unqueue "$YK"
 # sweep under set -e: it is skipped (crit-logged), and the sweep still reaches later entries.
 M=$(cat /proc/sys/kernel/random/uuid); MK="fau-$M-record"
 mk "$MK"; root_soft_delete "$MK"; root_queue "$MK" reason=fau   # no soft_deleted_at field
+N=$(cat /proc/sys/kernel/random/uuid); NK="fau-$N-record"   # a non-numeric soft_deleted_at
+mk "$NK"; root_soft_delete "$NK"; root_queue "$NK" soft_deleted_at=yesterday reason=fau
 M2=$(cat /proc/sys/kernel/random/uuid); M2K="fau-$M2-record"
 mk "$M2K"; run $NOW fau "$M2"
 out=$(run $((NOW + 8*DAY)) finalize 2>&1) && rc=0 || rc=$?
@@ -90,8 +92,11 @@ echo "$out" | grep -q CRITICAL || fail "malformed entry logs CRITICAL: $out"
 [ "$(soft "$M2K")" = "gone" ] || fail "sweep continues past the malformed entry and destroys the next key"
 [ "$(soft "$MK")" = "true" ] || fail "malformed entry's key is left alone, not destroyed"
 queued "$MK" || fail "malformed entry stays queued for manual repair"
+[ "$(soft "$NK")" = "true" ] && queued "$NK" || fail "a non-numeric soft_deleted_at is skipped, not destroyed or unqueued"
+echo "$out" | grep -q "CRITICAL $NK" || fail "a non-numeric soft_deleted_at logs CRITICAL: $out"
 pass "finalize skips a queue entry missing soft_deleted_at instead of aborting the sweep"
-root_restore "$MK"; root_unqueue "$MK"
+pass "finalize skips a non-numeric soft_deleted_at"
+root_restore "$MK"; root_unqueue "$MK"; root_restore "$NK"; root_unqueue "$NK"
 
 # (b) Idempotency, for real: a second run over the SAME already-soft-deleted key, with a later
 # clock, must exit 0, log a skip, and must not reset soft_deleted_at (no re-arming the 7-day clock).
@@ -106,6 +111,56 @@ echo "$out" | grep -q skipped || fail "re-run logs a skip line: $out"
 at2=$(BAO_TOKEN=$ROOT bao read -field=soft_deleted_at "$Q/$IK")
 [ "$at1" = "$at2" ] || fail "re-run must not reset soft_deleted_at (was $at1, now $at2)"
 pass "idempotent: unchanged soft_deleted_at, exit 0, skip logged"
+
+# --- Final review fix round (R10) -------------------------------------------
+
+# I1: an unreachable server is a failure, never "nothing to do".
+out=$(BAO_ADDR=http://127.0.0.1:1 run $NOW fau "$T" 2>&1) && rc=0 || rc=$?
+[ "$rc" = 1 ] || fail "fau against an unreachable server must exit 1 (rc=$rc): $out"
+echo "$out" | grep -q CRITICAL || fail "unreachable server logs CRITICAL: $out"
+out=$(BAO_ADDR=http://127.0.0.1:1 run $NOW finalize 2>&1) && rc=0 || rc=$?
+[ "$rc" = 1 ] || fail "finalize against an unreachable server must exit 1 (rc=$rc): $out"
+pass "an unreachable server exits 1 for fau and finalize"
+
+# I1: a token that may not list or read is a failure, and finalize unqueues nothing.
+P=$(cat /proc/sys/kernel/random/uuid); PK="fau-$P-record"
+mk "$PK"; run $NOW fau "$P"
+out=$(BAO_TOKEN=dev-only-app SHRED_NOW=$((NOW + 8*DAY)) sh "$S" finalize 2>&1) && rc=0 || rc=$?
+[ "$rc" != 0 ] || fail "finalize with a token that cannot list must fail: $out"
+out=$(BAO_TOKEN=dev-only-app SHRED_NOW=$NOW sh "$S" fau "$P" 2>&1) && rc=0 || rc=$?
+[ "$rc" != 0 ] || fail "fau with a token that cannot list must fail: $out"
+# A token that can list the queue but not read key metadata: a transient read failure in
+# finalize. It must exit 1 with CRITICAL and must not take the "restored out of band" branch.
+BAO_TOKEN=$ROOT bao policy write test-shred-no-key-read - >/dev/null <<'HCL'
+path "fau-keys-queue" { capabilities = ["list"] }
+path "fau-keys-queue/+" { capabilities = ["read"] }
+HCL
+NOREAD=$(BAO_TOKEN=$ROOT bao token create -policy=test-shred-no-key-read -ttl=10m -field=token)
+out=$(BAO_TOKEN=$NOREAD SHRED_NOW=$((NOW + 8*DAY)) sh "$S" finalize 2>&1) && rc=0 || rc=$?
+[ "$rc" = 1 ] || fail "finalize must exit 1 when it cannot read a key's metadata (rc=$rc): $out"
+echo "$out" | grep -q CRITICAL || fail "a failed metadata read logs CRITICAL: $out"
+queued "$PK" || fail "a failed metadata read must not unqueue the entry"
+[ "$(soft "$PK")" = "true" ] || fail "a failed metadata read leaves the key soft-deleted"
+pass "a token without permission fails and unqueues nothing"
+root_restore "$PK"; root_unqueue "$PK"
+
+# I1: fau matching zero keys (a wrong tenant) is a failure with its own exit code.
+U=$(cat /proc/sys/kernel/random/uuid)
+out=$(run $NOW fau "$U" 2>&1) && rc=0 || rc=$?
+[ "$rc" = 4 ] || fail "fau with an unknown tenant must exit 4 (rc=$rc): $out"
+echo "$out" | grep -q CRITICAL || fail "fau with an unknown tenant logs CRITICAL: $out"
+pass "fau with an unknown tenant exits 4"
+
+# I2: a key soft-deleted without a queue entry (a crash between the two writes) is re-queued.
+Z=$(cat /proc/sys/kernel/random/uuid); ZK="fau-$Z-record"
+mk "$ZK"; root_soft_delete "$ZK"
+out=$(run $NOW fau "$Z" 2>&1) && rc=0 || rc=$?
+[ "$rc" = 0 ] || fail "re-queueing exits 0 (rc=$rc): $out"
+echo "$out" | grep -q "CRITICAL.*re-queued" || fail "re-queueing logs CRITICAL: $out"
+[ "$(BAO_TOKEN=$ROOT bao read -field=reason "$Q/$ZK")" = fau ] || fail "re-queued with reason=fau"
+[ "$(BAO_TOKEN=$ROOT bao read -field=soft_deleted_at "$Q/$ZK")" = "$NOW" ] || fail "re-queued at now"
+pass "a soft-deleted but unqueued key is re-queued"
+root_restore "$ZK"; root_unqueue "$ZK"
 
 if run $NOW nonsense 2>/dev/null; then fail "unknown command must fail"; fi
 pass "bad input"

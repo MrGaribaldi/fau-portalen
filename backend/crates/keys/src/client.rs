@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -84,6 +85,8 @@ pub struct KeysConfig {
 pub struct Keys {
     client: RwLock<VaultClient>,
     cfg: KeysConfig,
+    /// False until the first successful Kubernetes login; always true for `Auth::Token`.
+    logged_in: AtomicBool,
 }
 
 impl fmt::Debug for Keys {
@@ -101,6 +104,10 @@ fn decode32(b64: &str) -> Result<DataKey, KeyError> {
 }
 
 impl Keys {
+    /// Builds the client without talking to OpenBao: login is lazy, in the first call, so the
+    /// backend starts and serves login and authorization while OpenBao is sealed or
+    /// unreachable, and each request that needs content gets `Sealed` or `Unavailable`
+    /// (spec §4.2, §6). Only a malformed configuration fails here.
     pub async fn connect(cfg: KeysConfig) -> Result<Self, KeyError> {
         let mut s = VaultClientSettingsBuilder::default();
         s.address(&cfg.address).timeout(Some(cfg.timeout));
@@ -112,12 +119,12 @@ impl Keys {
         }
         let client = VaultClient::new(s.build().map_err(|_| KeyError::Invalid)?)
             .map_err(|_| KeyError::Invalid)?;
-        let keys = Self {
+        let logged_in = AtomicBool::new(matches!(cfg.auth, Auth::Token(_)));
+        Ok(Self {
             client: RwLock::new(client),
             cfg,
-        };
-        keys.login().await?;
-        Ok(keys)
+            logged_in,
+        })
     }
 
     async fn login(&self) -> Result<(), KeyError> {
@@ -132,15 +139,20 @@ impl Keys {
                 .await
                 .map_err(map_err)?;
             c.set_token(&info.client_token);
+            self.logged_in.store(true, Ordering::Release);
         }
         Ok(())
     }
 
-    /// One retry after re-login on 403, for an expired Kubernetes auth token (plan ruling 4).
+    /// Logs in first if no login has succeeded yet, then one retry after re-login on 403, for
+    /// an expired Kubernetes auth token (plan ruling 4).
     async fn call<T>(
         &self,
         f: impl for<'a> Fn(&'a VaultClient) -> Call<'a, T>,
     ) -> Result<T, KeyError> {
+        if !self.logged_in.load(Ordering::Acquire) {
+            self.login().await?;
+        }
         let first = {
             let c = self.client.read().await;
             f(&c).await

@@ -6,7 +6,16 @@ use std::time::Duration;
 use fau_crypto::{Aad, ChatMonth, Unit};
 use fau_keys::{Auth, KeyError, Keys, KeysConfig};
 use reqwest::StatusCode;
+use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Task 2's `sys/quotas/rate-limit/fau-transit` caps `transit/` at 50 req/s cluster-wide
+/// (docs/key-service-design.md §4.3, tuned under #3442) — a production number, not a test-
+/// suite one. Running these tests' `#[tokio::test]`s concurrently (the default) easily bursts
+/// past it, so a forbidden-path assertion can observe 429 instead of 403 and fail for a reason
+/// that has nothing to do with policy. This lock forces the file's tests to run one at a time;
+/// it does not touch what any assertion checks.
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
 fn addr() -> String {
     std::env::var("TEST_OPENBAO_ADDR").expect("TEST_OPENBAO_ADDR")
@@ -44,6 +53,7 @@ async fn raw(
 
 #[tokio::test]
 async fn a_data_key_unwraps_to_the_same_bytes() {
+    let _serial = SERIAL.lock().await;
     let keys = app().await;
     let unit = Unit::Record {
         tenant: Uuid::now_v7(),
@@ -58,6 +68,7 @@ async fn a_data_key_unwraps_to_the_same_bytes() {
 
 #[tokio::test]
 async fn a_wrapped_key_opens_only_under_its_own_unit() {
+    let _serial = SERIAL.lock().await;
     let keys = app().await;
     let tenant = Uuid::now_v7();
     let (_, wrapped) = keys.new_data_key(&Unit::Record { tenant }).await.unwrap();
@@ -85,6 +96,7 @@ async fn a_wrapped_key_opens_only_under_its_own_unit() {
 
 #[tokio::test]
 async fn messages_round_trip_and_are_bound_to_their_row() {
+    let _serial = SERIAL.lock().await;
     let keys = app().await;
     let tenant = Uuid::now_v7();
     let aad = Aad::new(
@@ -116,6 +128,7 @@ async fn messages_round_trip_and_are_bound_to_their_row() {
 
 #[tokio::test]
 async fn soft_delete_stops_use_restore_brings_it_back_and_hard_delete_is_final() {
+    let _serial = SERIAL.lock().await;
     let keys = app().await;
     let unit = Unit::Record {
         tenant: Uuid::now_v7(),
@@ -179,6 +192,7 @@ async fn soft_delete_stops_use_restore_brings_it_back_and_hard_delete_is_final()
 
 #[tokio::test]
 async fn the_policies_allow_exactly_what_the_spec_says() {
+    let _serial = SERIAL.lock().await;
     use reqwest::Method as M;
     let keys = app().await;
     let unit = Unit::Record {
@@ -264,4 +278,116 @@ async fn the_policies_allow_exactly_what_the_spec_says() {
     )
     .await
     .is_success());
+}
+
+/// The previous test only ever calls the operator's *allowed* config/soft-delete/restore/hard-
+/// delete/queue paths with the root token, which bypasses policy entirely — so an over- or
+/// under-scoped `fau-keys-operator` policy would go unnoticed. Here every one of those calls uses
+/// the `dev-only-operator` token itself, on a key the app client created.
+#[tokio::test]
+async fn the_operator_can_destroy_and_queue_with_its_own_token() {
+    let _serial = SERIAL.lock().await;
+    use reqwest::Method as M;
+    let keys = app().await;
+    let unit = Unit::Record {
+        tenant: Uuid::now_v7(),
+    };
+    let (_, wrapped) = keys.new_data_key(&unit).await.unwrap();
+    let k = unit.key_name();
+    let op = "dev-only-operator";
+
+    // 1. Allow hard delete up front.
+    assert!(raw(
+        op,
+        M::POST,
+        &format!("transit/keys/{k}/config"),
+        Some(serde_json::json!({"deletion_allowed": true}))
+    )
+    .await
+    .is_success());
+
+    // 2. Soft-delete stops the app from using the key.
+    assert!(raw(
+        op,
+        M::DELETE,
+        &format!("transit/keys/{k}/soft-delete"),
+        None
+    )
+    .await
+    .is_success());
+    assert_eq!(
+        keys.unwrap(&unit, &wrapped).await.unwrap_err(),
+        KeyError::NotFound
+    );
+
+    // 3. Restore brings it back.
+    assert!(raw(
+        op,
+        M::POST,
+        &format!("transit/keys/{k}/soft-delete-restore"),
+        None
+    )
+    .await
+    .is_success());
+    assert!(keys.unwrap(&unit, &wrapped).await.is_ok());
+
+    // 4. Soft-delete again, then hard delete (deletion_allowed already true) is final.
+    assert!(raw(
+        op,
+        M::DELETE,
+        &format!("transit/keys/{k}/soft-delete"),
+        None
+    )
+    .await
+    .is_success());
+    assert!(raw(op, M::DELETE, &format!("transit/keys/{k}"), None)
+        .await
+        .is_success());
+    assert_eq!(
+        keys.unwrap(&unit, &wrapped).await.unwrap_err(),
+        KeyError::NotFound
+    );
+
+    // 5. The 7-day deletion queue, exercised end to end with the operator's own token.
+    assert!(raw(
+        op,
+        M::POST,
+        &format!("fau-keys-queue/{k}"),
+        Some(serde_json::json!({"soft_deleted_at": "1790500000"}))
+    )
+    .await
+    .is_success());
+    assert!(raw(op, M::GET, &format!("fau-keys-queue/{k}"), None)
+        .await
+        .is_success());
+    assert!(
+        raw(op, M::from_bytes(b"LIST").unwrap(), "fau-keys-queue", None)
+            .await
+            .is_success()
+    );
+    assert!(raw(op, M::DELETE, &format!("fau-keys-queue/{k}"), None)
+        .await
+        .is_success());
+
+    // 6. The operator cannot write outside its granted paths.
+    let unit2 = Unit::Record {
+        tenant: Uuid::now_v7(),
+    };
+    let k2 = unit2.key_name();
+    assert_eq!(
+        raw(op, M::POST, &format!("transit/keys/{k2}"), None).await,
+        StatusCode::FORBIDDEN,
+        "operator must not create a transit key"
+    );
+    assert_eq!(
+        raw(
+            op,
+            M::POST,
+            "sys/policies/acl/x",
+            Some(serde_json::json!({"policy": "path \"*\" { capabilities = [\"read\"] }"}))
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "operator must not write policies"
+    );
 }

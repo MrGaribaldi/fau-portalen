@@ -1008,6 +1008,7 @@ async fn allowed_values(pool: &sqlx::PgPool, table: &str, constraint: &str) -> V
 async fn check_constraints_allow_exactly_the_domain_code_sets() {
     use fau_domain::membership::vocabulary::{
         CapabilityClass, InvitationMode, RecoveryHolder, RequestKind, RequestStatus, TenantStatus,
+        Visibility,
     };
     let db = TestDb::migrated().await;
     let pool = db.admin_pool();
@@ -1025,6 +1026,11 @@ async fn check_constraints_allow_exactly_the_domain_code_sets() {
             "roles",
             "roles_capability_class_check",
             codes(CapabilityClass::ALL, CapabilityClass::code),
+        ),
+        (
+            "groups",
+            "groups_visibility_check",
+            codes(Visibility::ALL, Visibility::code),
         ),
         (
             "invitations",

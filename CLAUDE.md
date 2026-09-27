@@ -209,6 +209,28 @@ in that order). Binding before anything is built:
 - The calendar feed is redacted and never touches the key service.
 - Notifications are in-app only; an email digest may be a paid add-on.
 
+**The key service comes first** (Erik, 26 September) and is **OpenBao** (27 September, after his
+rule to prefer battle-proven components over code we own): #3506 (docs/key-service-design.md, plan
+docs/superpowers/plans/2026-09-27-key-service-openbao.md, accepted and **implemented**: all 9 tasks
+and the final review done 27 September, suite green, merged to `main` as PR #4; nothing applied to the cluster — deploying is #3424, and OpenBao 2.7 has dropped mlock, so
+the nodes must run without swap) blocks
+#3501–#3504 and #3419; the replica #3507 gates the pilot (#3432). The model is envelope encryption:
+- one transit key per shreddable unit;
+- the wrapped data keys are stored in Postgres `wrapped_keys`, which is safe only because each
+  transit key exists at the granularity it must be shredded at;
+- the backend unwraps once per session and encrypts locally;
+- messages use transit encrypt directly;
+- deletion is `ops/openbao/shred.sh` (soft delete, then hard delete after 7 days).
+
+**Archiving for non-payment** (#3509, docs/fau-archive-design.md, awaiting Erik's review) is paused,
+not deleted. It is read-only first with keys live, then keys are soft-deleted for up to 365 days.
+Published pages stay online, and exports last 90 days under their own key. It builds on shred.sh's
+queue `reason` field. The terms and the DPA must allow the retention before it ships.
+
+Policies use `+`, never `*`: a `*` grants `/config` and `/trim`. **`bao operator init`, `unseal`
+and `generate-root` are Erik's alone, on his own terminal**; there is no standing root token. Helm 4.3.0
+is in the agent image (rebuilt 27 September).
+
 Open with the user: #3481, #3485, #3447, #3488 and #3489 in Waiting. #3485 the next stage 2 pass, #3487 the infra-tools raw-chart issue and #3486 the
 favro-cli attachment issue. **#3490 is accepted and Done**, and #3420 is closed with its
 requirements moved into that architecture — so #3416, #3419, #3421, #3422, #3491 and #3492 have

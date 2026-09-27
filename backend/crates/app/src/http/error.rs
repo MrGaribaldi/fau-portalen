@@ -17,9 +17,9 @@ use super::request_context::current_request_id;
 /// carries the request id via [`current_request_id`], not a field a constructor
 /// could forget to set.
 pub struct ApiError {
-    pub(crate) code: ErrorCode,
+    code: ErrorCode,
     params: BTreeMap<String, ParamValue>,
-    pub(crate) status: StatusCode,
+    status: StatusCode,
 }
 
 impl ApiError {

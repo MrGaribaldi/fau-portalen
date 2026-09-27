@@ -2810,3 +2810,18 @@ Erik accepted the OpenBao implementation plan (docs/superpowers/plans/2026-09-27
 including its four rulings, and asked for it to be executed at once. Helm 4.3.0 was installed in the
 running agent session for rendering the chart values; it is baked into Dockerfile.agent for the next
 rebuild, which Erik starts after the work is done.
+
+## Load testing with k6, baseline 1,000 simultaneous editors — 27 September 2026
+
+Erik asked how many concurrent users the setup can serve at 1,000 FAU-er with 20 members each
+(20,000 accounts), with evening peaks likely. The agent's first-principles estimate:
+- about 2,000 concurrent sessions and about 400 requests/second at peak;
+- that needs only a handful of busy database connections;
+- Postgres's node size is the real constraint, and a dedicated 4-vCPU node is recommended at that
+  scale;
+- the SSE stream must use one `LISTEN` connection per pod, never one per viewer.
+
+Erik decided to measure it rather than trust the estimate: **k6** load tests, with a **baseline of
+1,000 simultaneous connections editing documents**, tracked on #3508. It waits on the document
+authority (#3419) and a staging deployment (#3424). k6 is an internal tool run against our own
+staging, never k6 Cloud.

@@ -85,9 +85,11 @@
 - `vaultrs` 0.8 has `transit::key::create`, `transit::generate::data_key`
   (`DataKeyType::{Plaintext, Wrapped}`), and `transit::data::{encrypt, decrypt}` with
   `associated_data` on both builders. It sends `X-Vault-Token`, which OpenBao accepts.
-- **Helm is not installed in the agent container.** Task 9 writes the chart values, but renders
-  them only where `helm` exists, or leaves that to #3424. Adding `helm` to `Dockerfile.agent` is a
-  separate change needing an image rebuild.
+- **Helm was not installed in the agent container.** Erik had it added to `Dockerfile.agent`
+  (Helm 4.3.0, checksummed) on 27 September; it takes effect after the next image rebuild and
+  restart. If `helm version` works when Task 9 runs, render the values with
+  `helm repo add openbao https://openbao.github.io/openbao-helm && helm template openbao openbao/openbao --version 0.29.6 -n openbao -f ops/openbao/helm-values.yaml > /dev/null`.
+  Otherwise leave rendering to #3424.
 
 ## Rulings this plan makes (for Erik's review)
 

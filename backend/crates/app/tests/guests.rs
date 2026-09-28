@@ -10,9 +10,9 @@ use fau_domain::authz::{Action, Denied};
 use fau_domain::membership::access::Capability;
 use fau_domain::membership::vocabulary::{CapabilityClass, RoleName, Visibility};
 use fau_persistence::membership::{
-    archive_group, authorize, create_handover_grants, effective_access, grant_role,
-    issue_invitation, ArchiveGroup, GrantRole, IssueInvitation, MembershipError, OfferedRole,
-    Resource, RoleChoice, Viewer,
+    accept_invitation, archive_group, authorize, create_handover_grants, effective_access,
+    grant_role, issue_invitation, resend_invitation, AcceptInvitation, ArchiveGroup, GrantRole,
+    InvitationChange, IssueInvitation, MembershipError, OfferedRole, Resource, RoleChoice, Viewer,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -316,4 +316,213 @@ async fn a_handover_grant_cannot_invite_a_guest() {
     )
     .await
     .expect("the handover still offers the admin role it exists for");
+}
+
+#[tokio::test]
+async fn a_handover_holder_offering_an_existing_guest_role_on_an_archived_group_gets_not_authorized(
+) {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "gammel@example.test", t0).await;
+    grant_role(
+        &pool,
+        GrantRole {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: fau.admin_membership_id,
+            role: new_role("Medlem", CapabilityClass::Member),
+            period: period(day(2026, 9, 23), day(2028, 9, 1)),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let group = seed_group(&pool, &fau, Visibility::Open).await;
+    let guest = seed_role(
+        &pool,
+        fau.tenant_id,
+        CapabilityClass::Guest,
+        Some(group),
+        None,
+        None,
+    )
+    .await;
+    archive_group(
+        &pool,
+        ArchiveGroup {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            group_id: group,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let inside = at("2027-11-01T10:00:00Z");
+    create_handover_grants(&pool, inside).await.unwrap();
+    let grant_id: Uuid =
+        sqlx::query_scalar("select id from handover_grants where source_assignment_id = $1")
+            .bind(fau.admin_assignment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    // Not `GroupArchived`: a handover holder is never authorized to offer a guest role at
+    // all (Ruling R17), so the archived group's state must not leak through the error
+    // (Ruling P12 fix round 1).
+    assert_eq!(
+        issue_invitation(
+            &pool,
+            IssueInvitation {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                recipient: email("ny@example.test"),
+                roles: vec![OfferedRole {
+                    role: RoleChoice::Existing(guest),
+                    period: period(day(2027, 11, 1), day(2028, 10, 1)),
+                }],
+                handover_grant_id: Some(grant_id),
+                message: None,
+            },
+            inside,
+        )
+        .await
+        .unwrap_err(),
+        MembershipError::NotAuthorized
+    );
+}
+
+#[tokio::test]
+async fn a_non_guest_roles_audit_names_no_group() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let member = add_member(
+        &pool,
+        &fau,
+        "member@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2027, 9, 1)),
+        t0,
+    )
+    .await;
+    let created: String = sqlx::query_scalar(
+        "select params::text from audit_events where action = 'role.created' and subject_id = (
+           select role_id from role_assignments where membership_id = $1)",
+    )
+    .bind(member.membership_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["capability_class"], "member");
+    assert_eq!(created["group_id"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn a_guest_role_cannot_name_another_tenants_group() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let other_fau = active_fau(&pool, "other-admin@example.test", t0).await;
+    let foreign_group = seed_group(&pool, &other_fau, Visibility::Open).await;
+    assert_eq!(
+        issue_invitation(&pool, invite(&fau, guest_role(Some(foreign_group))), t0)
+            .await
+            .unwrap_err(),
+        MembershipError::UnknownGroup,
+        "a group id scoped to another tenant is unknown, not merely archived"
+    );
+}
+
+#[tokio::test]
+async fn accepting_a_guest_invitation_whose_group_was_archived_meanwhile_is_refused() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let group = seed_group(&pool, &fau, Visibility::Open).await;
+    let issued = issue_invitation(&pool, invite(&fau, guest_role(Some(group))), t0)
+        .await
+        .unwrap();
+    archive_group(
+        &pool,
+        ArchiveGroup {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            group_id: group,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+
+    let memberships_before = count(&pool, "select count(*) from memberships").await;
+    let assignments_before = count(&pool, "select count(*) from role_assignments").await;
+    assert_eq!(
+        accept_invitation(
+            &pool,
+            AcceptInvitation {
+                token: issued.token.expose().to_owned(),
+                acceptor: verified("gjest@example.test"),
+                admin_end_override: None,
+            },
+            t0,
+        )
+        .await
+        .unwrap_err(),
+        MembershipError::GroupArchived
+    );
+    assert_eq!(
+        count(&pool, "select count(*) from memberships").await,
+        memberships_before,
+        "no membership is seated"
+    );
+    assert_eq!(
+        count(&pool, "select count(*) from role_assignments").await,
+        assignments_before,
+        "no role assignment is seated"
+    );
+}
+
+#[tokio::test]
+async fn resending_a_guest_invitation_whose_group_was_archived_meanwhile_is_refused() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let group = seed_group(&pool, &fau, Visibility::Open).await;
+    let issued = issue_invitation(&pool, invite(&fau, guest_role(Some(group))), t0)
+        .await
+        .unwrap();
+    archive_group(
+        &pool,
+        ArchiveGroup {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            group_id: group,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resend_invitation(
+            &pool,
+            InvitationChange {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                invitation_id: issued.invitation_id,
+            },
+            t0,
+        )
+        .await
+        .unwrap_err(),
+        MembershipError::GroupArchived,
+        "resending must not re-arm a guest invitation for another 14 days"
+    );
 }

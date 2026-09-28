@@ -234,6 +234,51 @@ async fn revoking_a_role_discards_whatever_was_already_buffered() {
     );
 }
 
+/// The other half of fix round 1's I1: a viewer whose standing has ended (so dispatch
+/// answers `NoAccess`) is closed without first reading what was already buffered, exactly
+/// as `revoking_a_role_discards_whatever_was_already_buffered` proves for `AccessRevoked`.
+#[tokio::test]
+async fn a_stream_whose_standing_ends_discards_whatever_was_already_buffered() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+    let (hub, now) = hub(&db).await;
+    // member_out's role ends on 1 September 2027; the registrant's admin role on 1 October.
+    // Subscribed in this order because dispatch visits a tenant's subscribers in
+    // subscription order: the member is decided before the bystander is sent anything.
+    let mut member = hub.subscribe(w.viewer("member_out")).await.unwrap();
+    let mut bystander = hub.subscribe(w.viewer("admin_in")).await.unwrap();
+
+    // Two changes the member may still read, left unread in its channel while the
+    // bystander reads along.
+    for _ in 0..2 {
+        announce(
+            &pool,
+            w.fau.tenant_id,
+            Change::Changed(Resource::Group(w.open)),
+        )
+        .await;
+        assert_eq!(next(&mut bystander).await, Some(Resource::Group(w.open)));
+    }
+
+    *now.lock().unwrap() = "2027-09-01T10:00:00Z".parse().unwrap();
+    announce(
+        &pool,
+        w.fau.tenant_id,
+        Change::Changed(Resource::Group(w.open)),
+    )
+    .await;
+    // The bystander hearing it means the dispatch has already found the member without
+    // standing and closed it.
+    assert_eq!(next(&mut bystander).await, Some(Resource::Group(w.open)));
+
+    assert_eq!(
+        next(&mut member).await,
+        None,
+        "lost standing discards whatever was already buffered, rather than delivering it first"
+    );
+}
+
 #[tokio::test]
 async fn a_guest_may_subscribe_and_a_person_without_standing_may_not() {
     let db = TestDb::migrated().await;

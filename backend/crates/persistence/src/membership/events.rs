@@ -122,13 +122,13 @@ pub type HubClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 /// `Receiver::recv` still drains everything already queued before it returns `None`, and a
 /// revoked viewer must not go on reading changes it saw while it still had access.
 ///
-/// `close()` sets the flag before notifying, and [`Subscription::recv`] checks the flag
-/// before it creates its `Notified` future, then re-checks by racing that future against
-/// `receiver.recv()`, `biased` so a pending close always wins over a buffered item. Two
-/// bracketing accesses, not one -- to avoid a race, [`Subscription::recv`] must create the
-/// `Notified` future *before* its flag check (see `tokio::sync::Notify`'s own
-/// documentation): `notify_waiters` only wakes futures that already exist, so one created
-/// after the check could miss a `close()` that lands in between.
+/// `close()` sets the flag before notifying. [`Subscription::recv`] first creates its
+/// `Notified` future, then checks the flag, then races that future against
+/// `receiver.recv()`, `biased` so a pending close always wins over a buffered item. The
+/// order is what makes it race-free (see `tokio::sync::Notify`'s own documentation):
+/// `notify_waiters` only wakes futures that already exist, so a future created after the
+/// flag check could miss a `close()` landing in between; created before it, any `close()`
+/// is either seen by the check or wakes the future.
 struct CloseSignal {
     closed: AtomicBool,
     notify: Notify,
@@ -177,8 +177,7 @@ impl Hub {
     /// Connects the LISTEN connection (taken from `pool` for the hub's lifetime) and starts
     /// the listener task, which ends when the last clone of the hub is dropped.
     pub async fn start(pool: PgPool, clock: HubClock) -> Result<Self, MembershipError> {
-        let mut listener = PgListener::connect_with(&pool).await?;
-        listener.listen(EVENTS_CHANNEL).await?;
+        let listener = connect_listener(&pool).await?;
         let inner = Arc::new(HubInner {
             pool,
             clock,
@@ -432,6 +431,44 @@ impl HubInner {
     }
 }
 
+/// The hub's LISTEN connection: a fresh connection from `pool`, listening on
+/// [`EVENTS_CHANNEL`] only.
+async fn connect_listener(pool: &PgPool) -> Result<PgListener, sqlx::Error> {
+    let mut listener = PgListener::connect_with(pool).await?;
+    listener.listen(EVENTS_CHANNEL).await?;
+    Ok(listener)
+}
+
+/// Replaces a listener whose `try_recv` failed with one built afresh by
+/// [`connect_listener`], retrying every second until that succeeds. `None` once the hub is
+/// gone.
+///
+/// Never re-listens on `failed` (final review I1). sqlx 0.8.6's `try_recv` drops a dead
+/// connection itself only for `ConnectionAborted`, `UnexpectedEof`, `TimedOut` and
+/// `BrokenPipe`; any other error (a `ConnectionReset`, a protocol error) comes back as
+/// `Err` with the dead connection still held, and `PgListener::listen` reconnects only when
+/// it holds none -- so retrying `listen` on the same listener would reuse the dead socket
+/// forever, and the hub would go deaf. Rebuilding also avoids `listen` pushing the channel
+/// onto the listener's list a second time on every recovery.
+///
+/// Holds only the `Weak` between attempts, and a pool handle only during one, so a hub
+/// dropped meanwhile ends this at the next attempt; every await point is safe to cancel
+/// (the hub aborts its listener task when dropped).
+async fn rebuild_listener(failed: PgListener, weak: &Weak<HubInner>) -> Option<PgListener> {
+    drop(failed);
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let pool = weak.upgrade()?.pool.clone();
+        match connect_listener(&pool).await {
+            Ok(listener) => return Some(listener),
+            Err(e) => tracing::warn!(
+                kind = %safe_error_kind(&e),
+                "change listener could not reconnect; retrying"
+            ),
+        }
+    }
+}
+
 async fn listen(mut listener: PgListener, weak: Weak<HubInner>) {
     loop {
         let next = listener.try_recv().await;
@@ -453,25 +490,20 @@ async fn listen(mut listener: PgListener, weak: Weak<HubInner>) {
                 tracing::warn!(kind = %safe_error_kind(&e), "change listener failed; closing every stream");
                 hub.close_all();
                 drop(hub);
-                // sqlx's own eager reconnect already failed once to get here (fix round 1,
-                // I3): left alone, the *next* `try_recv()` would reconnect and re-listen
-                // silently inside itself, with no return to this loop to close streams
-                // again -- so a viewer that subscribed during the outage, or a
-                // `AccessRevoked` sent while nobody here was listening, would never be
-                // told. Instead: force the reconnect ourselves, retrying on the same
-                // backoff, and only once `listen` succeeds, close every stream again --
-                // whether it predates the failure or was opened during it, none of them
-                // can be trusted to have seen everything since the connection dropped.
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    match listener.listen(EVENTS_CHANNEL).await {
-                        Ok(()) => break,
-                        Err(e) => tracing::warn!(
-                            kind = %safe_error_kind(&e),
-                            "change listener could not reconnect; retrying"
-                        ),
-                    }
-                }
+                // Either sqlx's own eager reconnect already failed, or sqlx kept a dead
+                // connection (see `rebuild_listener`). Left alone, the *next* `try_recv()`
+                // would at best reconnect and re-listen silently inside itself, with no
+                // return to this loop to close streams again (fix round 1, I3) -- so a
+                // viewer that subscribed during the outage, or an `AccessRevoked` sent
+                // while nobody here was listening, would never be told -- and at worst
+                // never recover. Instead: drop this listener, build a fresh one on the same
+                // backoff, and only once it listens, close every stream again -- whether
+                // it predates the failure or was opened during it, none of them can be
+                // trusted to have seen everything since the connection dropped.
+                let Some(rebuilt) = rebuild_listener(listener, &weak).await else {
+                    return;
+                };
+                listener = rebuilt;
                 let Some(hub) = weak.upgrade() else {
                     return;
                 };
@@ -487,6 +519,90 @@ async fn listen(mut listener: PgListener, weak: Weak<HubInner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    /// A hub's inner state on the shared test database, without a listener task: enough
+    /// to drive [`rebuild_listener`] directly.
+    async fn inner() -> Arc<HubInner> {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is set");
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .expect("connect to the test database");
+        Arc::new(HubInner {
+            pool,
+            clock: Arc::new(Timestamp::now),
+            subscribers: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            listener: Mutex::new(None),
+        })
+    }
+
+    /// Final review I1: sqlx drops a dead LISTEN connection itself only for four I/O error
+    /// kinds; for any other error `try_recv` returns `Err` and keeps the dead connection,
+    /// and `PgListener::listen` reconnects only when it holds none -- so re-listening on the
+    /// same listener would reuse the dead socket forever. A listener whose backend was
+    /// terminated, and which nobody has polled since, is in exactly that state: sqlx still
+    /// holds the dead connection. The recovery must hand back a listener that hears new
+    /// notifications.
+    #[tokio::test]
+    async fn a_failed_listener_is_rebuilt_on_a_fresh_connection() {
+        let inner = inner().await;
+        let pool = inner.pool.clone();
+        let mut failed = connect_listener(&pool).await.expect("connect the listener");
+        let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+            .fetch_one(&mut failed)
+            .await
+            .expect("the listener's backend pid");
+        let terminated: bool = sqlx::query_scalar("select pg_terminate_backend($1, 5000)")
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .expect("terminate the listener's backend");
+        assert!(terminated, "the listener's backend is gone");
+
+        let mut rebuilt = tokio::time::timeout(
+            Duration::from_secs(10),
+            rebuild_listener(failed, &Arc::downgrade(&inner)),
+        )
+        .await
+        .expect("a rebuilt listener within ten seconds")
+        .expect("the hub is still alive");
+
+        let tenant = Uuid::now_v7();
+        let mut conn = pool.acquire().await.unwrap();
+        notify(&mut conn, tenant, Change::Changed(Resource::Fau))
+            .await
+            .unwrap();
+        let heard = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = rebuilt.recv().await.expect("the rebuilt listener works");
+                if let Some((t, change)) = Change::parse(n.payload()) {
+                    if t == tenant {
+                        return change;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the rebuilt listener hears a new notification within five seconds");
+        assert_eq!(heard, Change::Changed(Resource::Fau));
+    }
+
+    /// The retry loop holds only a `Weak`: once the hub is gone it gives up rather than
+    /// reconnecting for nobody.
+    #[tokio::test]
+    async fn rebuilding_stops_once_the_hub_is_gone() {
+        let inner = inner().await;
+        let failed = connect_listener(&inner.pool).await.unwrap();
+        let weak = Arc::downgrade(&inner);
+        drop(inner);
+        let rebuilt = tokio::time::timeout(Duration::from_secs(5), rebuild_listener(failed, &weak))
+            .await
+            .expect("gives up within five seconds");
+        assert!(rebuilt.is_none());
+    }
 
     #[test]
     fn a_payload_carries_ids_and_a_kind_only() {

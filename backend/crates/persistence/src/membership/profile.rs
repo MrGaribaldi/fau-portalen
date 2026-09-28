@@ -62,8 +62,20 @@ pub(crate) fn check_contact_email(ct: &Ciphertext) -> Result<(), MembershipError
     }
 }
 
+/// The id must be a UUIDv7, the same as every other id this schema mints (fix round 1,
+/// Q10): `Uuid::nil()` and every other version fail this too, since `get_version` only
+/// returns `Some(Version::SortRand)` for one.
+pub(crate) fn check_membership_id(id: Uuid) -> Result<(), MembershipError> {
+    if id.get_version() == Some(uuid::Version::SortRand) {
+        Ok(())
+    } else {
+        Err(MembershipError::MembershipIdMalformed)
+    }
+}
+
 impl MemberProfile {
     pub(crate) fn check(&self) -> Result<(), MembershipError> {
+        check_membership_id(self.membership_id)?;
         check_display_name(&self.encrypted_display_name)?;
         if let Some(ct) = &self.encrypted_contact_email {
             check_contact_email(ct)?;
@@ -72,18 +84,32 @@ impl MemberProfile {
     }
 }
 
-/// Writes both fields onto a membership that is not revoked (the caller has just created
-/// or reopened it). A re-invited former member's row holds no name by then (D3: revocation
-/// and the `clear_ended_profiles` sweep cleared it), so the new acceptance states the name
-/// that applies from now on; one whose roles ran out before the sweep reached them has
-/// theirs replaced.
+/// Writes the profile onto a membership that has just been created, reopened, or was
+/// already current -- `already_current`, from `ensure_membership`'s third return value.
+///
+/// The display name always takes the accepted profile's value: an acceptance always states
+/// one (`check` requires it), and it is the name that applies from now on.
+///
+/// The contact address does too, *unless* `already_current` is true and the new profile
+/// carries none: an already-active, already-named member reached by a second invitation --
+/// a handover to a sitting member, or recovery -- must not have their stored address
+/// silently wiped just because that invitation's acceptance carried no address of its own
+/// (fix round 1, Q10). A freshly created row, or one just reopened from revoked, is never
+/// `already_current`, and has no address to keep either way (D3 cleared it on revocation),
+/// so there the profile's value -- `None` or not -- is written as given.
 pub(crate) async fn write_profile(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     profile: &MemberProfile,
+    already_current: bool,
 ) -> Result<(), MembershipError> {
     sqlx::query(
-        "update memberships set encrypted_display_name = $3, encrypted_contact_email = $4
+        "update memberships
+            set encrypted_display_name = $3,
+                encrypted_contact_email = case
+                  when $5 and $4 is null then encrypted_contact_email
+                  else $4
+                end
           where tenant_id = $1 and id = $2",
     )
     .bind(tenant_id)
@@ -95,6 +121,7 @@ pub(crate) async fn write_profile(
             .as_ref()
             .map(|c| c.as_bytes()),
     )
+    .bind(already_current)
     .execute(&mut *conn)
     .await?;
     Ok(())

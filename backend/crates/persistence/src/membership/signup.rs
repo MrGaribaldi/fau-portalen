@@ -378,14 +378,14 @@ pub async fn activate_tenant(
     if disabled {
         return Err(MembershipError::AccountDisabled);
     }
-    let (membership_id, _) = ensure_membership(
+    let (membership_id, _, already_current) = ensure_membership(
         &mut tx,
         tenant_id,
         account_id,
         activation.profile.membership_id,
     )
     .await?;
-    write_profile(&mut tx, tenant_id, &activation.profile).await?;
+    write_profile(&mut tx, tenant_id, &activation.profile, already_current).await?;
 
     let admin_role_id = Uuid::now_v7();
     sqlx::query(

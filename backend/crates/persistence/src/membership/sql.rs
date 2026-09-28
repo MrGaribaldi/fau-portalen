@@ -250,40 +250,51 @@ pub(crate) async fn upsert_verified_account(
 
 /// Finds or creates the account's membership in the tenant, as `expected_id`. A revoked
 /// membership is reopened rather than duplicated (one membership per account per FAU,
-/// #3412); the revocation stays in the audit log. Returns the id and whether it already
-/// existed.
+/// #3412); the revocation stays in the audit log. Returns the id, whether it already
+/// existed, and whether it was already current -- not revoked -- before this call.
 ///
 /// `expected_id` is the id the caller encrypted the member's profile for (#3502): the
 /// existing membership's id, or a fresh one that becomes the new row's. An existing
 /// membership under any other id is `AcceptanceTargetChanged`, so a profile can never land
 /// on a row its associated data does not name; an erased one is `MembershipErased`.
+///
+/// The third value, `already_current`, is true exactly when an existing row's
+/// `revoked_at` was already null: an active member accepting a second invitation (a
+/// handover to a sitting member, or recovery). `write_profile` uses it to decide whether
+/// to keep a stored contact address the caller's profile leaves unstated (fix round 1,
+/// Q10) -- a freshly created or freshly reopened row is never `already_current`, and has
+/// no address to keep either way, since D3 clears both fields on revocation.
 pub(crate) async fn ensure_membership(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     account_id: Uuid,
     expected_id: Uuid,
-) -> Result<(Uuid, bool), MembershipError> {
-    let existing: Option<(Uuid, bool)> = sqlx::query_as(
-        "select id, name_erased_at is not null from memberships
+) -> Result<(Uuid, bool, bool), MembershipError> {
+    let existing: Option<(Uuid, bool, bool)> = sqlx::query_as(
+        "select id, revoked_at is not null, name_erased_at is not null from memberships
           where tenant_id = $1 and account_id = $2 for update",
     )
     .bind(tenant_id)
     .bind(account_id)
     .fetch_optional(&mut *conn)
     .await?;
-    if let Some((id, erased)) = existing {
+    if let Some((id, was_revoked, erased)) = existing {
         if id != expected_id {
             return Err(MembershipError::AcceptanceTargetChanged);
         }
         if erased {
             return Err(MembershipError::MembershipErased);
         }
-        sqlx::query("update memberships set revoked_at = null where tenant_id = $1 and id = $2")
+        if was_revoked {
+            sqlx::query(
+                "update memberships set revoked_at = null where tenant_id = $1 and id = $2",
+            )
             .bind(tenant_id)
             .bind(id)
             .execute(&mut *conn)
             .await?;
-        return Ok((id, true));
+        }
+        return Ok((id, true, !was_revoked));
     }
     sqlx::query("insert into memberships (tenant_id, id, account_id) values ($1, $2, $3)")
         .bind(tenant_id)
@@ -291,7 +302,7 @@ pub(crate) async fn ensure_membership(
         .bind(account_id)
         .execute(&mut *conn)
         .await?;
-    Ok((expected_id, false))
+    Ok((expected_id, false, false))
 }
 
 /// Inserts a role assignment and returns its id.

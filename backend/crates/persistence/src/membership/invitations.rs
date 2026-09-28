@@ -17,6 +17,7 @@ use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::authz::read_transaction;
 use super::error::MembershipError;
 use super::profile::{write_profile, MemberProfile};
 use super::sql::{
@@ -875,9 +876,9 @@ pub async fn accept_invitation(
     };
 
     let (account_id, _) = upsert_verified_account(&mut tx, &acceptor_email, at).await?;
-    let (membership_id, reused) =
+    let (membership_id, reused, already_current) =
         ensure_membership(&mut tx, tenant_id, account_id, req.profile.membership_id).await?;
-    write_profile(&mut tx, tenant_id, &req.profile).await?;
+    write_profile(&mut tx, tenant_id, &req.profile, already_current).await?;
     let mut assignment_ids = Vec::with_capacity(roles.len());
     for (role_id, _, period) in &roles {
         assignment_ids.push(
@@ -947,10 +948,13 @@ pub async fn accept_invitation(
 /// that FAU -- a re-invited former member keeps theirs -- or a fresh UUIDv7 that becomes the
 /// new row's id.
 ///
-/// Reads only. It answers for any invitation the token names, pending or not, as long as
-/// the verified address is its recipient: [`accept_invitation`] then gives the precise
-/// refusal (expired, withdrawn, already accepted). Every other failure is
-/// `UnknownInvitation`, so the answer never says which part failed.
+/// Reads only, in one snapshot ([`read_transaction`], the read-path rule): the invitation
+/// lookup and the existing-membership lookup must see the same database state.
+///
+/// It answers for any invitation the token names, pending or not, as long as the verified
+/// address is its recipient: [`accept_invitation`] then gives the precise refusal (expired,
+/// withdrawn, already accepted). Every other failure is `UnknownInvitation`, so the answer
+/// never says which part failed.
 pub async fn prepare_acceptance(
     pool: &PgPool,
     token: &str,
@@ -959,26 +963,39 @@ pub async fn prepare_acceptance(
     if !looks_like_token(token) {
         return Err(MembershipError::UnknownInvitation);
     }
+    let mut tx = read_transaction(pool).await?;
     let row: Option<(Uuid, String)> =
         sqlx::query_as("select tenant_id, recipient_email from invitations where token_hash = $1")
             .bind(hash_token(token))
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
     let (tenant_id, recipient) = row.ok_or(MembershipError::UnknownInvitation)?;
     if recipient != acceptor.email().as_str() {
         return Err(MembershipError::UnknownInvitation);
     }
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "select m.id from memberships m join accounts a on a.id = m.account_id
+    // Whether the row is not revoked and already has a name is what tells the caller "this
+    // is an already-current member accepting another invitation" (a handover to a sitting
+    // member, or recovery) -- so it can prefill, and so `accept_invitation`'s `write_profile`
+    // knows to keep a stored contact address the new profile leaves unstated (fix round 1,
+    // Q10). Found-but-ended (revoked or unnamed) still names the row: acceptance reopens it.
+    let existing: Option<(Uuid, bool, bool)> = sqlx::query_as(
+        "select m.id, m.revoked_at is not null, m.encrypted_display_name is not null
+           from memberships m join accounts a on a.id = m.account_id
           where m.tenant_id = $1 and a.email = $2",
     )
     .bind(tenant_id)
     .bind(acceptor.email().as_str())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
+    let (membership_id, existing_current) = match existing {
+        Some((id, revoked, named)) => (id, !revoked && named),
+        None => (Uuid::now_v7(), false),
+    };
     Ok(AcceptanceTarget {
         tenant_id,
-        membership_id: existing.unwrap_or_else(Uuid::now_v7),
+        membership_id,
+        existing_current,
     })
 }
 
@@ -987,6 +1004,12 @@ pub async fn prepare_acceptance(
 pub struct AcceptanceTarget {
     pub tenant_id: Uuid,
     pub membership_id: Uuid,
+    /// Whether this membership already exists, is not revoked and already has a name --
+    /// an active member reached by a second invitation (a handover to a sitting member, or
+    /// recovery). The caller may prefill an acceptance form with it rather than asking
+    /// again, and knows `write_profile` will keep the stored contact address if the new
+    /// profile leaves it unstated (fix round 1, Q10).
+    pub existing_current: bool,
 }
 
 /// The invitee's view of the message (decision of 24 September 2026). Every failure is

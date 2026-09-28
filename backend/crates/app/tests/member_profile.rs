@@ -200,6 +200,37 @@ async fn a_malformed_field_is_refused_before_anything_is_written() {
     );
 }
 
+/// Fix round 1, item 2 (controller ruling Q10): `membership_id` must be a UUIDv7, like
+/// every other id this schema mints. `Uuid::nil()` and a v4-shaped id are both refused, the
+/// same DisplayName-style check-then-error pattern as the ciphertext fields.
+#[tokio::test]
+async fn a_non_uuidv7_membership_id_is_refused_before_anything_is_written() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let token = invite(&pool, &fau, "kari@example.test").await;
+    let v4_shaped = Uuid::from_u128(0x0199_0000_0000_4000_8000_0000_0000_0301);
+    for bad_id in [Uuid::nil(), v4_shaped] {
+        let err = accept_invitation(
+            &pool,
+            AcceptInvitation {
+                token: token.clone(),
+                acceptor: verified("kari@example.test"),
+                admin_end_override: None,
+                profile: MemberProfile {
+                    membership_id: bad_id,
+                    ..fresh_profile()
+                },
+            },
+            at(T0),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, MembershipError::MembershipIdMalformed, "{bad_id}");
+        assert_eq!(pending_invitations(&pool, "kari@example.test").await, 1);
+    }
+}
+
 #[tokio::test]
 async fn a_profile_for_another_membership_is_refused() {
     let db = TestDb::migrated().await;
@@ -360,6 +391,56 @@ async fn prepare_answers_for_an_expired_invitation_so_acceptance_can_say_why() {
     .await
     .unwrap_err();
     assert!(matches!(err, MembershipError::Acceptance(_)), "{err:?}");
+}
+
+/// Fix round 1, item 1(b) (controller ruling Q10): `existing_current` tells the caller
+/// whether the membership `prepare_acceptance` names is already active and already has a
+/// name -- so a fresh acceptee is `false`, and an active member reached by a second
+/// invitation is `true`.
+#[tokio::test]
+async fn prepare_reports_existing_current_only_for_an_active_named_membership() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+
+    // Negative control: never a member here.
+    let fresh_token = invite(&pool, &fau, "ny@example.test").await;
+    let fresh = prepare_acceptance(&pool, &fresh_token, &verified("ny@example.test"))
+        .await
+        .unwrap();
+    assert!(!fresh.existing_current, "never joined");
+
+    // Kari accepts once, so her membership is active and named.
+    let token = invite(&pool, &fau, "kari@example.test").await;
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+        .await
+        .unwrap();
+    assert!(!target.existing_current, "not yet a member");
+    accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token,
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: target.membership_id,
+                encrypted_display_name: envelope(1),
+                encrypted_contact_email: None,
+            },
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+
+    // A second invitation to the same address now prepares against an active, named row.
+    let second_token = invite(&pool, &fau, "kari@example.test").await;
+    let second = prepare_acceptance(&pool, &second_token, &verified("kari@example.test"))
+        .await
+        .unwrap();
+    assert_eq!(second.membership_id, target.membership_id);
+    assert!(second.existing_current, "active and named");
 }
 
 /// Both fields go with the membership (D3). Without the clearing in `revoke_membership`,

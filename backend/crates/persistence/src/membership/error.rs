@@ -133,6 +133,11 @@ pub enum MembershipError {
     DisplayNameMalformed,
     #[error("the contact address is not a well-formed ciphertext")]
     ContactEmailMalformed,
+    /// `MemberProfile::check` (fix round 1, Q10): the id must be a UUIDv7, the same as
+    /// every other id this schema mints, so an acceptance can never bind a name to
+    /// something a database index would treat as out of order or as attacker-chosen.
+    #[error("the membership id is not a well-formed uuidv7")]
+    MembershipIdMalformed,
     /// The membership the profile was encrypted for is not the one acceptance found: another
     /// acceptance created it in between. `prepare_acceptance` again and re-encrypt.
     #[error("the membership changed since the acceptance was prepared")]

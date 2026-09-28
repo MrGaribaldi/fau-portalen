@@ -9,9 +9,17 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# Locale-aware ordering of decrypted names in the member directory (#3502, #3439): ICU4X,
+# the Unicode Consortium's library, with CLDR's per-locale collation data compiled in.
+# icu_locale_core and most of ICU4X's support crates are already in Cargo.lock through
+# `url`'s IDNA support.
+icu_collator = { workspace = true }
+icu_locale_core = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
 unicode-normalization = { workspace = true }
+# Membership and group ids in the member directory's listing (#3502).
+uuid = { workspace = true }
 
 [features]
 # The sync planner's test builders and in-memory applier (`register::sync::testkit`), for

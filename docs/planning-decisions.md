@@ -2895,3 +2895,55 @@ until the alerts are live.
 random nonces (plan a rotation, but it does not block launch); one transit key per document and
 chat month (benchmark key count, list pagination, Raft growth and full-tenant deletion first); the
 session key cache; and direct transit encryption for short messages.
+
+## Second external review: a key-lifecycle architecture — 27 September 2026
+
+The same reviewer followed up with an ordered recommendation:
+- keep the encryption primitives, and change the key lifecycle instead;
+- the order: a recovery prototype, then independent deletion authority, then cache-aware deletion
+  tests, then the MFA guard, then live alerts, then a restore rehearsal.
+
+The agent's assessment of each point:
+
+1. **A recovery copy per data key**, sealed to an **offline recovery public key**, instead of
+   replicating OpenBao's transit keys. The app stores its normal OpenBao-wrapped copy and sends the
+   sealed copy to an off-cluster store. A unit's first write is not acknowledged until both are
+   durable. A restore unwraps the recovery copy and re-wraps the key under a new OpenBao key.
+   **Recommended for #3507.** It solves what the replica design has not: transit keys are created
+   `exportable=false` and `allow_plaintext_backup=false`, so there is no clean way to copy them.
+   The backend only ever holds the public key, so a compromised backend cannot read recovery
+   copies. The cost is one more write, once per unit, not per operation. What it brings with it:
+   - a second root secret (the offline private key), whose custody is Erik's decision;
+   - the finalizer must delete the recovery copy too, with bounded retention for that store's
+     own backups;
+   - **messages use direct transit encryption and have no data key**, so they would not be
+     recoverable after an OpenBao loss. Either accept that, since they are short and operational,
+     or move messages to envelope encryption (agent's addition);
+   - it needs a prototype and a restore rehearsal before it counts.
+2. **Hard-delete authority moves to a separately hosted finalizer**, enforcing the 7-day deadline
+   from its own record, and also deleting the recovery copy. This is the same finding as the first
+   review, now with a concrete shape. Open decision: where the finalizer runs, off the application
+   cluster, for a one-person operation.
+3. **Deletion becomes an application state machine**, with a persisted tombstone before the key
+   sweep. **Confirmed as a real gap in the code.** The app calls `ensure_key` before every first
+   encryption, so a hard-deleted key would be silently recreated under the same name. The tombstone
+   must refuse key creation, reads and writes for the unit, evict it on every backend instance, and
+   survive a key being restored or recreated. After that the sweep is reconciled until no key
+   escapes. This extends key-service-design §5's ordering rule.
+4. **Change the erasure promise:** "the live service cannot decrypt after deletion completes", plus
+   a **stated, bounded retention period** for historical recovery copies and storage images. This
+   is consistent with key-service-design §5's three deletion levels. The number is Erik's decision.
+5. **MFA proof for privileged actions:** already routed to #3414.
+6. **Live detection:** already routed to #3442. New: record sensitive content access at the
+   application layer too, because after the first unwrap the cache serves reads that OpenBao never
+   sees.
+
+The next improvements go on:
+- **#3424:** automate the certificate reload and alert before expiry (this supersedes the manual
+  SIGHUP step as the long-term answer); benchmark the key population and a full-FAU deletion.
+- **#3425:** rehearse the loss of the OpenBao volume and the loss of operator access.
+- **Erik:** decide who can unseal when he is unavailable.
+
+The trust-statement tightening was already done after the first review.
+
+None of this changes #3501, whose execution continues.

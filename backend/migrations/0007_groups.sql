@@ -9,7 +9,9 @@
 -- The name is content ("Oppfølging av sak med rektor"). It is encrypted by the backend
 -- under the FAU's record key with AAD (tenant, 'groups', 'encrypted_name', id). This table
 -- holds the envelope only, and no key material. The check below is structural: version
--- byte 1, and 41 bytes of nonce and tag around a 1..400-byte name.
+-- byte 1 and 42..512 octets in all, i.e. 41 bytes of version, nonce and tag around 1..471
+-- bytes of plaintext. A valid name (1..100 characters, so at most 400 bytes of UTF-8)
+-- needs at most 441; the rest is headroom, not a second name limit.
 create table groups (
   tenant_id      uuid        not null references tenants (id),
   id             uuid        not null,

@@ -7,8 +7,7 @@
 //! behaviour for admins, not only guests. `authorize` reads standing through
 //! `membership_access`, which requires `tenants.status = 'active'`; `require_admin` did not
 //! check tenant status at all. So an admin of a `closed` or `pending` FAU, who previously
-//! got the message (or a schema error, never `NotAuthorized` on status grounds), now gets
-//! `NotAuthorized` like anyone else with no current standing. A frozen FAU stays `active`
+//! got the message, now gets `NotAuthorized` like anyone else with no current standing. A frozen FAU stays `active`
 //! with `frozen_at` set, so an admin's read continues through a freeze -- only `status`
 //! changes the outcome.
 

@@ -42,9 +42,11 @@ use super::sql::{
 /// The associated data a group name is encrypted with, with the tenant and the group's id.
 pub const GROUP_NAME_AAD: (&str, &str) = ("groups", "encrypted_name");
 
-/// fau-crypto's envelope around a 1..=`GroupName::MAX_CHARS` name: 41 bytes of version,
-/// nonce and tag, plus 1 to 400 bytes of UTF-8. The same bounds as the database's
-/// `groups_name_is_an_envelope`.
+/// The envelope sizes a stored group name may have, the same octet bounds as the
+/// database's `groups_name_is_an_envelope`: fau-crypto's 41 bytes of version, nonce and tag
+/// around 1..=471 bytes of plaintext. A valid name (1..=`GroupName::MAX_CHARS` = 100
+/// characters, so at most 400 bytes of UTF-8) needs at most 441; the rest is headroom,
+/// not a second name limit.
 pub const GROUP_NAME_CIPHERTEXT_BYTES: RangeInclusive<usize> = 42..=512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -95,6 +95,8 @@ pub enum MembershipError {
     WouldLeaveNoAdmin,
     #[error("the FAU has an administrator")]
     NotInNoAdminState,
+    #[error("a guest role must name one group, and only a guest role may")]
+    RoleGroupMismatch,
 
     // Requests.
     #[error("replacement dates are invalid")]

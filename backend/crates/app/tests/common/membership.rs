@@ -105,6 +105,7 @@ pub fn new_role(name: &str, capability: CapabilityClass) -> RoleChoice {
     RoleChoice::New {
         name: RoleName::parse(name).unwrap(),
         capability,
+        group_id: None,
     }
 }
 

@@ -3134,3 +3134,15 @@ reading where a note needed interpreting; readings marked *(reading)* await Erik
 - **D19 (#3496, #3497):** Erik files both upstream issues himself.
 - **D20 (#3486):** the destructive probe is not run, and the question is closed.
 - **D21 (#3413):** the end-to-end review is closed.
+
+## Erik's clarifications on D1, D16 and D18 — 28 September 2026
+
+- **D1:** "un-archive when they start paying again" means the **FAU** (#3509 reactivation). A group
+  that has been archived is not reopened; it can be **recreated** instead. #3501's one-way group
+  archive stands.
+- **D16:** **controlled publication is in the MVP**: public documents such as meeting minutes
+  (#3492). The import side supports reading HTML in, and full DOCX import is also in the MVP (D16).
+  Erik's framing: the project has grown beyond the one-week test, and is building **a full MVP for
+  testing with actual FAU-er**.
+- **D18:** the etcd retention drop-in can be applied whenever it suits, because nothing uses the
+  cluster yet. The change is still planned and inspected before it is applied.

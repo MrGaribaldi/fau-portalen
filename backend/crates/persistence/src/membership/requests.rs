@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use fau_domain::authz::Action;
 use fau_domain::email::{Email, VerifiedEmail};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::requests::{
@@ -15,6 +16,7 @@ use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::authz::{authorize, denied, read_transaction, Resource, Viewer};
 use super::error::MembershipError;
 use super::invitations::{
     insert_invitation, resolve_roles, IssuedInvitation, NewInvitation, OfferedRole,
@@ -534,7 +536,17 @@ pub async fn lapse_requests(pool: &PgPool, at: Moment) -> Result<u64, Membership
     Ok(lapsed.len() as u64)
 }
 
-/// The message on a request, for the approval screen (flow spec §5.2). Authority first.
+/// The message on a request, for the approval screen (flow spec §5.2). Authority first,
+/// through `authorize` as the FAU-level `Manage` right (the #3418 read-path audit, #3501),
+/// in one read snapshot: a non-admin learns nothing about whether the request exists.
+///
+/// This changes behaviour for admins, not only for guests (controller ruling P4):
+/// `authorize` reads standing through `membership_access`, which requires
+/// `tenants.status = 'active'`, while `require_admin` never checked tenant status at all.
+/// So an admin of a `closed` or `pending` FAU is now refused with `NotAuthorized`, same as
+/// anyone else with no current standing. A frozen FAU keeps `status = 'active'` with
+/// `frozen_at` set, so an admin's read continues through a freeze exactly as before
+/// (ADR-003 decision 7a) -- only `status`, not `frozen_at`, changes the outcome here.
 pub async fn access_request_message(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -542,8 +554,14 @@ pub async fn access_request_message(
     actor_membership_id: Uuid,
     at: Moment,
 ) -> Result<Option<fau_crypto::MessageCiphertext>, MembershipError> {
-    let mut tx = pool.begin().await?;
-    require_admin(&mut tx, tenant_id, actor_membership_id, at.today()).await?;
+    let mut tx = read_transaction(pool).await?;
+    let viewer = Viewer {
+        tenant_id,
+        membership_id: actor_membership_id,
+    };
+    authorize(&mut tx, viewer, Resource::Fau, Action::Manage, at)
+        .await?
+        .map_err(|d| denied(d, MembershipError::NotAuthorized))?;
     let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
         "select encrypted_message from access_requests where tenant_id = $1 and id = $2",
     )

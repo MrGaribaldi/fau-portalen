@@ -156,6 +156,16 @@ pub async fn read_transaction(
     Ok(tx)
 }
 
+/// A refusal as the error a transaction returns. `hidden` is the answer for a resource the
+/// viewer may not know exists (`UnknownGroup` for a group); `NotAuthorized` covers a
+/// viewer who may see the resource but not act on it, or who has no standing at all.
+pub(crate) fn denied(d: Denied, hidden: MembershipError) -> MembershipError {
+    match d {
+        Denied::Hidden => hidden,
+        Denied::Forbidden | Denied::NoAccess => MembershipError::NotAuthorized,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

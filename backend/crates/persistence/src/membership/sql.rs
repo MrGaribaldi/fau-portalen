@@ -584,7 +584,9 @@ pub(crate) fn check_last_admin(
     Ok(leaves_none)
 }
 
-/// Addresses of every current member: a usable membership with any role valid today.
+/// Addresses of every current member: a usable membership with a member- or admin-class
+/// role valid today. A guest is not an FAU-wide member (groups design §3.2), so a guest
+/// role alone does not count (#3501's read-path audit, Ruling R16).
 pub(crate) async fn current_member_emails(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -610,6 +612,7 @@ async fn member_emails(
             and ra.revoked_at is null
             and ra.starts_on <= $2::date and ra.ends_on_exclusive > $2::date
             and ($3 = false or r.capability_class = 'admin')
+            and r.capability_class <> 'guest'
           order by a.email"
     );
     Ok(sqlx::query_scalar(&sql)
@@ -621,8 +624,9 @@ async fn member_emails(
 }
 
 /// Recovery notices (spec 6.4.4, ADR-003 decision 10): every current member; when none
-/// remain, everyone who held a role in the past 24 months. EWB is always added, as the
-/// notified second party for every recovery on every FAU (ADR-003 decision 8).
+/// remain, everyone who held a member or admin role in the past 24 months -- never a
+/// guest (Ruling R16). EWB is always added, as the notified second party for every
+/// recovery on every FAU (ADR-003 decision 8).
 pub(crate) async fn recovery_notice_recipients(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -633,9 +637,11 @@ pub(crate) async fn recovery_notice_recipients(
         recipients = sqlx::query_scalar(
             "select distinct a.email
                from role_assignments ra
+               join roles r       on r.tenant_id = ra.tenant_id and r.id = ra.role_id
                join memberships m on m.tenant_id = ra.tenant_id and m.id = ra.membership_id
                join accounts a    on a.id = m.account_id
               where ra.tenant_id = $1 and a.disabled_at is null
+                and r.capability_class <> 'guest'
                 and ra.starts_on <= $2::date and ra.ends_on_exclusive > $3::date
               order by a.email",
         )

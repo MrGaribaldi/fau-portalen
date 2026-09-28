@@ -3048,3 +3048,14 @@ The fix (`shm_size` or `max_parallel_workers_per_gather=0`) needs a db restart, 
 call; tests run with `--test-threads=4` meanwhile.
 
 The deferred items are filed on #3417, #3419 and #3503.
+
+## Guests may propose replacements; dev database shared memory raised — 28 September 2026
+
+- **A guest may propose a replacement for their own guest-role assignment**, decided by Erik. An
+  admin still has to approve it. The reason given: guests don't need even more special-casing.
+  `create_replacement_proposal` stays as it is.
+- **The dev Postgres gets `shm_size: 256m`** in compose.yaml. Erik asked for at least 128 MB, to
+  test the hypothesis behind the recurring "exit code 2" crash, which is parallel-query shared
+  memory exhausting Docker's 64 MB `/dev/shm`. The container was recreated on the same data
+  volume, and verbose connection logging is still on. If a full-parallelism
+  `cargo test --workspace` run no longer crashes it, the hypothesis holds.

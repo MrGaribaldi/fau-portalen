@@ -117,7 +117,7 @@ Done while writing this plan, on branch `groups-3501` at `f01de45`, before `Gues
 | Path | Shortcut found | Treatment |
 |---|---|---|
 | `effective_access` (`membership/access.rs`) | Returns `Capability::Member` for any valid role, and #3412 lets `Member` read everything | Task 2 adds `Capability::Guest` below `Member`. Task 4 splits out `membership_access`, which `authorize` and the hub share, and documents that a capability is not permission to read a resource |
-| `access_request_message` (`membership/requests.rs`) | `require_admin` directly | Task 5 routes it through `authorize(Resource::Fau, Action::Manage)` in a read snapshot. Behaviour is unchanged for admins and members |
+| `access_request_message` (`membership/requests.rs`) | `require_admin` directly | Task 5 routes it through `authorize(Resource::Fau, Action::Manage)` in a read snapshot. Members are unaffected. **Admins of a `pending` or `closed` FAU are now refused**, because `authorize` requires an active tenant. A frozen FAU stays `active`, so its admins still read (execution ruling P4) |
 | `invitation_message` (`membership/invitations.rs`) | None: authorized by the token plus a matching verified address; the reader is not a member | Unchanged, and documented as outside `authorize` |
 | `current_member_emails` / `recovery_notice_recipients` (`membership/sql.rs`) | "Any role valid today" counts as a member, so guests would receive FAU-wide recovery notices | Task 5 excludes guest-class roles (R16) |
 | `admin_emails`, `is_admin_today`, `AdminState`, the handover sweep | Filter on `capability_class = 'admin'` explicitly | Unaffected |

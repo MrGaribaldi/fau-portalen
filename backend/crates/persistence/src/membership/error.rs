@@ -95,6 +95,8 @@ pub enum MembershipError {
     WouldLeaveNoAdmin,
     #[error("the FAU has an administrator")]
     NotInNoAdminState,
+    #[error("a guest role must name one group, and only a guest role may")]
+    RoleGroupMismatch,
 
     // Requests.
     #[error("replacement dates are invalid")]
@@ -109,6 +111,22 @@ pub enum MembershipError {
     UnknownRequest,
     #[error("the request is no longer pending")]
     RequestNotPending,
+
+    // Groups (#3501).
+    #[error("group not found")]
+    UnknownGroup,
+    #[error("the group is archived")]
+    GroupArchived,
+    #[error("the membership is already in the group")]
+    AlreadyInGroup,
+    #[error("the membership was not added to the group by hand")]
+    NotInGroup,
+    #[error("the group name is not a well-formed ciphertext")]
+    GroupNameMalformed,
+    #[error("organization unit not found")]
+    UnknownUnit,
+    #[error("cohort not found")]
+    UnknownCohort,
 
     // Infrastructure.
     #[error("the operating system's random source failed")]

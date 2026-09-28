@@ -201,6 +201,31 @@ runs under `fau-keys-operator`.
   OpenBao lists them. In #3506, the same CronJob runs the 7-day hard delete. #3507 decides whether
   it must move to the replica side (ADR-003 decision 7: compromising the key service must not grant
   the ability to cancel).
+- **Three things are called deletion, and only the first two exist today.** Added 27 September
+  2026 after the external review.
+  - A **soft delete** stops use in the live service and can be undone.
+  - A **hard delete** means the live OpenBao API can no longer decrypt. It does not prove that
+    every copy is gone. A copy of OpenBao's state made before the delete keeps the key. So may the
+    live volume itself: OpenBao's Raft log and BoltDB mark space free for reuse, they do not erase
+    it. Rotating the seal or barrier keys does not help, because rotation keeps access to older
+    keyring material.
+  - **Expiry of every recoverable copy** is a property the replica (#3507) must specify and
+    demonstrate: how an individual key is copied, restored and permanently removed, and what
+    happens to older copies of the volume.
+
+  Until #3507 demonstrates it, crypto-shredding is a **proposed** property, not a guarantee across
+  backups, and no customer-facing text may say otherwise.
+- **The 7-day window is enforced only by `shred.sh`.** The operator policy can set
+  `deletion_allowed` and hard-delete a key at once. A stolen operator credential can therefore
+  destroy every FAU's keys immediately. Before real data, final deletion authority must move
+  outside the application cluster (#3507). The scheduling job should keep soft delete and the
+  queue, and lose hard delete. A finalizer protected independently must verify a deadline it holds
+  itself, and recovery from an unauthorized deletion must be rehearsed.
+- **A soft delete does not revoke data keys already held in `KeyCache`**, including clones held by
+  in-flight requests. Any deletion, lock or purge must first stop the application reading the
+  unit. It must then evict the unit on every backend instance and refuse to create new keys for
+  it. Only then does it soft-delete. This must be tested with requests already in flight. It
+  binds the card that wires `KeyCache` into the application, and #3509.
 - **After a transit key is destroyed**, its `wrapped_keys` rows and the ciphertext are useless.
   They are deleted by the application's own purge, which is ordinary tidying and not the security
   property.

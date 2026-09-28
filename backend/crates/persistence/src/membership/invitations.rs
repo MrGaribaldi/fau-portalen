@@ -33,6 +33,9 @@ pub enum RoleChoice {
     New {
         name: RoleName,
         capability: CapabilityClass,
+        /// The group a guest role reaches (groups design §3.1, Ruling R4). `Some` exactly
+        /// when `capability` is `Guest`; `RoleGroupMismatch` otherwise.
+        group_id: Option<Uuid>,
     },
 }
 
@@ -165,28 +168,57 @@ pub(crate) async fn resolve_roles(
         }
         let (role_id, capability) = match &o.role {
             RoleChoice::Existing(id) => {
-                let class: Option<String> = sqlx::query_scalar(
-                    "select capability_class from roles where tenant_id = $1 and id = $2",
+                let row: Option<(String, bool)> = sqlx::query_as(
+                    "select r.capability_class, g.archived_at is not null
+                       from roles r
+                       left join groups g on g.tenant_id = r.tenant_id and g.id = r.group_id
+                      where r.tenant_id = $1 and r.id = $2",
                 )
                 .bind(tenant_id)
                 .bind(id)
                 .fetch_optional(&mut *conn)
                 .await?;
-                let class = class.ok_or(MembershipError::UnknownRole)?;
+                let (class, group_archived) = row.ok_or(MembershipError::UnknownRole)?;
+                if group_archived {
+                    return Err(MembershipError::GroupArchived);
+                }
                 (
                     *id,
                     CapabilityClass::from_code(&class).ok_or_else(MembershipError::decode)?,
                 )
             }
-            RoleChoice::New { name, capability } => {
+            RoleChoice::New {
+                name,
+                capability,
+                group_id,
+            } => {
+                if (*capability == CapabilityClass::Guest) != group_id.is_some() {
+                    return Err(MembershipError::RoleGroupMismatch);
+                }
+                if let Some(group) = group_id {
+                    let archived: Option<bool> = sqlx::query_scalar(
+                        "select archived_at is not null from groups where tenant_id = $1 and id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(group)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    match archived {
+                        None => return Err(MembershipError::UnknownGroup),
+                        Some(true) => return Err(MembershipError::GroupArchived),
+                        Some(false) => {}
+                    }
+                }
                 let id = Uuid::now_v7();
                 sqlx::query(
-                    "insert into roles (tenant_id, id, name, capability_class) values ($1, $2, $3, $4)",
+                    "insert into roles (tenant_id, id, name, capability_class, group_id)
+                     values ($1, $2, $3, $4, $5)",
                 )
                 .bind(tenant_id)
                 .bind(id)
                 .bind(name.as_str())
                 .bind(capability.code())
+                .bind(group_id)
                 .execute(&mut *conn)
                 .await?;
                 write_audit(
@@ -204,7 +236,7 @@ pub(crate) async fn resolve_roles(
                         action: "role.created",
                         subject_type: "role",
                         subject_id: id,
-                        params: json!({ "capability_class": capability.code() }),
+                        params: json!({ "capability_class": capability.code(), "group_id": group_id }),
                     },
                 )
                 .await?;
@@ -298,6 +330,27 @@ pub async fn issue_invitation(
             {
                 return Err(MembershipError::NotAuthorized);
             }
+            // Inviting a guest is admin-only (groups design §3.3; Ruling R17); a handover
+            // grant is not admin authority. Checked here, on the bare `capability_class` and
+            // before `resolve_roles`, so a handover holder probing an existing guest role on
+            // an archived group gets `NotAuthorized`, never `GroupArchived` -- which would
+            // leak the group's state to someone who is not authorized to offer it at all
+            // (Ruling P12 fix round 1). An unknown role id still falls through to
+            // `resolve_roles`'s `UnknownRole` below.
+            for offered in &req.roles {
+                if let RoleChoice::Existing(id) = &offered.role {
+                    let class: Option<String> = sqlx::query_scalar(
+                        "select capability_class from roles where tenant_id = $1 and id = $2",
+                    )
+                    .bind(req.tenant_id)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if class.as_deref() == Some(CapabilityClass::Guest.code()) {
+                        return Err(MembershipError::NotAuthorized);
+                    }
+                }
+            }
             let own = usable_member_email(&mut tx, req.tenant_id, req.actor_membership_id)
                 .await?
                 .ok_or(MembershipError::NotAuthorized)?;
@@ -316,6 +369,15 @@ pub async fn issue_invitation(
         &req.roles,
     )
     .await?;
+    // Inviting guests is admin-only (groups design §3.3); a handover grant is not admin
+    // authority (Ruling R17).
+    if mode == InvitationMode::Handover
+        && roles
+            .iter()
+            .any(|(_, class, _)| *class == CapabilityClass::Guest)
+    {
+        return Err(MembershipError::NotAuthorized);
+    }
     let issued = insert_invitation(
         &mut tx,
         at,
@@ -530,6 +592,24 @@ pub async fn resend_invitation(
     if inv.accepted || inv.revoked {
         return Err(MembershipError::InvitationNotPending);
     }
+    // Resending an invitation that offers a guest role whose group has since been archived
+    // would re-arm it for another 14 days (Ruling P12 fix round 1).
+    let offers_an_archived_group: bool = sqlx::query_scalar(
+        "select exists (
+           select 1
+             from invitation_roles ir
+             join roles r on r.tenant_id = ir.tenant_id and r.id = ir.role_id
+             join groups g on g.tenant_id = r.tenant_id and g.id = r.group_id
+            where ir.tenant_id = $1 and ir.invitation_id = $2 and g.archived_at is not null
+         )",
+    )
+    .bind(change.tenant_id)
+    .bind(change.invitation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if offers_an_archived_group {
+        return Err(MembershipError::GroupArchived);
+    }
 
     let token = InvitationToken::generate()?;
     let expires_at = invitation_expiry(at.now());
@@ -741,11 +821,16 @@ pub async fn accept_invitation(
     };
     check_acceptance(&snapshot, at.now()).map_err(MembershipError::Acceptance)?;
 
-    let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
+    // A guest role's group may have been archived after the invitation was issued; seating
+    // the guest anyway would grant read access to an archived group (Ruling P12 fix round 1).
+    // The left join gives `false` for a non-guest role, which has no group.
+    let rows: Vec<(Uuid, String, String, String, bool)> = sqlx::query_as(
         "select ir.role_id, r.capability_class,
-                to_char(ir.starts_on, 'YYYY-MM-DD'), to_char(ir.ends_on_exclusive, 'YYYY-MM-DD')
+                to_char(ir.starts_on, 'YYYY-MM-DD'), to_char(ir.ends_on_exclusive, 'YYYY-MM-DD'),
+                g.archived_at is not null
            from invitation_roles ir
            join roles r on r.tenant_id = ir.tenant_id and r.id = ir.role_id
+           left join groups g on g.tenant_id = r.tenant_id and g.id = r.group_id
           where ir.tenant_id = $1 and ir.invitation_id = $2
           order by ir.role_id",
     )
@@ -754,7 +839,10 @@ pub async fn accept_invitation(
     .fetch_all(&mut *tx)
     .await?;
     let mut roles = Vec::with_capacity(rows.len());
-    for (role_id, class, starts, ends) in rows {
+    for (role_id, class, starts, ends, group_archived) in rows {
+        if group_archived {
+            return Err(MembershipError::GroupArchived);
+        }
         let class = CapabilityClass::from_code(&class).ok_or_else(MembershipError::decode)?;
         roles.push((role_id, class, period_from(&starts, &ends)?));
     }

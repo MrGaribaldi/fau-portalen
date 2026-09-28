@@ -2846,3 +2846,205 @@ paused rather than deleted, can pay and continue, or can ask for a hard delete. 
 The agent ruled that the 365 days count from the soft delete. Open: the terms and DPA must provide
 for the retention before this ships, and the replica (#3507) must follow the per-reason window.
 Separate from #3506, whose deletion script's queue `reason` field it builds on.
+## Erik's go-ahead for #3501 — 27 September 2026
+
+Erik closed #3506 as complete after PR #4 merged, and asked the agent to start #3501 (groups, the guest
+member type and one authorization function) and keep going while he is away overnight. The agent
+plans #3501 from the accepted #3500 design (docs/groups-directory-chat-calendar-design.md) and executes
+it on branch `groups-3501` without a separate plan review. Nothing is applied to the cluster; merging
+and pushing stay Erik's.
+
+## External review of the encryption design — 27 September 2026
+
+Erik ran the encryption brief (docs/encryption-review-brief.md) past an outside expert. The verdict:
+the envelope design is sound for its goal (a stolen database or bucket does not reveal content),
+but **it must not hold real FAU data yet**. Production approval should depend on four things:
+- an independent recovery and deletion system, tested;
+- cache-aware revocation;
+- real proof of MFA for administrative actions;
+- audit alerts that are running.
+
+The agent checked every finding against the documents and the code. All hold, and there is no
+pushback.
+
+| Finding | Priority | Where it goes |
+|---|---|---|
+| The 7-day window is enforced only by `shred.sh`, and the operator credential can hard-delete at once | Critical | #3507. Final deletion authority moves off the application cluster; the scheduler loses hard delete; an independent finalizer checks its own deadline; recovery from an unauthorized delete is rehearsed. Recorded in key-service-design §5 |
+| A hard delete does not reach earlier copies of OpenBao state, or Raft/BoltDB remnants on the live volume | Critical | #3507 must define how key copies expire across every recoverable copy. Until then crypto-shredding is described as *proposed*. Key-service-design §5 now separates soft delete, hard delete and expiry of all copies |
+| Soft delete does not revoke keys already held in `KeyCache` | High | The card that wires `KeyCache` into the app (#3417) and #3509. Order: stop reads, evict on every instance, refuse new keys, then soft-delete; test with requests in flight. Key-service-design §5 |
+| The admin guard checks that a second factor is *enrolled*, not that it was *used* | High | #3414. Require proof of the authentication method and time (`amr`/`auth_time` or a fresh challenge), verify what Hanko actually returns, and enforce it server-side. The guard is not built, so nothing is exposed yet |
+| The backend can decrypt across tenants, and the mass-decryption detector is not live | High | Kept as an explicit trust assumption; the ADR-003 trust statement is corrected. #3442 alerts: distinct-key decrypts, direct hard deletes, restores, audit-pipeline failure and Job failure, with audit records sent somewhere independent of the app cluster |
+| One OpenBao instance and one human unseal holder are single points of failure | High | #3507 and the restore rehearsal #3425 are hard launch gates, as already decided. The custody choice (availability or separation of authority) is Erik's |
+
+Smaller items, recorded for their cards:
+- A revision in the AAD alone does not stop rollback. Where rollback matters, the expected revision
+  needs trusted monotonic state (#3419).
+- Put the unit/key id in a future envelope version.
+- Test that a substituted wrapped key is detected (it causes data loss or tampered new content,
+  not disclosure).
+- Specify the upload quarantine boundary and its purge path (#3447).
+- Specify published-output deletion (#3419).
+
+**Corrected at once, because it is public wording.** The ADR-003 trust statement claimed that a
+stolen database was inert, and that reading an FAU meant seating a member with every step
+notifying members. It now says the database leak is a privacy event, that a compromised backend
+is not held to the application path, and that bulk exfiltration may not be called slow or loud
+until the alerts are live.
+
+**Trade-offs the reviewer would keep:** server-side encryption over E2E; XChaCha20-Poly1305 with
+random nonces (plan a rotation, but it does not block launch); one transit key per document and
+chat month (benchmark key count, list pagination, Raft growth and full-tenant deletion first); the
+session key cache; and direct transit encryption for short messages.
+
+## Second external review: a key-lifecycle architecture — 27 September 2026
+
+The same reviewer followed up with an ordered recommendation:
+- keep the encryption primitives, and change the key lifecycle instead;
+- the order: a recovery prototype, then independent deletion authority, then cache-aware deletion
+  tests, then the MFA guard, then live alerts, then a restore rehearsal.
+
+The agent's assessment of each point:
+
+1. **A recovery copy per data key**, sealed to an **offline recovery public key**, instead of
+   replicating OpenBao's transit keys. The app stores its normal OpenBao-wrapped copy and sends the
+   sealed copy to an off-cluster store. A unit's first write is not acknowledged until both are
+   durable. A restore unwraps the recovery copy and re-wraps the key under a new OpenBao key.
+   **Recommended for #3507.** It solves what the replica design has not: transit keys are created
+   `exportable=false` and `allow_plaintext_backup=false`, so there is no clean way to copy them.
+   The backend only ever holds the public key, so a compromised backend cannot read recovery
+   copies. The cost is one more write, once per unit, not per operation. What it brings with it:
+   - a second root secret (the offline private key), whose custody is Erik's decision;
+   - the finalizer must delete the recovery copy too, with bounded retention for that store's
+     own backups;
+   - **messages use direct transit encryption and have no data key**, so they would not be
+     recoverable after an OpenBao loss. Either accept that, since they are short and operational,
+     or move messages to envelope encryption (agent's addition);
+   - it needs a prototype and a restore rehearsal before it counts.
+2. **Hard-delete authority moves to a separately hosted finalizer**, enforcing the 7-day deadline
+   from its own record, and also deleting the recovery copy. This is the same finding as the first
+   review, now with a concrete shape. Open decision: where the finalizer runs, off the application
+   cluster, for a one-person operation.
+3. **Deletion becomes an application state machine**, with a persisted tombstone before the key
+   sweep. **Confirmed as a real gap in the code.** The app calls `ensure_key` before every first
+   encryption, so a hard-deleted key would be silently recreated under the same name. The tombstone
+   must refuse key creation, reads and writes for the unit, evict it on every backend instance, and
+   survive a key being restored or recreated. After that the sweep is reconciled until no key
+   escapes. This extends key-service-design §5's ordering rule.
+4. **Change the erasure promise:** "the live service cannot decrypt after deletion completes", plus
+   a **stated, bounded retention period** for historical recovery copies and storage images. This
+   is consistent with key-service-design §5's three deletion levels. The number is Erik's decision.
+5. **MFA proof for privileged actions:** already routed to #3414.
+6. **Live detection:** already routed to #3442. New: record sensitive content access at the
+   application layer too, because after the first unwrap the cache serves reads that OpenBao never
+   sees.
+
+The next improvements go on:
+- **#3424:** automate the certificate reload and alert before expiry (this supersedes the manual
+  SIGHUP step as the long-term answer); benchmark the key population and a full-FAU deletion.
+- **#3425:** rehearse the loss of the OpenBao volume and the loss of operator access.
+- **Erik:** decide who can unseal when he is unavailable.
+
+The trust-statement tightening was already done after the first review.
+
+None of this changes #3501, whose execution continues.
+
+## #3501 built: rulings for Erik's review — 27 September 2026
+
+Groups, the guest member type and one authorization function were built on `groups-3501`
+following docs/superpowers/plans/2026-09-27-groups-guests-authorization-3501.md. The
+plan's rulings, open to challenge:
+
+- **The change stream.**
+  - It stops at `Hub`/`Subscription` in `fau-persistence`. The SSE route waits for #3417's
+    sessions, since nothing identifies a viewer yet.
+  - Each process holds one `LISTEN` connection, and every delivery is re-authorized for its
+    viewer.
+  - These close a membership's streams: revoking a role or a membership, and removing a
+    hand-added group member.
+  - A role reaching its end date closes the stream at its next delivery, without a timer.
+  - A revoked viewer's buffered stream events are discarded, not merely left to drain: it
+    must not go on reading changes it saw while it still had access.
+  - A listener reconnect, or a stream more than 64 deliveries behind, closes streams without
+    discarding what was already buffered; the client reconnects and refetches. On a listener
+    error the hub closes every stream at once, forces its own reconnect and re-`LISTEN`s,
+    then closes every stream again once that succeeds -- none of them, old or newly opened
+    during the outage, can be trusted to have seen everything since the connection dropped.
+- **Guest roles.** A guest role names exactly one group (`roles.group_id`, check
+  `(capability_class = 'guest') = (group_id is not null)`), and only a guest role names a
+  group. A guest role also carries no unit or cohort (constraint
+  `roles_guest_has_no_unit_or_cohort`). A guest in two groups holds two roles or is added by
+  hand. Guest invitations are refused, both at accept and at resend, if the group the guest
+  role names was archived meanwhile.
+- **Binding.** A group binds to at most one unit or cohort. A role holder is in it when the
+  role, valid today, names the group, sits on its unit or sits on its cohort. There is no
+  traversal through `unit_cohorts`.
+- **#3412's remainder.**
+  - Migrated: school years, cohorts, organization units and unit cohorts, all plaintext.
+    `unit_relation` is not migrated.
+  - No transactions create them yet: the initial school configuration is its own work.
+  - Unit kinds are `grade`, `class`, `base` and `teaching_group`, and grades are 1–10.
+- **Hidden means not found for every resource.** A viewer who cannot read something gets
+  the same answer as for an unknown id. `Forbidden` is used only where the viewer can read.
+- **Writing and freezing.**
+  - Writing to a group record is managing it, which is admin-only.
+  - An archived group is read-only for everyone, admins included, and archiving is
+    one-way.
+  - A frozen FAU refuses create, rename, open and add-member. It allows close, archive and
+    remove-member.
+- **Revoking a membership soft-removes its hand-added group memberships,** so a re-invite
+  does not return closed groups.
+- **Guests get no FAU-wide notices.** They receive no recovery notices, neither as current
+  members nor in the 24-month fallback, and a handover grant cannot invite a guest.
+- **Names.** A group name is at most 100 characters, and its ciphertext is 42–512 bytes
+  with version byte 1, checked in code and in the database.
+- **No user-facing strings and no new error codes** until #3417 maps these errors at the edge.
+- **Schema contract.** The minimum stays 2, since 0006 and 0007 are additive.
+
+The #3418 read-path audit found two shortcuts:
+- `access_request_message` checked for an admin directly; it is now routed through
+  `authorize`, which also means it now refuses admins of a pending or closed FAU (a frozen
+  FAU stays active, so it is not refused).
+- Recovery recipients counted any role; guests are now excluded.
+
+`effective_access` now reports `Capability::Guest`. The spec's "migrations stop at 0004" is
+stale: 0005 (#3506) came later.
+
+Proven end to end (`key_chain.rs`): a group's encrypted name never appears in Postgres as
+readable bytes, decrypts correctly under the FAU's record key inside a session, and its
+ciphertext is bound to its own row -- the same bytes under another group's id do not open.
+
+## #3501 execution: rulings the agent made overnight — 28 September 2026
+
+Erik authorized unattended execution. Every ruling below was made without him and is his to
+reverse. The branch is `groups-3501`: not merged, not pushed.
+
+**Two that change behaviour, for Erik to confirm:**
+- **An archived group can now be closed**; reopening it is still refused. The final review found
+  that the plan made archived groups impossible to close. Archiving is one-way in the MVP, so an
+  open group with sensitive history would have stayed readable to every member forever. Closing
+  is a reducing action, allowed under R13/R14.
+- **`access_request_message` refuses admins of `pending` or `closed` FAUs** (ruling P4). It now
+  goes through `authorize`, which requires an active tenant. A frozen FAU stays `active`, so its
+  admins still read.
+
+**Security gaps the reviews found and closed:**
+- A guest role could carry a unit or cohort, which would have put the guest into every group bound
+  to it. It is now refused by `roles_guest_has_no_unit_or_cohort`.
+- A guest invitation issued before its group was archived still seated the guest at accept, and
+  resend re-armed it. Both now refuse.
+- Under handover, the refusal order revealed whether a hidden group was archived. The guest check
+  now runs first.
+- A revoked viewer still received up to 64 buffered stream events. They are now discarded.
+- After some connection errors, the stream listener retried on a dead socket forever, so
+  revocations stopped closing streams. The listener is now rebuilt.
+
+**Open question for Erik:** a guest can propose a replacement for their own guest-role assignment.
+An admin still has to approve it. It was left as it is.
+
+**Environment:** the shared dev Postgres crash-restarted at 08:57 UTC (10:57 Oslo) under a full
+parallel test run. It is the known "exit code 2" crash. The crashed process had no connection log,
+so it was a background process. The hypothesis is Docker's 64 MB `/dev/shm` with parallel workers.
+The fix (`shm_size` or `max_parallel_workers_per_gather=0`) needs a db restart, which is Erik's
+call; tests run with `--test-threads=4` meanwhile.
+
+The deferred items are filed on #3417, #3419 and #3503.

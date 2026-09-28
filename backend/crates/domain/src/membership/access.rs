@@ -6,10 +6,14 @@ use jiff::civil::Date;
 use super::period::Period;
 use super::vocabulary::CapabilityClass;
 
-/// What a person may do in one FAU today. Ordered: `Admin` includes every `Member` right.
+/// What a person may do in one FAU today. Ordered: each class includes every right of the
+/// ones before it within the resources it can reach. `Guest` reaches only its own groups
+/// (groups design §3.3), so a capability is never, on its own, permission to read a
+/// resource: ask `fau_persistence::membership::authorize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
     None,
+    Guest,
     Member,
     Admin,
 }
@@ -83,6 +87,7 @@ pub fn evaluate_access(
         .iter()
         .filter(|a| a.valid_on(today))
         .map(|a| match a.capability {
+            CapabilityClass::Guest => Capability::Guest,
             CapabilityClass::Member => Capability::Member,
             CapabilityClass::Admin => Capability::Admin,
         })
@@ -396,5 +401,26 @@ mod tests {
         let admin = role(CapabilityClass::Admin, date(2026, 9, 1), date(2026, 12, 1));
         assert!(!removal_leaves_no_admin(&[], &[g], &[admin], &[], today));
         assert!(removal_leaves_no_admin(&[], &[], &[], &[g], today));
+    }
+
+    #[test]
+    fn a_guest_role_gives_guest_capability_and_a_member_role_outranks_it() {
+        let today = date(2026, 9, 23);
+        let guest = role(CapabilityClass::Guest, date(2026, 9, 1), date(2027, 9, 1));
+        let member = role(CapabilityClass::Member, date(2026, 9, 1), date(2027, 9, 1));
+        assert_eq!(
+            evaluate_access(OK, &[guest], &[], today).capability,
+            Capability::Guest
+        );
+        assert_eq!(
+            evaluate_access(OK, &[guest, member], &[], today).capability,
+            Capability::Member,
+            "rights are the union of valid roles"
+        );
+        assert!(Capability::None < Capability::Guest && Capability::Guest < Capability::Member);
+        assert!(
+            !tenant_has_admin(&[guest], &[], today),
+            "a guest role is never admin coverage"
+        );
     }
 }

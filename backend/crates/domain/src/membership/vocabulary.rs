@@ -4,11 +4,13 @@
 
 use std::fmt;
 
-/// The privilege a role grants. The class decides, never the role's name (§2.3).
+/// The privilege a role grants. The class decides, never the role's name (§2.3). A guest
+/// reaches only the groups its roles name or it was added to (groups design §3.1, D10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityClass {
     Member,
     Admin,
+    Guest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,13 @@ pub enum RecoveryHolder {
     SchoolRep,
 }
 
+/// Who besides its members and the admins may see a group (groups design §3.3, D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Open,
+    Closed,
+}
+
 macro_rules! codes {
     ($ty:ty { $($variant:ident => $code:literal),+ $(,)? }) => {
         impl $ty {
@@ -68,7 +77,8 @@ macro_rules! codes {
     };
 }
 
-codes!(CapabilityClass { Member => "member", Admin => "admin" });
+codes!(CapabilityClass { Member => "member", Admin => "admin", Guest => "guest" });
+codes!(Visibility { Open => "open", Closed => "closed" });
 codes!(TenantStatus { Pending => "pending", Active => "active", Closed => "closed" });
 codes!(InvitationMode {
     Normal => "normal",
@@ -142,6 +152,29 @@ impl FauName {
     }
 }
 
+/// A group's name ("Dugnadskomiteen", "Oppfølging av sak med rektor"). Content, so it is
+/// encrypted before it reaches persistence (groups design §3.1), and `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GroupName(String);
+
+impl GroupName {
+    pub const MAX_CHARS: usize = 100;
+
+    pub fn parse(raw: &str) -> Result<Self, NameError> {
+        validate_name(raw, Self::MAX_CHARS).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GroupName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GroupName([redacted])")
+    }
+}
+
 impl fmt::Debug for RoleName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RoleName([redacted])")
@@ -176,6 +209,7 @@ mod tests {
     round_trips!(request_kind_round_trips, RequestKind);
     round_trips!(request_status_round_trips, RequestStatus);
     round_trips!(recovery_holder_round_trips, RecoveryHolder);
+    round_trips!(visibility_round_trips, Visibility);
 
     #[test]
     fn codes_match_the_database_check_constraints() {
@@ -185,7 +219,7 @@ mod tests {
                 .iter()
                 .map(|v| v.code())
                 .collect::<Vec<_>>(),
-            ["member", "admin"]
+            ["member", "admin", "guest"]
         );
         assert_eq!(
             TenantStatus::ALL
@@ -222,6 +256,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ewb", "school_rep"]
         );
+        assert_eq!(
+            Visibility::ALL.iter().map(|v| v.code()).collect::<Vec<_>>(),
+            ["open", "closed"]
+        );
     }
 
     /// Final review M8: role and FAU names are free text an admin or registrant typed,
@@ -235,6 +273,10 @@ mod tests {
         assert_eq!(format!("{fau:?}"), "FauName([redacted])");
         assert!(!format!("{:?}", Some(&role)).contains("Kari"));
         assert!(!format!("{fau:#?}").contains("Nordre"));
+
+        let group = GroupName::parse("Oppfølging av sak med rektor").unwrap();
+        assert_eq!(format!("{group:?}"), "GroupName([redacted])");
+        assert!(!format!("{:?}", Some(&group)).contains("rektor"));
     }
 
     #[test]
@@ -253,5 +295,9 @@ mod tests {
             "Nordre Skole FAU"
         );
         assert_eq!(FauName::parse(&"x".repeat(201)), Err(NameError::TooLong));
+
+        assert_eq!(GroupName::parse(" Dugnad ").unwrap().as_str(), "Dugnad");
+        assert!(GroupName::parse(&"ø".repeat(100)).is_ok());
+        assert_eq!(GroupName::parse(&"ø".repeat(101)), Err(NameError::TooLong));
     }
 }

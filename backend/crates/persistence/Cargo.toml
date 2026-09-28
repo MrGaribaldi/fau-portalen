@@ -20,7 +20,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# mpsc for the change stream's subscriptions (membership/events.rs).
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 # Row ids (UUIDv7, ADR-002), already a workspace dependency.
 uuid = { workspace = true }

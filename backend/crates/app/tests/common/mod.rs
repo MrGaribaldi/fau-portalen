@@ -26,6 +26,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
+pub mod groups;
 pub mod membership;
 pub mod register;
 

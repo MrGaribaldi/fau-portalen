@@ -1,11 +1,18 @@
-//! The per-request access check (spec 2.1, 4; #3417 calls it on every request).
+//! The per-request access check (spec 2.1, 4; #3417 calls it on every request), and its
+//! per-membership form, which `authorize` and the change stream share.
+//!
+//! A capability is standing, not permission. `Capability::Guest` reaches only its own
+//! groups, and even a member does not read a closed group they are not in. So resource
+//! reads ask `authorize` (groups design §3.3), and nothing may read `capability >= Member`
+//! as "may read everything" (the #3418 read-path audit, #3501).
 
 use fau_domain::membership::access::{
     evaluate_access, Access, AssignmentView, GrantView, Standing,
 };
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_domain::time::Moment;
-use sqlx::PgPool;
+use jiff::civil::Date;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::error::MembershipError;
@@ -21,35 +28,53 @@ pub async fn effective_access(
     at: Moment,
 ) -> Result<Access, MembershipError> {
     let mut tx = pool.begin().await?;
-    // One snapshot for all three reads (final review M3): at READ COMMITTED each
-    // statement sees its own snapshot, so a revocation committing between them could
-    // pair a membership's old standing with its new assignments. REPEATABLE READ fixes
-    // the snapshot at the first query; READ ONLY because nothing here writes. It must be
-    // the transaction's first statement.
+    // One snapshot for every read (final review M3): at READ COMMITTED each statement
+    // sees its own snapshot, so a revocation committing between them could pair a
+    // membership's old standing with its new assignments. REPEATABLE READ fixes the
+    // snapshot at the first query; READ ONLY because nothing here writes. It must be the
+    // transaction's first statement.
     sqlx::query("set transaction isolation level repeatable read, read only")
         .execute(&mut *tx)
         .await?;
-    // Reads the two `Standing` fields that `USABLE_ACCOUNT` normally checks together
-    // from its own named conjuncts, rather than retyping the SQL by hand (fix round 1,
-    // task 10): `sql::tests::usable_account_is_the_conjunction_of_its_two_parts` keeps
-    // all three in sync.
+    let membership_id: Option<Uuid> =
+        sqlx::query_scalar("select id from memberships where tenant_id = $1 and account_id = $2")
+            .bind(tenant_id)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let access = match membership_id {
+        Some(id) => membership_access(&mut tx, tenant_id, id, at.today()).await?,
+        None => Access::NONE,
+    };
+    tx.commit().await?;
+    Ok(access)
+}
+
+/// What `membership_id` may do in `tenant_id` on `today`, on the caller's connection, so
+/// it shares the caller's transaction and snapshot. An unknown membership is no access.
+pub(crate) async fn membership_access(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    today: Date,
+) -> Result<Access, MembershipError> {
+    // The two `Standing` fields that `USABLE_ACCOUNT` normally checks together, read from
+    // its own named conjuncts rather than retyped by hand (fix round 1, task 10):
+    // `sql::tests::usable_account_is_the_conjunction_of_its_two_parts` keeps all three
+    // in sync.
     let sql = format!(
-        "select t.status = 'active',
-                {ACCOUNT_USABLE},
-                m.id,
-                coalesce({MEMBERSHIP_NOT_REVOKED}, false)
-           from tenants t
-           cross join accounts a
-           left join memberships m on m.tenant_id = t.id and m.account_id = a.id
-          where t.id = $1 and a.id = $2"
+        "select t.status = 'active', ({ACCOUNT_USABLE}), {MEMBERSHIP_NOT_REVOKED}
+           from memberships m
+           join tenants t  on t.id = m.tenant_id
+           join accounts a on a.id = m.account_id
+          where m.tenant_id = $1 and m.id = $2"
     );
-    let standing: Option<(bool, bool, Option<Uuid>, bool)> = sqlx::query_as(&sql)
+    let standing: Option<(bool, bool, bool)> = sqlx::query_as(&sql)
         .bind(tenant_id)
-        .bind(account_id)
-        .fetch_optional(&mut *tx)
+        .bind(membership_id)
+        .fetch_optional(&mut *conn)
         .await?;
-    let Some((tenant_active, account_usable, Some(membership_id), membership_active)) = standing
-    else {
+    let Some((tenant_active, account_usable, membership_active)) = standing else {
         return Ok(Access::NONE);
     };
 
@@ -63,7 +88,7 @@ pub async fn effective_access(
     )
     .bind(tenant_id)
     .bind(membership_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     let mut assignments = Vec::with_capacity(rows.len());
     for (class, starts, ends, revoked) in rows {
@@ -89,7 +114,7 @@ pub async fn effective_access(
     )
     .bind(tenant_id)
     .bind(membership_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     let mut grants = Vec::with_capacity(rows.len());
     for (starts, ends, revoked) in rows {
@@ -98,7 +123,6 @@ pub async fn effective_access(
             revoked,
         });
     }
-    tx.commit().await?;
 
     Ok(evaluate_access(
         Standing {
@@ -108,6 +132,6 @@ pub async fn effective_access(
         },
         &assignments,
         &grants,
-        at.today(),
+        today,
     ))
 }

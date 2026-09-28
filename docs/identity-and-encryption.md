@@ -34,14 +34,23 @@ otherwise.
 
 Encryption here defends against a **leak**, not against us.
 
-- A stolen database, a stolen backup, or a stolen object-storage bucket is inert on its own. The
-  keys are in none of them.
-- Reading one FAU's documents means driving the live application: seat a member, pass magic-link
-  verification, download. Then do it again for the next FAU. No step yields more than one FAU.
-- Every one of those steps is audited and notifies that FAU's members, so bulk exfiltration is
-  slow, linear in the number of FAU-er, and loud.
-- Root on a cluster node defeats all of it. This document says so rather than implying a
-  guarantee we cannot make.
+- A stolen database, a stolen backup, or a stolen object-storage bucket does not reveal content on
+  its own: the keys are in none of them. It is **not inert as a privacy event**, though. Login
+  emails, memberships and roles, school associations, poll votes and the UUIDv7 creation times
+  are plaintext because the product must query them.
+- A member or an administrator reading through the application is restricted by authorization,
+  per FAU, and audited.
+- **A compromised backend is not held to that path.** Its OpenBao credential can unwrap and
+  decrypt any FAU's keys, because the transit policy is not scoped by tenant, and it has direct
+  database access. It does not have to seat a member or pass verification, and nothing notifies
+  members. What bounds it is detection, and the mass-decryption alerts that would provide it are
+  **not yet live** (#3442). Until they are, do not describe bulk exfiltration as slow or loud.
+- Root on a cluster node, or cluster-admin, defeats all of it. This document says so rather than
+  implying a guarantee we cannot make.
+
+Corrected 27 September 2026 after an external review of the encryption design. The earlier
+bullets claimed a stolen database was inert, and that every step of reading an FAU notified its
+members. Both overstated what the implementation guarantees.
 
 **We never write "we cannot see your data."** Not in the DPA, not in privacy text, not in sales
 material. The accurate phrase is restricted and audited access. Claiming zero access while holding

@@ -42,9 +42,10 @@ pub use authz::{authorize, read_transaction, Resource, Viewer};
 pub use error::{ExistingFau, MembershipError};
 pub use events::{Change, Hub, HubClock, Subscription, EVENTS_CHANNEL, SUBSCRIPTION_BUFFER};
 pub use groups::{
-    add_group_member, archive_group, create_group, remove_group_member, rename_group,
-    set_group_visibility, ArchiveGroup, CreateGroup, GroupBinding, GroupMemberChange, RenameGroup,
-    SetGroupVisibility, GROUP_NAME_AAD, GROUP_NAME_CIPHERTEXT_BYTES,
+    add_group_member, archive_group, create_group, get_group, list_group_members, list_groups,
+    remove_group_member, rename_group, set_group_visibility, ArchiveGroup, CreateGroup,
+    GroupBinding, GroupMemberChange, GroupMemberView, GroupView, RenameGroup, SetGroupVisibility,
+    GROUP_NAME_AAD, GROUP_NAME_CIPHERTEXT_BYTES,
 };
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{

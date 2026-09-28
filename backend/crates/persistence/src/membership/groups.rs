@@ -19,18 +19,24 @@
 use std::ops::RangeInclusive;
 
 use fau_crypto::Ciphertext;
-use fau_domain::authz::Action;
+use fau_domain::authz::{decide, Action, GroupFacts, Target};
+use fau_domain::membership::access::Capability;
 use fau_domain::membership::vocabulary::Visibility;
 use fau_domain::time::Moment;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::authz::{authorize, denied, Resource, Viewer};
+use super::access::membership_access;
+use super::authz::{
+    authorize, denied, in_group_sql, read_transaction, Resource, Viewer, ASSIGNMENT_VALID_ON_3,
+    ROLE_FOLLOWS_GROUP,
+};
 use super::error::MembershipError;
 use super::events::{notify, Change};
 use super::sql::{
-    lock_tenant, membership_and_account_state, require_open, ts_param, write_audit, Audit,
+    date_param, lock_tenant, membership_and_account_state, require_open, ts_param, write_audit,
+    Audit, USABLE_ACCOUNT,
 };
 
 /// The associated data a group name is encrypted with, with the tenant and the group's id.
@@ -570,4 +576,176 @@ pub(crate) async fn remove_from_all_groups(
         notify(conn, tenant_id, Change::Changed(Resource::Group(group_id))).await?;
     }
     Ok(())
+}
+
+/// A group as a viewer may see it. The name is the stored ciphertext; the session decrypts
+/// it under the record key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupView {
+    pub group_id: Uuid,
+    pub encrypted_name: Ciphertext,
+    pub visibility: Visibility,
+    pub archived: bool,
+    pub binding: Option<GroupBinding>,
+    /// Whether the viewer is a current member (by hand or through a role).
+    pub viewer_in_group: bool,
+}
+
+/// One current member of a group, and how they are in it. A person can be both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupMemberView {
+    pub membership_id: Uuid,
+    pub added_by_hand: bool,
+    pub through_role: bool,
+}
+
+type GroupRow = (
+    Uuid,
+    Vec<u8>,
+    String,
+    bool,
+    Option<Uuid>,
+    Option<Uuid>,
+    bool,
+);
+
+fn group_select() -> String {
+    format!(
+        "select g.id, g.encrypted_name, g.visibility, g.archived_at is not null,
+                g.unit_id, g.cohort_id, {}
+           from groups g
+          where g.tenant_id = $1",
+        in_group_sql()
+    )
+}
+
+fn view(row: GroupRow) -> Result<GroupView, MembershipError> {
+    let (group_id, name, visibility, archived, unit_id, cohort_id, viewer_in_group) = row;
+    let binding = match (unit_id, cohort_id) {
+        (None, None) => None,
+        (Some(unit), None) => Some(GroupBinding::Unit(unit)),
+        (None, Some(cohort)) => Some(GroupBinding::Cohort(cohort)),
+        (Some(_), Some(_)) => return Err(MembershipError::decode()),
+    };
+    Ok(GroupView {
+        group_id,
+        encrypted_name: Ciphertext::from_stored(name),
+        visibility: Visibility::from_code(&visibility).ok_or_else(MembershipError::decode)?,
+        archived,
+        binding,
+        viewer_in_group,
+    })
+}
+
+/// Every group the viewer may read (§3.3): all of them for an admin; open ones and their
+/// own closed ones for a member; only their own for a guest. One snapshot, with the same
+/// facts and the same rule `authorize` uses (Ruling R11).
+pub async fn list_groups(
+    pool: &PgPool,
+    viewer: Viewer,
+    at: Moment,
+) -> Result<Vec<GroupView>, MembershipError> {
+    let mut tx = read_transaction(pool).await?;
+    let access =
+        membership_access(&mut tx, viewer.tenant_id, viewer.membership_id, at.today()).await?;
+    if access.capability == Capability::None {
+        return Err(MembershipError::NotAuthorized);
+    }
+    let sql = format!("{} order by g.id", group_select());
+    let rows: Vec<GroupRow> = sqlx::query_as(&sql)
+        .bind(viewer.tenant_id)
+        .bind(viewer.membership_id)
+        .bind(date_param(at.today()))
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let mut visible = Vec::new();
+    for row in rows {
+        let group = view(row)?;
+        let facts = GroupFacts {
+            visibility: group.visibility,
+            archived: group.archived,
+            viewer_in_group: group.viewer_in_group,
+        };
+        if decide(access.capability, Target::Group(facts), Action::Read).is_ok() {
+            visible.push(group);
+        }
+    }
+    Ok(visible)
+}
+
+/// One group, if the viewer may read it; `UnknownGroup` otherwise, exactly as for an id
+/// that does not exist.
+pub async fn get_group(
+    pool: &PgPool,
+    viewer: Viewer,
+    group_id: Uuid,
+    at: Moment,
+) -> Result<GroupView, MembershipError> {
+    let mut tx = read_transaction(pool).await?;
+    authorize(&mut tx, viewer, Resource::Group(group_id), Action::Read, at)
+        .await?
+        .map_err(|d| denied(d, MembershipError::UnknownGroup))?;
+    let sql = format!("{} and g.id = $4", group_select());
+    let row: GroupRow = sqlx::query_as(&sql)
+        .bind(viewer.tenant_id)
+        .bind(viewer.membership_id)
+        .bind(date_param(at.today()))
+        .bind(group_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    view(row)
+}
+
+/// The group's current members: added by hand and not removed, or holding a role valid
+/// today that the group follows. Only people with standing today count: a usable
+/// membership with some role valid today. Readable exactly when the group is (Ruling R22).
+pub async fn list_group_members(
+    pool: &PgPool,
+    viewer: Viewer,
+    group_id: Uuid,
+    at: Moment,
+) -> Result<Vec<GroupMemberView>, MembershipError> {
+    let mut tx = read_transaction(pool).await?;
+    authorize(&mut tx, viewer, Resource::Group(group_id), Action::Read, at)
+        .await?
+        .map_err(|d| denied(d, MembershipError::UnknownGroup))?;
+    let sql = format!(
+        "select s.membership_id, bool_or(s.by_hand), bool_or(not s.by_hand)
+           from (select gm.membership_id, true as by_hand
+                   from group_members gm
+                  where gm.tenant_id = $1 and gm.group_id = $2 and gm.removed_at is null
+                 union all
+                 select ra.membership_id, false
+                   from groups g
+                   join roles r             on r.tenant_id = g.tenant_id and {ROLE_FOLLOWS_GROUP}
+                   join role_assignments ra on ra.tenant_id = r.tenant_id and ra.role_id = r.id
+                  where g.tenant_id = $1 and g.id = $2 and {ASSIGNMENT_VALID_ON_3}) s
+           join memberships m on m.tenant_id = $1 and m.id = s.membership_id
+           join accounts a    on a.id = m.account_id
+          where {USABLE_ACCOUNT}
+            and exists (select 1 from role_assignments ra
+                         where ra.tenant_id = m.tenant_id and ra.membership_id = m.id
+                           and {ASSIGNMENT_VALID_ON_3})
+          group by s.membership_id
+          order by s.membership_id"
+    );
+    let rows: Vec<(Uuid, bool, bool)> = sqlx::query_as(&sql)
+        .bind(viewer.tenant_id)
+        .bind(group_id)
+        .bind(date_param(at.today()))
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(membership_id, added_by_hand, through_role)| GroupMemberView {
+                membership_id,
+                added_by_hand,
+                through_role,
+            },
+        )
+        .collect())
 }

@@ -222,6 +222,12 @@ the nodes must run without swap) blocks
 - messages use transit encrypt directly;
 - deletion is `ops/openbao/shred.sh` (soft delete, then hard delete after 7 days).
 
+**#3501 is built** on branch `groups-3501` (28 September), not merged: groups, the guest class,
+one authorization function (`fau_domain::authz::decide` plus `fau_persistence::membership::authorize`),
+and the per-FAU change stream. There is no HTTP SSE route until #3417. Every read path must call
+`authorize` inside `read_transaction`. The shared dev Postgres crash-restarts under full parallel
+tests, so run `cargo test --workspace -- --test-threads=4`.
+
 **Archiving for non-payment** (#3509, docs/fau-archive-design.md, awaiting Erik's review) is paused,
 not deleted. It is read-only first with keys live, then keys are soft-deleted for up to 365 days.
 Published pages stay online, and exports last 90 days under their own key. It builds on shred.sh's

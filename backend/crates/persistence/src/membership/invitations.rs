@@ -18,6 +18,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::error::MembershipError;
+use super::profile::{write_profile, MemberProfile};
 use super::sql::{
     date_param, enqueue, ensure_membership, from_micros, handover_grant_valid, insert_assignment,
     is_admin_today, lock_tenant, membership_usable, period_from, recovery_notice_recipients,
@@ -720,6 +721,10 @@ pub struct AcceptInvitation {
     /// invitation offers (spec 3.4.3, 3.5), within the same 1–24 month range. Refused on
     /// any other mode.
     pub admin_end_override: Option<Date>,
+    /// The acceptor's display name, and optionally a contact address, encrypted for
+    /// `prepare_acceptance`'s membership id (groups design §4.1, #3502). Required: this is
+    /// where names enter the system.
+    pub profile: MemberProfile,
 }
 
 /// Hand-written so `token` never reaches a log line the way a derived `Debug` would.
@@ -729,6 +734,7 @@ impl fmt::Debug for AcceptInvitation {
             .field("token", &"[redacted]")
             .field("acceptor", &self.acceptor)
             .field("admin_end_override", &self.admin_end_override)
+            .field("profile", &self.profile)
             .finish()
     }
 }
@@ -755,6 +761,7 @@ pub async fn accept_invitation(
     if !looks_like_token(&req.token) {
         return Err(MembershipError::UnknownInvitation);
     }
+    req.profile.check()?;
     let hash = hash_token(&req.token);
     let mut tx = pool.begin().await?;
 
@@ -868,7 +875,9 @@ pub async fn accept_invitation(
     };
 
     let (account_id, _) = upsert_verified_account(&mut tx, &acceptor_email, at).await?;
-    let (membership_id, reused) = ensure_membership(&mut tx, tenant_id, account_id).await?;
+    let (membership_id, reused) =
+        ensure_membership(&mut tx, tenant_id, account_id, req.profile.membership_id).await?;
+    write_profile(&mut tx, tenant_id, &req.profile).await?;
     let mut assignment_ids = Vec::with_capacity(roles.len());
     for (role_id, _, period) in &roles {
         assignment_ids.push(
@@ -932,6 +941,54 @@ pub async fn accept_invitation(
     })
 }
 
+/// Which FAU and which membership an acceptance will write to, so the caller can fetch that
+/// FAU's record key and encrypt the acceptor's profile for that membership's id before
+/// calling [`accept_invitation`] (#3502). The membership is the acceptor's existing one in
+/// that FAU -- a re-invited former member keeps theirs -- or a fresh UUIDv7 that becomes the
+/// new row's id.
+///
+/// Reads only. It answers for any invitation the token names, pending or not, as long as
+/// the verified address is its recipient: [`accept_invitation`] then gives the precise
+/// refusal (expired, withdrawn, already accepted). Every other failure is
+/// `UnknownInvitation`, so the answer never says which part failed.
+pub async fn prepare_acceptance(
+    pool: &PgPool,
+    token: &str,
+    acceptor: &VerifiedEmail,
+) -> Result<AcceptanceTarget, MembershipError> {
+    if !looks_like_token(token) {
+        return Err(MembershipError::UnknownInvitation);
+    }
+    let row: Option<(Uuid, String)> =
+        sqlx::query_as("select tenant_id, recipient_email from invitations where token_hash = $1")
+            .bind(hash_token(token))
+            .fetch_optional(pool)
+            .await?;
+    let (tenant_id, recipient) = row.ok_or(MembershipError::UnknownInvitation)?;
+    if recipient != acceptor.email().as_str() {
+        return Err(MembershipError::UnknownInvitation);
+    }
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "select m.id from memberships m join accounts a on a.id = m.account_id
+          where m.tenant_id = $1 and a.email = $2",
+    )
+    .bind(tenant_id)
+    .bind(acceptor.email().as_str())
+    .fetch_optional(pool)
+    .await?;
+    Ok(AcceptanceTarget {
+        tenant_id,
+        membership_id: existing.unwrap_or_else(Uuid::now_v7),
+    })
+}
+
+/// Where an acceptance will write: see [`prepare_acceptance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptanceTarget {
+    pub tenant_id: Uuid,
+    pub membership_id: Uuid,
+}
+
 /// The invitee's view of the message (decision of 24 September 2026). Every failure is
 /// `UnknownInvitation`, so the answer never says which part failed.
 pub async fn invitation_message(
@@ -988,6 +1045,11 @@ mod tests {
             token: token.clone(),
             acceptor: VerifiedEmail::from_provider(Email::parse("ny@example.test").unwrap()),
             admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: Uuid::now_v7(),
+                encrypted_display_name: fau_crypto::Ciphertext::from_stored(vec![1; 42]),
+                encrypted_contact_email: None,
+            },
         };
         let debug = format!("{req:?}");
         assert!(!debug.contains(&token));

@@ -248,22 +248,36 @@ pub(crate) async fn upsert_verified_account(
     .await?)
 }
 
-/// Finds or creates the account's membership in the tenant. A revoked membership is
-/// reopened rather than duplicated (one membership per account per FAU, #3412); the
-/// revocation stays in the audit log. Returns the id and whether it already existed.
+/// Finds or creates the account's membership in the tenant, as `expected_id`. A revoked
+/// membership is reopened rather than duplicated (one membership per account per FAU,
+/// #3412); the revocation stays in the audit log. Returns the id and whether it already
+/// existed.
+///
+/// `expected_id` is the id the caller encrypted the member's profile for (#3502): the
+/// existing membership's id, or a fresh one that becomes the new row's. An existing
+/// membership under any other id is `AcceptanceTargetChanged`, so a profile can never land
+/// on a row its associated data does not name; an erased one is `MembershipErased`.
 pub(crate) async fn ensure_membership(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     account_id: Uuid,
+    expected_id: Uuid,
 ) -> Result<(Uuid, bool), MembershipError> {
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "select id from memberships where tenant_id = $1 and account_id = $2 for update",
+    let existing: Option<(Uuid, bool)> = sqlx::query_as(
+        "select id, name_erased_at is not null from memberships
+          where tenant_id = $1 and account_id = $2 for update",
     )
     .bind(tenant_id)
     .bind(account_id)
     .fetch_optional(&mut *conn)
     .await?;
-    if let Some(id) = existing {
+    if let Some((id, erased)) = existing {
+        if id != expected_id {
+            return Err(MembershipError::AcceptanceTargetChanged);
+        }
+        if erased {
+            return Err(MembershipError::MembershipErased);
+        }
         sqlx::query("update memberships set revoked_at = null where tenant_id = $1 and id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -271,14 +285,13 @@ pub(crate) async fn ensure_membership(
             .await?;
         return Ok((id, true));
     }
-    let id = Uuid::now_v7();
     sqlx::query("insert into memberships (tenant_id, id, account_id) values ($1, $2, $3)")
         .bind(tenant_id)
-        .bind(id)
+        .bind(expected_id)
         .bind(account_id)
         .execute(&mut *conn)
         .await?;
-    Ok((id, false))
+    Ok((expected_id, false))
 }
 
 /// Inserts a role assignment and returns its id.

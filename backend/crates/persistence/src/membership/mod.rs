@@ -31,6 +31,7 @@ mod events;
 mod groups;
 mod handover;
 mod invitations;
+mod profile;
 mod requests;
 mod roles;
 mod signup;
@@ -49,10 +50,13 @@ pub use groups::{
 };
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{
-    accept_invitation, invitation_message, issue_invitation, resend_invitation,
-    withdraw_invitation, AcceptInvitation, Accepted, InvitationChange, InvitationMessage,
-    InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,
-    INVITATION_MESSAGE_AAD,
+    accept_invitation, invitation_message, issue_invitation, prepare_acceptance, resend_invitation,
+    withdraw_invitation, AcceptInvitation, AcceptanceTarget, Accepted, InvitationChange,
+    InvitationMessage, InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole,
+    RoleChoice, INVITATION_MESSAGE_AAD,
+};
+pub use profile::{
+    MemberProfile, CONTACT_EMAIL_AAD, DISPLAY_NAME_AAD, MEMBER_FIELD_CIPHERTEXT_BYTES,
 };
 pub use requests::{
     access_request_message, approve_request, create_access_request, create_replacement_proposal,

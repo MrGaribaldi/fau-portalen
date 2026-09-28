@@ -73,6 +73,7 @@ async fn a_second_signup_for_a_school_is_refused_and_copied_to_ewb() {
         Activation {
             tenant_id: first.tenant_id,
             registrant: verified("a@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -228,6 +229,7 @@ async fn a_pending_fau_expires_after_seven_days_and_frees_the_school() {
             Activation {
                 tenant_id: pending.tenant_id,
                 registrant: verified("r@example.test"),
+                profile: fresh_profile(),
             },
             later,
         )
@@ -258,6 +260,7 @@ async fn an_expired_pending_fau_does_not_hold_its_school_before_the_sweep() {
             Activation {
                 tenant_id: pending.tenant_id,
                 registrant: verified("r@example.test"),
+                profile: fresh_profile(),
             },
             late,
         )
@@ -309,6 +312,7 @@ async fn activation_writes_everything_together() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -440,6 +444,7 @@ async fn activation_is_all_or_nothing() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -499,6 +504,7 @@ async fn activation_requires_the_registrants_own_address() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("someone-else@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -639,6 +645,7 @@ async fn activating_an_already_active_fau_is_refused() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -650,6 +657,7 @@ async fn activating_an_already_active_fau_is_refused() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -689,6 +697,7 @@ async fn activating_a_frozen_fau_is_refused() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -736,6 +745,7 @@ async fn activating_with_a_disabled_account_is_refused() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -799,6 +809,7 @@ async fn activation_refuses_a_signup_whose_admin_end_is_not_after_today() {
         Activation {
             tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )

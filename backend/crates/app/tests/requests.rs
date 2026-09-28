@@ -156,6 +156,7 @@ async fn approving_issues_a_normal_invitation_linked_to_the_request() {
             token: issued.token.expose().to_owned(),
             acceptor: verified("ny@example.test"),
             admin_end_override: None,
+            profile: fresh_profile(),
         },
         t0,
     )

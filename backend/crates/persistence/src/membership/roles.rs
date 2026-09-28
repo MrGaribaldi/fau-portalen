@@ -255,7 +255,13 @@ pub async fn revoke_membership(
 
     let now = ts_param(at.now());
     sqlx::query(
-        "update memberships set revoked_at = $3::timestamptz where tenant_id = $1 and id = $2",
+        // Neither field outlives the membership (D3, 28 September 2026): history shows an
+        // ended membership as its role and year, never a name. Migration 0008's two
+        // *_only_while_current checks refuse a revocation that forgets either.
+        "update memberships
+            set revoked_at = $3::timestamptz,
+                encrypted_display_name = null, encrypted_contact_email = null
+          where tenant_id = $1 and id = $2",
     )
     .bind(req.tenant_id)
     .bind(req.membership_id)

@@ -33,6 +33,7 @@ fn accept(token: &str, acceptor: &str) -> AcceptInvitation {
         token: token.to_owned(),
         acceptor: verified(acceptor),
         admin_end_override: None,
+        profile: fresh_profile(),
     }
 }
 
@@ -1270,9 +1271,13 @@ async fn a_removed_admin_does_not_regain_handover_through_reopen_and_the_sweep()
     )
     .await
     .unwrap();
+    // A reopened membership keeps its id, so the profile is encrypted for it (#3502).
     let back = accept_invitation(
         &pool,
-        accept(issued.token.expose(), "admin@example.test"),
+        AcceptInvitation {
+            profile: profile_for(&pool, issued.token.expose(), "admin@example.test").await,
+            ..accept(issued.token.expose(), "admin@example.test")
+        },
         d,
     )
     .await

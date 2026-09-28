@@ -56,7 +56,8 @@ pub use invitations::{
     RoleChoice, INVITATION_MESSAGE_AAD,
 };
 pub use profile::{
-    MemberProfile, CONTACT_EMAIL_AAD, DISPLAY_NAME_AAD, MEMBER_FIELD_CIPHERTEXT_BYTES,
+    set_contact_email, set_display_name, MemberProfile, SetContactEmail, SetDisplayName,
+    CONTACT_EMAIL_AAD, DISPLAY_NAME_AAD, MEMBER_FIELD_CIPHERTEXT_BYTES,
 };
 pub use requests::{
     access_request_message, approve_request, create_access_request, create_replacement_proposal,

@@ -306,6 +306,7 @@ async fn a_handover_acceptance_by_an_already_active_member_keeps_their_stored_ad
         &pool,
         first_issued.token.expose(),
         &verified("kari@example.test"),
+        at(T0),
     )
     .await
     .unwrap();
@@ -348,9 +349,14 @@ async fn a_handover_acceptance_by_an_already_active_member_keeps_their_stored_ad
     )
     .await
     .unwrap();
-    let target = prepare_acceptance(&pool, issued.token.expose(), &verified("kari@example.test"))
-        .await
-        .unwrap();
+    let target = prepare_acceptance(
+        &pool,
+        issued.token.expose(),
+        &verified("kari@example.test"),
+        inside,
+    )
+    .await
+    .unwrap();
     assert_eq!(target.membership_id, kari, "the same membership");
     assert!(target.existing_current, "already active and named");
 
@@ -1396,7 +1402,7 @@ async fn a_removed_admin_does_not_regain_handover_through_reopen_and_the_sweep()
     let back = accept_invitation(
         &pool,
         AcceptInvitation {
-            profile: profile_for(&pool, issued.token.expose(), "admin@example.test").await,
+            profile: profile_for(&pool, issued.token.expose(), "admin@example.test", d).await,
             ..accept(issued.token.expose(), "admin@example.test")
         },
         d,

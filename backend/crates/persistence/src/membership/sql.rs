@@ -258,27 +258,35 @@ pub(crate) async fn upsert_verified_account(
 /// membership under any other id is `AcceptanceTargetChanged`, so a profile can never land
 /// on a row its associated data does not name; an erased one is `MembershipErased`.
 ///
-/// The third value, `already_current`, is true exactly when an existing row's
-/// `revoked_at` was already null: an active member accepting a second invitation (a
-/// handover to a sitting member, or recovery). `write_profile` uses it to decide whether
-/// to keep a stored contact address the caller's profile leaves unstated (fix round 1,
-/// Q10) -- a freshly created or freshly reopened row is never `already_current`, and has
-/// no address to keep either way, since D3 clears both fields on revocation.
+/// The third value, `already_current`, is true exactly when an existing row had not
+/// ended (`profile::membership_ended`, D3): an active member accepting a second
+/// invitation (a handover to a sitting member, or recovery). `write_profile` uses it to
+/// decide whether to keep a stored contact address the caller's profile leaves unstated
+/// (fix round 1, Q10) -- a freshly created or freshly reopened row is never
+/// `already_current`, and has no address to keep either way, since D3 clears both fields
+/// once a membership ends. A row whose roles simply ran out, re-invited before the sweep
+/// reaches it, is `already_current = false` too: it holds no address to keep (controller
+/// ruling, Task 5 review).
 pub(crate) async fn ensure_membership(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     account_id: Uuid,
     expected_id: Uuid,
+    today: Date,
 ) -> Result<(Uuid, bool, bool), MembershipError> {
-    let existing: Option<(Uuid, bool, bool)> = sqlx::query_as(
-        "select id, revoked_at is not null, name_erased_at is not null from memberships
-          where tenant_id = $1 and account_id = $2 for update",
-    )
-    .bind(tenant_id)
-    .bind(account_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some((id, was_revoked, erased)) = existing {
+    let sql = format!(
+        "select m.id, m.revoked_at is not null, m.name_erased_at is not null, {}
+           from memberships m
+          where m.tenant_id = $1 and m.account_id = $2 for update",
+        super::profile::membership_ended("$3")
+    );
+    let existing: Option<(Uuid, bool, bool, bool)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(date_param(today))
+        .fetch_optional(&mut *conn)
+        .await?;
+    if let Some((id, was_revoked, erased, ended)) = existing {
         if id != expected_id {
             return Err(MembershipError::AcceptanceTargetChanged);
         }
@@ -294,7 +302,7 @@ pub(crate) async fn ensure_membership(
             .execute(&mut *conn)
             .await?;
         }
-        return Ok((id, true, !was_revoked));
+        return Ok((id, true, !ended));
     }
     sqlx::query("insert into memberships (tenant_id, id, account_id) values ($1, $2, $3)")
         .bind(tenant_id)

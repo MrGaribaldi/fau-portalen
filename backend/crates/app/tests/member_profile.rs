@@ -77,7 +77,7 @@ async fn acceptance_stores_the_name_and_the_optional_address_on_the_prepared_mem
         ("ola@example.test", None),
     ] {
         let token = invite(&pool, &fau, address).await;
-        let target = prepare_acceptance(&pool, &token, &verified(address))
+        let target = prepare_acceptance(&pool, &token, &verified(address), at(T0))
             .await
             .unwrap();
         assert_eq!(target.tenant_id, fau.tenant_id);
@@ -264,12 +264,19 @@ async fn a_profile_for_another_membership_is_refused() {
         "revocation took the name (D3)"
     );
 
-    // Invited back: prepare names the old membership, which acceptance reopens.
+    // Invited back: prepare names the old membership, which acceptance reopens. Revoked,
+    // it is not existing_current (controller ruling, Task 5 review: the same shared
+    // `membership_ended` check `ensure_membership` and editing use).
+    //
+    // Mutation check: drop the `revoked_at is not null` arm from `membership_ended`, and
+    // this fails: a row revoked only through this path -- not through
+    // `revoke_role_assignment` -- would be reported active.
     let token = invite(&pool, &fau, "kari@example.test").await;
-    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
     assert_eq!(target.membership_id, first.membership_id);
+    assert!(!target.existing_current, "revoked, so not existing_current");
 
     // A profile encrypted for any other id would be undecryptable on that row: refused,
     // and the membership stays revoked.
@@ -336,7 +343,7 @@ async fn prepare_names_only_this_faus_membership_and_only_for_the_recipient() {
     )
     .await;
     let token = invite(&pool, &a, "kari@example.test").await;
-    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
     assert_eq!(target.tenant_id, a.tenant_id);
@@ -344,7 +351,7 @@ async fn prepare_names_only_this_faus_membership_and_only_for_the_recipient() {
         target.membership_id, in_b.membership_id,
         "a membership in another FAU is never reused"
     );
-    let again = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+    let again = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
     assert_ne!(again.membership_id, target.membership_id, "fresh each time");
@@ -356,7 +363,7 @@ async fn prepare_names_only_this_faus_membership_and_only_for_the_recipient() {
         (&"a".repeat(64)[..], "kari@example.test"),
     ] {
         assert_eq!(
-            prepare_acceptance(&pool, token, &verified(reader))
+            prepare_acceptance(&pool, token, &verified(reader), t0)
                 .await
                 .unwrap_err(),
             MembershipError::UnknownInvitation,
@@ -372,7 +379,7 @@ async fn prepare_answers_for_an_expired_invitation_so_acceptance_can_say_why() {
     let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
     let token = invite(&pool, &fau, "kari@example.test").await;
     let late = at("2027-06-01T10:00:00Z");
-    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), at(T0))
         .await
         .unwrap();
     let err = accept_invitation(
@@ -406,14 +413,14 @@ async fn prepare_reports_existing_current_only_for_an_active_named_membership() 
 
     // Negative control: never a member here.
     let fresh_token = invite(&pool, &fau, "ny@example.test").await;
-    let fresh = prepare_acceptance(&pool, &fresh_token, &verified("ny@example.test"))
+    let fresh = prepare_acceptance(&pool, &fresh_token, &verified("ny@example.test"), t0)
         .await
         .unwrap();
     assert!(!fresh.existing_current, "never joined");
 
     // Kari accepts once, so her membership is active and named.
     let token = invite(&pool, &fau, "kari@example.test").await;
-    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
     assert!(!target.existing_current, "not yet a member");
@@ -436,11 +443,186 @@ async fn prepare_reports_existing_current_only_for_an_active_named_membership() 
 
     // A second invitation to the same address now prepares against an active, named row.
     let second_token = invite(&pool, &fau, "kari@example.test").await;
-    let second = prepare_acceptance(&pool, &second_token, &verified("kari@example.test"))
+    let second = prepare_acceptance(&pool, &second_token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
     assert_eq!(second.membership_id, target.membership_id);
     assert!(second.existing_current, "active and named");
+}
+
+/// Controller ruling, Task 5 review: `already_current` only means "no address to keep
+/// unstated" -- it never means "keep the old address regardless". A second invitation to
+/// an already-active member that states a fresh address replaces the stored one.
+///
+/// Mutation check: change `write_profile`'s case condition from `$5 and $4 is null` to
+/// bare `$5`, and this fails: the fresh address (9) would be silently dropped in favour of
+/// the one already stored (2).
+#[tokio::test]
+async fn an_already_current_membership_stating_a_fresh_address_has_it_replace_the_stored_one() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let token = invite(&pool, &fau, "kari@example.test").await;
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
+        .await
+        .unwrap();
+    let kari = accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token,
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: target.membership_id,
+                encrypted_display_name: envelope(1),
+                encrypted_contact_email: Some(envelope(2)),
+            },
+        },
+        t0,
+    )
+    .await
+    .unwrap()
+    .membership_id;
+
+    // A second invitation reaches the same, still-active member, and states a new
+    // address this time.
+    let second_token = invite(&pool, &fau, "kari@example.test").await;
+    let second = prepare_acceptance(&pool, &second_token, &verified("kari@example.test"), t0)
+        .await
+        .unwrap();
+    assert!(second.existing_current, "active and named");
+    accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token: second_token,
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: second.membership_id,
+                encrypted_display_name: envelope(3),
+                encrypted_contact_email: Some(envelope(9)),
+            },
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fields(&pool, kari).await,
+        (
+            Some(envelope(3).as_bytes().to_vec()),
+            Some(envelope(9).as_bytes().to_vec())
+        ),
+        "the stated address replaces the stored one"
+    );
+}
+
+/// Controller ruling, Task 5 review: a membership whose roles simply ran out -- not
+/// revoked, but the retention sweep hasn't reached it yet -- is `already_current = false`
+/// too, the same as a revoked one. Re-invited the same day, before the sweep, it holds no
+/// address to keep.
+///
+/// Mutation check: revert `ensure_membership`'s third return value to `!was_revoked`
+/// (dropping the shared `membership_ended` check), and this fails: the stale address (2)
+/// survives the second acceptance instead of being dropped.
+#[tokio::test]
+async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_drops_its_address() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let issued = issue_invitation(
+        &pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            recipient: email("kari@example.test"),
+            roles: vec![OfferedRole {
+                role: new_role("Medlem", CapabilityClass::Member),
+                period: period(day(2026, 9, 1), day(2026, 10, 1)),
+            }],
+            handover_grant_id: None,
+            message: None,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let token = issued.token.expose().to_owned();
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
+        .await
+        .unwrap();
+    let kari = accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token,
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: target.membership_id,
+                encrypted_display_name: envelope(1),
+                encrypted_contact_email: Some(envelope(2)),
+            },
+        },
+        t0,
+    )
+    .await
+    .unwrap()
+    .membership_id;
+
+    // Her only role ends 2026-10-01. The same day, ahead of any sweep, she is invited
+    // back to a fresh role.
+    let after = at("2026-10-01T09:00:00Z");
+    let issued_again = issue_invitation(
+        &pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            recipient: email("kari@example.test"),
+            roles: vec![OfferedRole {
+                role: new_role("Medlem", CapabilityClass::Member),
+                period: period(day(2026, 10, 1), day(2027, 9, 1)),
+            }],
+            handover_grant_id: None,
+            message: None,
+        },
+        after,
+    )
+    .await
+    .unwrap();
+    let token_again = issued_again.token.expose().to_owned();
+    let target_again =
+        prepare_acceptance(&pool, &token_again, &verified("kari@example.test"), after)
+            .await
+            .unwrap();
+    assert_eq!(target_again.membership_id, kari, "the same row is reused");
+    assert!(
+        !target_again.existing_current,
+        "roles had run out, ahead of the sweep"
+    );
+
+    accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token: token_again,
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: target_again.membership_id,
+                encrypted_display_name: envelope(3),
+                encrypted_contact_email: None,
+            },
+        },
+        after,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fields(&pool, kari).await,
+        (Some(envelope(3).as_bytes().to_vec()), None),
+        "an ended membership's old address is not kept, even though the row was never revoked"
+    );
 }
 
 /// Both fields go with the membership (D3). Without the clearing in `revoke_membership`,
@@ -453,7 +635,7 @@ async fn revoking_a_membership_clears_its_name_and_contact_address() {
     let t0 = at(T0);
     let fau = active_fau(&pool, "admin@example.test", t0).await;
     let token = invite(&pool, &fau, "kari@example.test").await;
-    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"))
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
     let kari = accept_invitation(

@@ -9,14 +9,26 @@
 //!
 //! **The contact address is the member's own statement.** It is not verified, and no system
 //! mail is ever sent to it: login, invitations and recovery keep using the account address.
+//! So only the member sets it. An admin may correct a name, not an address.
+//!
+//! **Neither field outlives the membership** (Erik's D3, 28 September 2026). Once a
+//! membership has ended ([`membership_ended`]) it holds no name, so no edit gives it one;
+//! history shows it as its role and year instead (`member_names`).
+//!
+//! **Order** (as in the rest of `membership`): tenant state, then authority, then row state.
 
 use std::ops::RangeInclusive;
 
 use fau_crypto::Ciphertext;
-use sqlx::PgConnection;
+use fau_domain::membership::access::Capability;
+use fau_domain::time::Moment;
+use serde_json::json;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::access::membership_access;
 use super::error::MembershipError;
+use super::sql::{date_param, is_admin_today, lock_tenant, require_open, write_audit, Audit};
 
 /// The associated data a display name is encrypted with, with the tenant and the
 /// membership's id.
@@ -124,5 +136,161 @@ pub(crate) async fn write_profile(
     .bind(already_current)
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SetDisplayName {
+    pub tenant_id: Uuid,
+    pub actor_membership_id: Uuid,
+    /// Equal to `actor_membership_id` when a member edits their own name.
+    pub membership_id: Uuid,
+    pub encrypted_display_name: Ciphertext,
+}
+
+/// SQL: membership `m` has ended on the date bound as `date_param` (for example `$3`). It
+/// is revoked, or none of its role assignments is still running or yet to start (plan R8).
+/// A handover grant does not keep a membership going: it is a recovery right, not a role.
+///
+/// The one definition that editing ([`set_display_name`]), the retention sweep
+/// (`clear_ended_profiles`) and history (`member_names`) share (D3). `revoked_at` is tested
+/// on its own too: `revoke_membership` revokes the running and future assignments with the
+/// membership, but a row revoked any other way must still count as ended.
+pub(crate) fn membership_ended(date_param: &str) -> String {
+    format!(
+        "(m.revoked_at is not null
+          or not exists (select 1 from role_assignments ra
+                          where ra.tenant_id = m.tenant_id and ra.membership_id = m.id
+                            and ra.revoked_at is null
+                            and ra.ends_on_exclusive > {date_param}::date))"
+    )
+}
+
+/// A member edits their own name, or an admin corrects the name of anyone whose membership
+/// is still active (§4.1). Refused while the FAU is frozen, for a name an Article 17
+/// erasure removed (`MembershipErased`), and for a membership that has ended
+/// (`MembershipEnded`): under D3 an ended membership holds no name, and history shows its
+/// role and year instead. A membership whose roles are all still to come is active.
+///
+/// **Authority before state:** a member naming anyone but themselves gets `NotAuthorized`
+/// whether or not the id exists; only an admin learns `UnknownMembership` or
+/// `MembershipEnded`.
+pub async fn set_display_name(
+    pool: &PgPool,
+    req: SetDisplayName,
+    at: Moment,
+) -> Result<(), MembershipError> {
+    check_display_name(&req.encrypted_display_name)?;
+    let mut tx = pool.begin().await?;
+    let state = lock_tenant(&mut tx, req.tenant_id).await?;
+    require_open(&state)?;
+    let own = req.actor_membership_id == req.membership_id;
+    let by_admin = if own {
+        let access =
+            membership_access(&mut tx, req.tenant_id, req.actor_membership_id, at.today()).await?;
+        if access.capability == Capability::None {
+            return Err(MembershipError::NotAuthorized);
+        }
+        false
+    } else {
+        if !is_admin_today(&mut tx, req.tenant_id, req.actor_membership_id, at.today()).await? {
+            return Err(MembershipError::NotAuthorized);
+        }
+        true
+    };
+    let row: Option<(bool, bool)> = sqlx::query_as(&format!(
+        "select m.name_erased_at is not null, {}
+           from memberships m
+          where m.tenant_id = $1 and m.id = $2 for update",
+        membership_ended("$3")
+    ))
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(date_param(at.today()))
+    .fetch_optional(&mut *tx)
+    .await?;
+    match row {
+        None => return Err(MembershipError::UnknownMembership),
+        Some((true, _)) => return Err(MembershipError::MembershipErased),
+        Some((false, true)) => return Err(MembershipError::MembershipEnded),
+        Some((false, false)) => {}
+    }
+    sqlx::query(
+        "update memberships set encrypted_display_name = $3 where tenant_id = $1 and id = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(req.encrypted_display_name.as_bytes())
+    .execute(&mut *tx)
+    .await?;
+    write_audit(
+        &mut tx,
+        at,
+        Audit::member(
+            req.tenant_id,
+            req.actor_membership_id,
+            "membership.display_name_changed",
+            "membership",
+            req.membership_id,
+            json!({ "by_admin": by_admin }),
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SetContactEmail {
+    pub tenant_id: Uuid,
+    /// Only the member themself: the address is their own statement (§4.1).
+    pub membership_id: Uuid,
+    /// `None` clears it, and the login address is shown instead.
+    pub encrypted_contact_email: Option<Ciphertext>,
+}
+
+/// A member sets or clears their own contact address. Setting one needs an open FAU;
+/// clearing one reduces what others see, so it is allowed while frozen. Either needs
+/// standing today: someone whose roles have ended has no address to show, and the
+/// retention sweep clears it.
+pub async fn set_contact_email(
+    pool: &PgPool,
+    req: SetContactEmail,
+    at: Moment,
+) -> Result<(), MembershipError> {
+    if let Some(ct) = &req.encrypted_contact_email {
+        check_contact_email(ct)?;
+    }
+    let mut tx = pool.begin().await?;
+    let state = lock_tenant(&mut tx, req.tenant_id).await?;
+    if req.encrypted_contact_email.is_some() {
+        require_open(&state)?;
+    }
+    let access = membership_access(&mut tx, req.tenant_id, req.membership_id, at.today()).await?;
+    if access.capability == Capability::None {
+        return Err(MembershipError::NotAuthorized);
+    }
+    sqlx::query(
+        "update memberships set encrypted_contact_email = $3 where tenant_id = $1 and id = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(req.encrypted_contact_email.as_ref().map(|c| c.as_bytes()))
+    .execute(&mut *tx)
+    .await?;
+    write_audit(
+        &mut tx,
+        at,
+        Audit::member(
+            req.tenant_id,
+            req.membership_id,
+            "membership.contact_email_changed",
+            "membership",
+            req.membership_id,
+            json!({ "cleared": req.encrypted_contact_email.is_none() }),
+        ),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }

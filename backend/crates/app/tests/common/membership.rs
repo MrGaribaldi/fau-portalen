@@ -89,8 +89,8 @@ pub fn fresh_profile() -> MemberProfile {
 /// The profile an acceptance of `token` by `acceptor` needs: for `prepare_acceptance`'s
 /// membership, so a re-invited former member works too. A token `prepare_acceptance`
 /// refuses gets a fresh profile, so a test of the refusal still reaches `accept_invitation`.
-pub async fn profile_for(pool: &PgPool, token: &str, acceptor: &str) -> MemberProfile {
-    match prepare_acceptance(pool, token, &verified(acceptor)).await {
+pub async fn profile_for(pool: &PgPool, token: &str, acceptor: &str, at: Moment) -> MemberProfile {
+    match prepare_acceptance(pool, token, &verified(acceptor), at).await {
         Ok(target) => MemberProfile {
             membership_id: target.membership_id,
             ..fresh_profile()
@@ -167,7 +167,7 @@ pub async fn add_member(
     .await
     .expect("issue");
     let token = issued.token.expose().to_owned();
-    let profile = profile_for(pool, &token, address).await;
+    let profile = profile_for(pool, &token, address, at).await;
     accept_invitation(
         pool,
         AcceptInvitation {

@@ -876,8 +876,14 @@ pub async fn accept_invitation(
     };
 
     let (account_id, _) = upsert_verified_account(&mut tx, &acceptor_email, at).await?;
-    let (membership_id, reused, already_current) =
-        ensure_membership(&mut tx, tenant_id, account_id, req.profile.membership_id).await?;
+    let (membership_id, reused, already_current) = ensure_membership(
+        &mut tx,
+        tenant_id,
+        account_id,
+        req.profile.membership_id,
+        at.today(),
+    )
+    .await?;
     write_profile(&mut tx, tenant_id, &req.profile, already_current).await?;
     let mut assignment_ids = Vec::with_capacity(roles.len());
     for (role_id, _, period) in &roles {
@@ -955,10 +961,15 @@ pub async fn accept_invitation(
 /// address is its recipient: [`accept_invitation`] then gives the precise refusal (expired,
 /// withdrawn, already accepted). Every other failure is `UnknownInvitation`, so the answer
 /// never says which part failed.
+///
+/// `at` supplies the date the shared "has this membership ended?" predicate
+/// (`profile::membership_ended`, D3) is read against: rule-deciding time always comes from
+/// the caller, never the database clock.
 pub async fn prepare_acceptance(
     pool: &PgPool,
     token: &str,
     acceptor: &VerifiedEmail,
+    at: Moment,
 ) -> Result<AcceptanceTarget, MembershipError> {
     if !looks_like_token(token) {
         return Err(MembershipError::UnknownInvitation);
@@ -973,23 +984,28 @@ pub async fn prepare_acceptance(
     if recipient != acceptor.email().as_str() {
         return Err(MembershipError::UnknownInvitation);
     }
-    // Whether the row is not revoked and already has a name is what tells the caller "this
-    // is an already-current member accepting another invitation" (a handover to a sitting
-    // member, or recovery) -- so it can prefill, and so `accept_invitation`'s `write_profile`
-    // knows to keep a stored contact address the new profile leaves unstated (fix round 1,
-    // Q10). Found-but-ended (revoked or unnamed) still names the row: acceptance reopens it.
-    let existing: Option<(Uuid, bool, bool)> = sqlx::query_as(
-        "select m.id, m.revoked_at is not null, m.encrypted_display_name is not null
+    // Whether the row has not ended (`profile::membership_ended`, D3 -- shared with
+    // `ensure_membership` and with editing) is what tells the caller "this is an
+    // already-current member accepting another invitation" (a handover to a sitting
+    // member, or recovery) -- so it can prefill, and so `accept_invitation`'s
+    // `write_profile` knows to keep a stored contact address the new profile leaves
+    // unstated (fix round 1, Q10). Found-but-ended (revoked, or ran out ahead of the
+    // sweep) still names the row: acceptance reopens it.
+    let sql = format!(
+        "select m.id, {}
            from memberships m join accounts a on a.id = m.account_id
           where m.tenant_id = $1 and a.email = $2",
-    )
-    .bind(tenant_id)
-    .bind(acceptor.email().as_str())
-    .fetch_optional(&mut *tx)
-    .await?;
+        super::profile::membership_ended("$3")
+    );
+    let existing: Option<(Uuid, bool)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .bind(acceptor.email().as_str())
+        .bind(date_param(at.today()))
+        .fetch_optional(&mut *tx)
+        .await?;
     tx.commit().await?;
     let (membership_id, existing_current) = match existing {
-        Some((id, revoked, named)) => (id, !revoked && named),
+        Some((id, ended)) => (id, !ended),
         None => (Uuid::now_v7(), false),
     };
     Ok(AcceptanceTarget {
@@ -1004,11 +1020,11 @@ pub async fn prepare_acceptance(
 pub struct AcceptanceTarget {
     pub tenant_id: Uuid,
     pub membership_id: Uuid,
-    /// Whether this membership already exists, is not revoked and already has a name --
-    /// an active member reached by a second invitation (a handover to a sitting member, or
-    /// recovery). The caller may prefill an acceptance form with it rather than asking
-    /// again, and knows `write_profile` will keep the stored contact address if the new
-    /// profile leaves it unstated (fix round 1, Q10).
+    /// Whether this membership already exists and has not ended (`profile::membership_ended`,
+    /// D3) -- an active member reached by a second invitation (a handover to a sitting
+    /// member, or recovery). The caller may prefill an acceptance form with it rather than
+    /// asking again, and knows `write_profile` will keep the stored contact address if the
+    /// new profile leaves it unstated (fix round 1, Q10).
     pub existing_current: bool,
 }
 

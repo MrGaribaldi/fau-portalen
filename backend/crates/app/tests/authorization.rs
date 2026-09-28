@@ -282,6 +282,27 @@ async fn a_bound_group_follows_roles_on_its_unit_or_cohort_on_the_current_date()
         "still a member"
     );
 
+    // Link `unit` and `cohort` in unit_cohorts, so the "no traversal" assertions below are
+    // actually exercised: without this row, a broken ROLE_FOLLOWS_GROUP that joined through
+    // unit_cohorts would find no match either, and the assertions could never fail.
+    sqlx::query(
+        "insert into unit_cohorts (tenant_id, unit_id, cohort_id, grade_level) values ($1, $2, $3, 3)",
+    )
+    .bind(fau.tenant_id)
+    .bind(unit)
+    .bind(cohort)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Reverse of the check below: the unit-role holder still does not reach the
+    // cohort-bound group now that the link exists (Ruling R6 -- no traversal through
+    // unit_cohorts).
+    assert_eq!(
+        check(&pool, v, Resource::GroupContent(by_cohort), read, T0).await,
+        H,
+        "a unit role must not reach a cohort-bound group via unit_cohorts"
+    );
+
     // A cohort role reaches the cohort's group, not the unit's: there is no traversal
     // through unit_cohorts (Ruling R6).
     let cohort_parent = add_member(
@@ -311,6 +332,154 @@ async fn a_bound_group_follows_roles_on_its_unit_or_cohort_on_the_current_date()
     assert_eq!(
         check(&pool, c, Resource::GroupContent(by_unit), read, T0).await,
         A
+    );
+
+    // ASSIGNMENT_VALID_ON_3's `ra.revoked_at is null`: a member's unit role, once revoked,
+    // no longer reaches the unit-bound group, even though their (separate) member role is
+    // still live and keeps their FAU-wide standing.
+    let revoked_parent = add_member(
+        &pool,
+        &fau,
+        "revoked-unit-role@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2028, 9, 1)),
+        t0,
+    )
+    .await;
+    grant_role(
+        &pool,
+        GrantRole {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: revoked_parent.membership_id,
+            role: RoleChoice::Existing(unit_role),
+            period: period(day(2026, 9, 1), day(2027, 9, 1)),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let unit_assignment: Uuid = sqlx::query_scalar(
+        "select id from role_assignments
+          where membership_id = $1 and role_id = $2 and revoked_at is null",
+    )
+    .bind(revoked_parent.membership_id)
+    .bind(unit_role)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    revoke(&pool, &fau, unit_assignment, t0).await;
+    let rv = Viewer {
+        tenant_id: fau.tenant_id,
+        membership_id: revoked_parent.membership_id,
+    };
+    assert_eq!(
+        check(&pool, rv, Resource::GroupContent(by_unit), read, T0).await,
+        H,
+        "a revoked unit role must not reach the unit-bound group"
+    );
+    assert_eq!(
+        check(&pool, rv, Resource::Fau, read, T0).await,
+        A,
+        "the member role is untouched by revoking the unit role"
+    );
+
+    // ASSIGNMENT_VALID_ON_3's `ra.starts_on <= $3::date`: a unit role that has not started
+    // yet grants nothing today, and starts to on its first valid day.
+    let future_parent = add_member(
+        &pool,
+        &fau,
+        "future-unit-role@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2028, 9, 1)),
+        t0,
+    )
+    .await;
+    grant_role(
+        &pool,
+        GrantRole {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: future_parent.membership_id,
+            role: RoleChoice::Existing(unit_role),
+            period: period(day(2027, 1, 1), day(2027, 9, 1)),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let fv = Viewer {
+        tenant_id: fau.tenant_id,
+        membership_id: future_parent.membership_id,
+    };
+    assert_eq!(
+        check(&pool, fv, Resource::GroupContent(by_unit), read, T0).await,
+        H,
+        "the unit role has not started yet"
+    );
+    assert_eq!(
+        check(
+            &pool,
+            fv,
+            Resource::GroupContent(by_unit),
+            read,
+            "2027-01-02T00:00:00Z"
+        )
+        .await,
+        A,
+        "the unit role has started"
+    );
+}
+
+/// A viewer from a different FAU is not "outside the group": their own tenant has no such
+/// group at all, so the group's own tenant scoping (`g.tenant_id = $1`) must refuse them
+/// exactly as it would an unknown id -- not fall through to `viewer_in_group` on someone
+/// else's rows.
+#[tokio::test]
+async fn a_viewer_from_another_tenant_gets_no_access() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+
+    let t0 = at(T0);
+    let year = period(day(2026, 9, 1), day(2027, 9, 1));
+    let fau_b = active_fau(&pool, "admin-b@example.test", t0).await;
+    let member_b = add_member(
+        &pool,
+        &fau_b,
+        "member-b@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        year,
+        t0,
+    )
+    .await
+    .membership_id;
+
+    let viewer_b = Viewer {
+        tenant_id: fau_b.tenant_id,
+        membership_id: member_b,
+    };
+    for resource in [
+        Resource::Group(w.open),
+        Resource::GroupContent(w.open),
+        Resource::GroupContent(w.closed),
+    ] {
+        assert_eq!(
+            check(&pool, viewer_b, resource, Action::Read, T0).await,
+            H,
+            "{resource:?}"
+        );
+    }
+
+    // A viewer whose tenant_id and membership_id name different FAUs has no standing in
+    // the claimed tenant at all -- the membership lookup itself must find nothing.
+    let mismatched = Viewer {
+        tenant_id: w.fau.tenant_id,
+        membership_id: member_b,
+    };
+    assert_eq!(
+        check(&pool, mismatched, Resource::Fau, Action::Read, T0).await,
+        N
     );
 }
 

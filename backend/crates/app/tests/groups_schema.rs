@@ -261,6 +261,51 @@ async fn removal_cannot_precede_addition() {
 }
 
 #[tokio::test]
+async fn a_guest_role_carries_no_unit_or_cohort() {
+    // Controller ruling P7: a guest reaches only its own groups. A guest role that also
+    // named a unit or a cohort would put its holder into every group bound to that unit
+    // or cohort through ROLE_FOLLOWS_GROUP, which is broader than that.
+    let db = TestDb::migrated().await;
+    let pool = db.admin_pool();
+    let s = seed(&pool).await;
+    let g = group(&pool, &s, envelope(42), None, None).await.unwrap();
+
+    let err = sqlx::query(
+        "insert into roles (tenant_id, id, name, capability_class, group_id, unit_id)
+         values ($1, $2, 'Gjest', 'guest', $3, $4)",
+    )
+    .bind(s.tenant)
+    .bind(Uuid::now_v7())
+    .bind(g)
+    .bind(s.unit)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&err).as_deref(), Some("23514"));
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("roles_guest_has_no_unit_or_cohort")
+    );
+
+    let err = sqlx::query(
+        "insert into roles (tenant_id, id, name, capability_class, group_id, cohort_id)
+         values ($1, $2, 'Gjest', 'guest', $3, $4)",
+    )
+    .bind(s.tenant)
+    .bind(Uuid::now_v7())
+    .bind(g)
+    .bind(s.cohort)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&err).as_deref(), Some("23514"));
+    assert_eq!(
+        constraint_name(&err).as_deref(),
+        Some("roles_guest_has_no_unit_or_cohort")
+    );
+}
+
+#[tokio::test]
 async fn the_runtime_role_cannot_delete_groups_or_their_history() {
     let db = TestDb::migrated().await;
     let admin = db.admin_pool();

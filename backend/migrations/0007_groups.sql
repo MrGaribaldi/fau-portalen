@@ -64,6 +64,11 @@ alter table roles add constraint roles_capability_class_check
   check (capability_class in ('member', 'admin', 'guest'));
 alter table roles add constraint roles_guest_names_a_group
   check ((capability_class = 'guest') = (group_id is not null));
+-- A guest reaches only its own groups (groups design §3.3, controller ruling P7): a guest
+-- role naming a unit or a cohort would put its holder into every group bound to that unit
+-- or cohort through ROLE_FOLLOWS_GROUP, which is broader than "its own groups".
+alter table roles add constraint roles_guest_has_no_unit_or_cohort
+  check (capability_class <> 'guest' or (unit_id is null and cohort_id is null));
 create index roles_group_idx on roles (tenant_id, group_id) where group_id is not null;
 
 -- No delete: groups are archived and members removed softly.

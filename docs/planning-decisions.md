@@ -3072,3 +3072,65 @@ The deferred items are filed on #3417, #3419 and #3503.
   cleanly) and caused no backend crash or restart. Before the change, a single run could crash
   it. `--test-threads=4` is no longer needed. The one formal causal test left would be reverting
   to 64 MB.
+
+## Erik's answers from the decision board — 28 September 2026
+
+Answered in one pass from the decision board (D1–D21). Recorded as given, with the agent's
+reading where a note needed interpreting; readings marked *(reading)* await Erik's confirmation.
+
+**#3501**
+- **D1:** confirmed that archived groups can be closed and never reopened. Erik's note: "we do need
+  to be able to un-archive and open them if they start paying us again, if they haven't been
+  closed for so long we have deleted them".
+  *(reading)* This concerns reactivating an **archived FAU** (#3509): paying restores the FAU and
+  its content until the keys are destroyed. It is recorded as a #3509 requirement. If Erik meant
+  un-archiving individual groups too, that becomes a follow-up to #3501's one-way group archive.
+- **D2:** Erik's intent is that admins of a **pending** FAU (one being set up) must be able to
+  handle join requests. A **break-glass admin** must be able to resolve requests, so that a
+  closed FAU can take new members and be reopened.
+  This reverses execution ruling P4 for pending and closed FAUs, and adds a break-glass request
+  resolver. It becomes a follow-up card; the question was only whether an admin could read the
+  message text attached to a request.
+
+**#3502**
+- **D3:** a display name is valid only while the membership is active. When it ends, the name is
+  replaced by **role and year** (for example "Leder 2025–2026"), "which helps keep things GDPR
+  valid". This overrides spec §4.2 ("the name stays after the membership ends") and plan rulings
+  R7–R9. The name is cleared when the membership ends, like the contact email, so there is no name
+  history to keep. #3502's remaining tasks are amended before Task 4.
+- **D4:** Sámi collation data is added when a Sámi locale is added.
+- **D5:** confirmed that archived groups are left out of the directory.
+
+**Security, before real data (#3507, #3432)**
+- **D6:** adopt **per-data-key recovery copies**, sealed to an offline recovery public key.
+- **D7:** the offline recovery private key is held by Erik, in Proton Pass, as a separate item
+  from the unseal key.
+- **D8:** the finalizer runs **on Erik's own machine, by hand, for now**, with a notification when
+  a run is due. A small VM takes over later. The reason given: during the pilot, FAU-er may come,
+  go and return, and returning should be easy.
+- **D9:** old copies may keep deleted keys for **90 days**, so that they always outlast the
+  two-month summer holiday.
+- **D10:** access-request and invitation messages are accepted as not recoverable after an
+  OpenBao loss.
+- **D11:** nobody else can unseal for now. The outage risk is accepted until the pilot.
+- **D12:** the pilot gate adds cache-aware revocation (#3417), MFA proof (#3414) and live audit
+  alerts (#3442), alongside the replica (#3507).
+
+**#3509 archive**
+- **D13:** the design is accepted.
+- **D14:** the 365 days count from the soft delete (the lock).
+- **D15:** the retention basis goes to legal (#3426).
+
+**Older questions**
+- **D16 (#3433):** **full DOCX import is in the MVP**, to help new FAU-er onboard and stay.
+  Private comments (#3491) are not needed, but nice to have if they are easy.
+  *(reading)* On controlled publication (#3492), Erik's note calls it "the easy import", which
+  reads as a mix-up with import. Whether publication itself is in the MVP is still to confirm.
+- **D17 (#3447):** confirmed that mammoth is the default DOCX converter and that PDFs stay
+  attachments with text extraction. The storage format was answered by #3490. Tiptap's own DOCX
+  import is not used.
+- **D18 (#3488):** authorized: the etcd-s3-retention drop-in on master, applied at a quiet moment
+  after the plan is shown, plus the upstream request to add the setting to infra-tools' template.
+- **D19 (#3496, #3497):** Erik files both upstream issues himself.
+- **D20 (#3486):** the destructive probe is not run, and the question is closed.
+- **D21 (#3413):** the end-to-end review is closed.

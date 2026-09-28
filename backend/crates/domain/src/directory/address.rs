@@ -167,7 +167,8 @@ pub fn address_spec(address: &Email) -> String {
 }
 
 /// Percent-encodes every byte except RFC 3986's unreserved characters and `@` (RFC 6068 §2:
-/// encoding is always allowed, and `%`, `,`, `?`, `&`, `#`, `/` and non-ASCII must be).
+/// encoding is always allowed, and `%`, `,`, `;`, `=`, `?`, `&`, `#`, `/` and non-ASCII must
+/// be).
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -323,6 +324,40 @@ mod tests {
             r.mailto(RecipientField::Bcc),
             Mailto::Link("mailto:?bcc=a%3Fcc%3Dx%26b%23c%2Fd%25e@example.no".into())
         );
+    }
+
+    #[test]
+    fn copy_text_of_parsed_addresses_never_lets_a_separator_escape_its_quotes() {
+        // The fix-round review's attack address: a domain comma used to slip past
+        // `address_spec` unquoted, because only the local part was ever checked for one.
+        // `Email::parse` now refuses it at the source (fau_domain::email), so it can never
+        // reach `Recipients` at all.
+        assert!(Email::parse("target@fau,attacker.example").is_err());
+
+        // For every address that does parse, a `,` or `;` inside it is always inside its
+        // quoted local part (`address_spec` quotes whenever the local part is not a
+        // dot-atom) -- never in the domain, which `Email::parse` restricts to alphanumerics,
+        // `-` and `.`. So a parser that respects RFC 5322 quoting, stripping quoted spans
+        // before splitting on the separator, recovers exactly one address per recipient.
+        let r = Recipients::new([
+            e("a,b@example.no"),
+            e("c;d@example.no"),
+            e("plain@example.no"),
+        ]);
+        for (separator, bare) in [(CopySeparator::Comma, ','), (CopySeparator::Semicolon, ';')] {
+            let text = r.copy_text(separator);
+            let mut outside_quotes = String::new();
+            let mut in_quotes = false;
+            for c in text.chars() {
+                if c == '"' {
+                    in_quotes = !in_quotes;
+                } else if !in_quotes {
+                    outside_quotes.push(c);
+                }
+            }
+            let addresses_seen = outside_quotes.matches(bare).count() + 1;
+            assert_eq!(addresses_seen, r.len(), "{separator:?}: {text}");
+        }
     }
 
     #[test]

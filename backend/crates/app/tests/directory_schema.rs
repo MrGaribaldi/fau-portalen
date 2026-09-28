@@ -1,5 +1,7 @@
 //! Migration 0008: the member directory's fields on `memberships` (groups design §4.1,
-//! §4.2), proven in SQL before any Rust depends on them.
+//! §4.2), proven in SQL before any Rust depends on them. Under Erik's D3 (28 September
+//! 2026) neither field outlives the membership: a revoked membership holds no name and no
+//! contact address.
 
 mod common;
 use common::TestDb;
@@ -98,52 +100,72 @@ async fn both_fields_hold_only_a_bounded_envelope() {
 }
 
 #[tokio::test]
-async fn a_revoked_membership_holds_no_contact_email() {
+async fn a_revoked_membership_holds_neither_a_name_nor_a_contact_email() {
     let db = TestDb::migrated().await;
     let pool = db.admin_pool();
     let (_, m) = seed(&pool).await;
-    set(&pool, m, "encrypted_contact_email", Some(envelope(1, 60)))
+    let checks = [
+        (
+            "encrypted_display_name",
+            "memberships_display_name_only_while_current",
+        ),
+        (
+            "encrypted_contact_email",
+            "memberships_contact_email_only_while_current",
+        ),
+    ];
+    let revoke = |clear: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(&format!(
+                "update memberships set revoked_at = '2026-09-23T10:00:00Z'{clear} where id = $1"
+            ))
+            .bind(m)
+            .execute(&pool)
+            .await
+            .map(|_| ())
+        }
+    };
+
+    // Each field on its own blocks the revocation, with its own check.
+    for (column, constraint) in checks {
+        set(&pool, m, column, Some(envelope(1, 60))).await.unwrap();
+        let err = revoke("").await.unwrap_err();
+        assert_eq!(
+            constraint_name(&err).as_deref(),
+            Some(constraint),
+            "{column}"
+        );
+        set(&pool, m, column, None).await.unwrap();
+    }
+
+    // Clearing both in the same statement is accepted: under D3 the name goes too.
+    for (column, _) in checks {
+        set(&pool, m, column, Some(envelope(1, 60))).await.unwrap();
+    }
+    revoke(", encrypted_display_name = null, encrypted_contact_email = null")
+        .await
+        .unwrap();
+    for (column, constraint) in checks {
+        let err = set(&pool, m, column, Some(envelope(1, 60)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            constraint_name(&err).as_deref(),
+            Some(constraint),
+            "{column}"
+        );
+    }
+
+    // Positive control, the re-invitation path: reopened, the row takes a new name.
+    sqlx::query("update memberships set revoked_at = null where id = $1")
+        .bind(m)
+        .execute(&pool)
         .await
         .unwrap();
     set(&pool, m, "encrypted_display_name", Some(envelope(1, 60)))
         .await
         .unwrap();
-
-    // Revoking without clearing the address is refused.
-    let err =
-        sqlx::query("update memberships set revoked_at = '2026-09-23T10:00:00Z' where id = $1")
-            .bind(m)
-            .execute(&pool)
-            .await
-            .unwrap_err();
-    assert_eq!(
-        constraint_name(&err).as_deref(),
-        Some("memberships_contact_email_only_while_current")
-    );
-
-    // Clearing it in the same statement is accepted, and the name stays (§4.2).
-    sqlx::query(
-        "update memberships set revoked_at = '2026-09-23T10:00:00Z', encrypted_contact_email = null
-          where id = $1",
-    )
-    .bind(m)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let err = set(&pool, m, "encrypted_contact_email", Some(envelope(1, 60)))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        constraint_name(&err).as_deref(),
-        Some("memberships_contact_email_only_while_current")
-    );
-    let name: Option<Vec<u8>> =
-        sqlx::query_scalar("select encrypted_display_name from memberships where id = $1")
-            .bind(m)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(name, Some(envelope(1, 60)));
 }
 
 #[tokio::test]

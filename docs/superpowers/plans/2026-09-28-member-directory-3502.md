@@ -2,18 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The storage, rules and reads behind the member directory: a display name captured when a person joins, an optional contact address, both encrypted and bound to their membership; a directory read that shows each viewer exactly the people the group rule lets them see and what each represents; a `mailto:` link or copy text for a selection, with every export audited as a count; and the retention rules, under which a name survives the end of a membership and a contact address does not.
+**Goal:** The storage, rules and reads behind the member directory: a display name captured when a person joins, an optional contact address, both encrypted and bound to their membership; a directory read that shows each viewer exactly the people the group rule lets them see and what each represents; a `mailto:` link or copy text for a selection, with every export audited as a count; and the retention rules. Under Erik's **D3** (28 September 2026), neither the name nor the contact address outlives the membership. History shows an ended membership as its role and year ("Leder 2025–2026"), computed at read time.
 
 **Architecture:**
-- **Schema.** Migration `0008` adds `encrypted_display_name`, `encrypted_contact_email` and `name_erased_at` to `memberships`, with envelope checks, a check that a revoked membership holds no contact address, and a check that an erased one holds neither field.
-- **Domain (pure).** `fau_domain::directory` has three modules. `address` removes repeated recipients and builds the RFC 6068 `mailto:` link, with the To/Bcc default and the length guard, and the copy text. `collation` orders decrypted names by locale through ICU4X. `listing::arrange` orders the decrypted directory for one viewer's locale.
+- **Schema.** Migration `0008` adds `encrypted_display_name`, `encrypted_contact_email` and `name_erased_at` to `memberships`. It has envelope checks, checks that a revoked membership holds neither a name nor a contact address (the name check is added by Task 3b, for D3), and a check that an erased membership holds neither field.
+- **Domain (pure).** `fau_domain::directory` has four modules. `address` removes repeated recipients and builds the RFC 6068 `mailto:` link, with the To/Bcc default and the length guard, and the copy text. `collation` orders decrypted names by locale through ICU4X. `listing::arrange` orders the decrypted directory for one viewer's locale. `history::role_label` picks the role and years that history shows for an ended membership.
 - **Persistence.**
   - `prepare_acceptance` tells the caller which FAU and membership an acceptance will write, so it can encrypt the profile before `accept_invitation` stores it.
   - `set_display_name` and `set_contact_email` edit the fields.
   - `member_directory` reads the sections a viewer may see. It uses the same facts and rule as `list_groups` and the same member SQL as `list_group_members`.
   - `export_addresses` hands over a selection's addresses and audits it.
-  - `member_names` resolves names for history.
-  - `clear_ended_contact_emails` and `erase_member_names` apply retention.
+  - `member_names` resolves history: a name while the membership is active, the roles it held once it has ended, and "Tidligere medlem" after an erasure.
+  - `clear_ended_profiles` and `erase_member_names` apply retention.
 - **The session** (#3417, not built here) decrypts names and addresses under the FAU's record key, calls `arrange`, and builds the link from the domain.
 
 **Tech Stack:** Rust 1.98.1, sqlx 0.8 on PostgreSQL 17, jiff, serde_json, `fau-crypto`'s XChaCha20-Poly1305 envelope under `fau-<tenant>-record` (the data-key flow in `fau-keys`), and **ICU4X `icu_collator` 2.3** with `icu_locale_core` 2.3 for collation.
@@ -33,7 +33,7 @@
 - **Never reveal state through the order of refusals.** Order: input validation, tenant state, then authority, then row state. A non-admin naming someone else gets `NotAuthorized` whether or not the id exists.
 - **Ids are UUIDv7.** A new membership's id is chosen before encryption so that the AAD can bind to it: `prepare_acceptance` for invitations, and the caller on activation.
 - **Dates cross the SQL boundary as text**, and rule-deciding time comes from the caller's `Moment` (`membership/sql.rs`).
-- **Migrations continue from `0007` on main.** `0008` inserts `schema_contract` version 8. `MINIMUM_CONTRACT_VERSION` stays 2 (Ruling R21). Never edit an applied migration. If a persistent database has applied a draft of `0008`, add `0009` instead.
+- **Migrations continue from `0007` on main.** `0008` inserts `schema_contract` version 8. `MINIMUM_CONTRACT_VERSION` stays 2 (Ruling R21). Never edit an applied migration. Task 3b amends `0008` in place for D3, after a read-only check that no persistent database has applied it. If one has, add `0009` instead.
 - **Collation is never byte order** (§4.3, #3439). Nothing may hard-code two locales or assume Latin collation.
 - **English** for all technical text, code, comments and commit messages. #3502 renders **no user-facing strings**. The Bokmål source strings the screen will need are recorded as catalogue entries (Ruling R20). Never author Nynorsk.
 - **Test commands** run from `/workspace/backend` with these variables exported:
@@ -74,25 +74,25 @@ The spec leaves these open, and the plan decides them. Each carries its reason a
   - Rejected: letting persistence call back into encryption. `fau-keys` depends on `fau-persistence`, and holding the tenant lock across an OpenBao call is worse.
   - Cost if wrong: a single-call accept would need the key service inside persistence.
 - **R4: The registrant's name is captured at activation, by the same rule.** `Activation.profile` names a fresh membership id, since a pending FAU has no memberships. The spec names only acceptance, but otherwise the FAU's first admin would be the one nameless member.
-- **R5: A new acceptance replaces the name and the contact address.** A re-invited former member states the name that applies from now on. Their old name stayed on the row until then.
+- **R5: A new acceptance replaces the name and the contact address.** A re-invited former member states the name that applies from now on. *Amended by D3-2:* the old row holds no name by then, because revocation or the sweep cleared it. Only a member whose roles ran out before the sweep reached them has a name replaced.
 - **R6: Who edits what.**
   - A member edits their own name, a guest included.
-  - An admin corrects anyone's name, including a former member's, since history shows names.
+  - ~~An admin corrects anyone's name, including a former member's, since history shows names.~~ *Replaced by D3-6:* an admin corrects the name of anyone whose membership is still active. An ended membership takes no name.
   - Only the member sets or clears their contact address, because it is their own statement; an admin cannot.
   - Name edits and setting an address are refused while the FAU is frozen. Clearing an address is allowed, because it reduces what others see.
   - Every edit needs standing today.
-- **R7: No name history.** An edit overwrites the name. The audit entry `membership.display_name_changed` records that it changed and whether an admin did it, never the value. See the open question below.
-- **R8: When a membership ends, and so does its contact address.** A membership has ended when it is revoked, or when none of its role assignments is still running or yet to start.
+- **R7: No name history.** *Superseded by D3-1*, which keeps the conclusion for a stronger reason. An edit overwrites the name. The audit entry `membership.display_name_changed` records that it changed and whether an admin did it, never the value.
+- **R8: When a membership ends, and so does its contact address.** *Superseded by D3-2*, which keeps this definition of "ended" and extends every clearing below to the name. A membership has ended when it is revoked, or when none of its role assignments is still running or yet to start.
   - Revocation clears the address in the same statement. Migration `0008`'s `memberships_contact_email_only_while_current` enforces this, so no code path can forget.
   - A membership whose roles simply ran out is not revoked. `clear_ended_contact_emails` clears it: a sweep per FAU, under the tenant lock and re-checked under it, with each clearing audited by the system actor.
   - It is cleared at once, not after the account's three-month grace. That grace protects re-recognition, and re-entering an address costs a second.
   - Cost if wrong: add a date offset to one fragment.
-- **R9: Article 17 erasure is built as a storage step only.**
+- **R9: Article 17 erasure is built as a storage step only.** *Amended by D3-4:* the marker now also suppresses the role-and-year label.
   - `erase_member_names(account)` removes both fields from every membership the account holds, marks each erased and audits it without the name. #3426 builds the flow around it: who asks, what else goes, and whether the membership ends.
   - An erased person is not listed in the directory. `member_names` returns `Former`, which renders as "Tidligere medlem".
   - An erased membership cannot be accepted into again (`MembershipErased`), because a new name on the old row would re-attach history to it.
   - Database backups keep the old ciphertext until they age out; only deleting the FAU shreds it. This goes in the privacy notice.
-- **R10: `member_names` serves history, for members and admins only.** A guest gets `NotAuthorized` until the first feature that shows a guest history (#3503 chat authors) decides what a guest may resolve. Ids outside the viewer's FAU are left out.
+- **R10: `member_names` serves history, for members and admins only.** A guest gets `NotAuthorized` until the first feature that shows a guest history (#3503 chat authors) decides what a guest may resolve. Ids outside the viewer's FAU are left out. D3 leaves this unchanged.
 - **R11: What the directory shows** (§4.3, §4.4, §3.2).
   - It has one FAU-wide section, for members and admins only, that lists every current member and admin and never a guest.
   - It has one section per group the viewer may read, through `readable_groups`, the facts and rule `list_groups` uses, listing members through `group_members_sql`, the SQL `list_group_members` uses. Guests appear inside those sections.
@@ -106,7 +106,7 @@ The spec leaves these open, and the plan decides them. Each carries its reason a
   - Why ICU4X: it is the Unicode Consortium's own library, it is used in Firefox, and it is already most of the way into `Cargo.lock` through `url`'s IDNA support. It adds 6 crates, all from ICU4X or its support libraries: `icu_collator`, `icu_collator_data`, `icu_locale_fallback`, `icu_locale_fallback_data`, `utf16_iter` and `write16`. This follows Erik's rule to prefer battle-proven components.
   - Rejected: `feruca`, which is UCA without per-locale tailoring and puts Å with A, which is wrong for Bokmål. Binding to system ICU was rejected because the runtime image would need `libicu`.
   - A tag that does not parse falls back to `nb-NO`. Ties are broken by id. Unnamed rows sort last.
-  - **Data gap:** ICU4X's compiled data has CLDR's `nb` and `nn` tailoring but not Sámi (`se`, `sma`, `smj`), which fall back to the root order. This was checked while planning. Adding a Sámi locale means generating ICU4X data that includes it, behind the one constructor `NameCollator::for_locale`.
+  - **Data gap:** ICU4X's compiled data has CLDR's `nb` and `nn` tailoring but not Sámi (`se`, `sma`, `smj`), which fall back to the root order. This was checked while planning. Adding a Sámi locale means generating ICU4X data that includes it, behind the one constructor `NameCollator::for_locale`. Erik's D4 (28 September): the data is added when a Sámi locale is added.
 - **R14: Address formats.**
   - `mailto:` joins addresses with a bare `,`, because RFC 6068's grammar has no whitespace, and `, ` would cost `%20` per address against the length guard.
   - Every byte except the unreserved characters and `@` is percent-encoded.
@@ -138,6 +138,8 @@ The spec leaves these open, and the plan decides them. Each carries its reason a
   | `directory.guest` | "Gjest" |
   | `directory.unnamed` | "Navn ikke oppgitt" |
   | `member.former` | "Tidligere medlem" |
+  | `member.endedRole.oneYear` | "{role} {year}" (D3-5) |
+  | `member.endedRole.years` | "{role} {firstYear}–{lastYear}" (D3-5) |
   | `directory.selectAll` | "Velg alle" |
   | `directory.compose` | "Skriv e-post" |
   | `directory.copy` | "Kopier adresser" |
@@ -148,15 +150,51 @@ The spec leaves these open, and the plan decides them. Each carries its reason a
 - **R22: A contact address is parsed with `Email::parse` before it is encrypted**, with no extra rule. The builders handle any `Email` safely (R14).
 - **R23: `DirectoryPerson.is_viewer`** marks the viewer's own entry, where the screen offers editing.
 
-**Open questions for Erik** (no work waits on them):
-1. **Name history.** Prosjektgrunnlag §8 wants history to show "the names that applied at the time", but a name edit overwrites (R7). Is a person who renames themself rare enough to accept, or should history keep dated name versions? That would be a later migration: a `membership_names` table with `valid_from`.
-2. **Sámi collation data** (R13): generate the ICU4X data when a Sámi locale is added, or now?
+### Rulings (D3), 28 September 2026
+
+Erik's decision D3: *"Display names are only valid when active members, when they are no longer active we change from display name to role and year, which helps keep things GDPR valid."* It overrides spec §4.2 and Rulings R7–R9. These rulings apply it where D3 leaves the detail open.
+
+- **Ruling (D3): D3-1, no name history (replaces R7).** A display name exists only while the membership is active, so there is no past name to keep, and an edit overwrites. Open question 1 is closed.
+  - Reason: D3 removes the name when the membership ends, and history uses role and year instead.
+  - Cost if wrong: a later `membership_names` table, the same cost as before.
+- **Ruling (D3): D3-2, an ended membership holds neither field (replaces R8).** "Ended" keeps R8's meaning: revoked, or no role assignment still running or yet to start. `membership_ended` in `profile.rs` is the one SQL definition, shared by editing, the sweep and history.
+  - Revocation clears the name and the contact address in the statement that revokes. Migration `0008`'s `memberships_display_name_only_while_current` (Task 3b) and `memberships_contact_email_only_while_current` refuse any path that forgets.
+  - A membership whose roles ran out is cleared by the daily `clear_ended_profiles` (renamed from `clear_ended_contact_emails`), audited as `membership.profile_cleared {cause: "membership_ended"}`. It is cleared at once, with no three-month grace.
+  - A handover grant does not keep a membership going: it is a recovery right, not a role. A former admin in the handover window is shown by role and year.
+  - A membership whose roles are all still to come is active and keeps its name.
+  - Reason: D3, and "ended" was already defined for the contact address.
+  - Cost if wrong: one fragment changes, for example to add a grace period.
+- **Ruling (D3): D3-3, "ended" and the label are computed at read time, never stored.** `member_names` decides "ended" at the moment of the read, from `role_assignments`, so a sweep that has not run yet never lets a name through. It then returns the roles the membership held (`MemberName::Ended(Vec<HeldRole>)`). No label column exists.
+  - Reason: the role facts are already kept as plaintext school structure (ADR-003 decision 6), and a stored label could drift from them.
+  - Cost if wrong: a renamed role renames old labels too, and history loses its labels if role assignments are ever purged. An ended membership with no held role shows "Tidligere medlem" (`Former`).
+- **Ruling (D3): D3-4, an Article 17 erasure shows "Tidligere medlem", never role and year (amends R9).** `name_erased_at` keeps its name and gains a role: an erased membership, active or ended, renders as `Former`. It still cannot be accepted into again (`MembershipErased`), and the directory still leaves it out.
+  - Reason: a single-holder role with its year ("Leder 2025–2026") identifies the person as well as a name does, and an erasure is a request to stop identifying them.
+  - Cost if wrong: erased people lose role context in history. The assignments remain, so #3426 can revisit this.
+- **Ruling (D3): D3-5, which role and which years.** `fau_domain::directory::history::role_label(held, event_date)` decides:
+  - the role held on the day of the event, so that a minute from someone's year as Kasserer says Kasserer even if they later led the FAU;
+  - among roles held that day: admin class, then member, then guest, then the earliest start;
+  - after every role has ended: the last role that ended; before any role began: the first role to begin;
+  - one role, never a list, and no unit or cohort, because a place narrows a role down to a person;
+  - years: the calendar years of the first and last day the assignment was actually held, where an assignment revoked early ends on its revocation day (Oslo date). An assignment revoked before it started was never held.
+  - Rendering: `member.endedRole.oneYear` "{role} {year}" when both years are equal, otherwise `member.endedRole.years` "{role} {firstYear}–{lastYear}". Both are proposed catalogue strings (R20), with the years passed as strings so ICU does not group their digits. #3502 renders nothing.
+  - Reason: D3's example "Leder 2025–2026", applied truthfully to people who held several roles.
+  - Cost if wrong: the rule lives in one pure function with unit tests; school-year arithmetic (1 August) would be a local change there.
+- **Ruling (D3): D3-6, no edits on ended memberships (replaces R6's former-member clause).** `set_display_name` refuses an ended target with the new `MembershipError::MembershipEnded`. The check comes after authority, so only an admin, or the member acting on themself, learns it.
+  - Setting a contact address still needs standing today (unchanged). A handover-grant holder without a role could set one: it is shown nowhere, since the directory needs a role valid today, and the sweep clears it. This is accepted rather than coded.
+  - Reason: a name on an ended membership would contradict D3, and on a revoked row the database refuses it anyway.
+  - Cost if wrong: admins cannot correct how a former member is shown. Their label comes from the role, which admins can edit.
+- **Ruling (D3): D3-7, acceptance and activation are unchanged.** A name is still required while the membership is active. A re-invited former member reopens their row, which holds no name, and states one again (R5 as amended).
+- **Ruling (D3): D3-8, the directory read and the export are unaffected.** Both list only people with standing today. Standing today implies an active membership, so every listed name is valid under D3 and no listed entry is `Ended` or `Former`. Task 7 only gains a doc line saying so, and Task 8's code is unchanged; only its `error.rs` hunk context moved.
+- **Also answered 28 September:** D4 (Sámi collation data is added with a Sámi locale; R13) and D5 (archived groups stay out of the directory, confirming execution ruling Q6).
+
+**Open questions for Erik:** none remain from this plan. Question 1 (name history) is closed by D3, and question 2 (Sámi collation data) by D4.
 
 **Spec against code:**
 - ADR-003 §6 lists "member emails and names" as plaintext. The accepted spec §4.1 and key-service §3.1, both later, encrypt display names and contact addresses. The later documents win. The login address stays plaintext.
 - Spec §4.3 says addresses are "joined with `, ` per RFC 6068", but RFC 6068's `mailto:` grammar has no space. Ruling R14 applies `, ` to the copy text and `,` to the link.
 - Spec §8 gives "display name captured when an invitation is accepted" to #3418. #3501's plan handed it to #3502, and it is Task 4 here.
 - Spec §4.1 makes the name required, but pre-`0008` rows have none. R2 handles them, and `ShownName::Unnamed` renders them.
+- **Spec §4.2 says "the name stays after the membership ends".** Erik's D3 (28 September 2026) overrides that: the name goes with the membership, and history shows role and year. The Rulings (D3) below apply it. The spec's text is not edited here; the #3500 document owner updates §4.2.
 
 ## What later cards get from #3502, and nothing more
 
@@ -183,12 +221,22 @@ The spec leaves these open, and the plan decides them. Each carries its reason a
     4. `accept_invitation`, retrying from step 1 once on `AcceptanceTargetChanged`.
 
     Activation is the same with a fresh `Uuid::now_v7()`.
-  - Profile edits: `set_display_name` and `set_contact_email`. An admin correcting someone else's name is a privileged admin action, so it passes #3414's gate first. A member's own edit needs no gate.
-- **The job runner** (with `lapse_requests` and `create_handover_grants`) schedules `clear_ended_contact_emails` daily.
-- **#3426 (Article 17):** `erase_member_names(account_id)` is its storage step (R9).
-- **#3503 (chat) and every history renderer** resolve authors through `member_names`, which returns `Former` after an erasure. #3503 decides the guest rule (R10).
-- **#3421 (audit view)** renders `directory.addresses_exported`, `membership.display_name_changed`, `membership.contact_email_changed`, `membership.contact_email_cleared` and `membership.name_erased` from their codes.
-- **Privacy notice and DPA** (§8): names are kept after the membership ends; contact addresses are visible to the FAU and deleted when the membership ends; an erasure's backup tail.
+  - Profile edits: `set_display_name` and `set_contact_email`. An admin correcting someone else's name is a privileged admin action, so it passes #3414's gate first. A member's own edit needs no gate. `MembershipEnded` means the membership has ended and takes no name (D3-6).
+- **The job runner** (with `lapse_requests` and `create_handover_grants`) schedules `clear_ended_profiles` daily.
+- **#3426 (Article 17):** `erase_member_names(account_id)` is its storage step (R9, D3-4).
+- **#3503 (chat) and every history renderer** resolve people through `member_names`, then render:
+  - `Named`: decrypt with `DISPLAY_NAME_AAD`;
+  - `Unnamed`: "Navn ikke oppgitt";
+  - `Ended(held)`: `role_label(&held, event_date)`, using the date of the message, minute or audit line, rendered with `member.endedRole.oneYear` or `member.endedRole.years`;
+  - `Former`: "Tidligere medlem".
+
+  A renderer never caches a name beyond the request, since it goes when the membership ends. #3503 decides the guest rule (R10).
+- **#3421 (audit view)** renders `directory.addresses_exported`, `membership.display_name_changed`, `membership.contact_email_changed`, `membership.profile_cleared` and `membership.name_erased` from their codes.
+- **Privacy notice and DPA** (§8):
+  - names and contact addresses are deleted when the membership ends;
+  - afterwards history shows the role and year, from the FAU's role records;
+  - contact addresses are visible to the FAU;
+  - an erasure shows "Tidligere medlem" and has a backup tail.
 
 ## File Structure
 
@@ -196,7 +244,7 @@ The spec leaves these open, and the plan decides them. Each carries its reason a
 backend/
   Cargo.toml                                       modify: icu_collator, icu_locale_core in [workspace.dependencies]
   Cargo.lock                                       regenerated by cargo (Task 3)
-  migrations/0008_member_directory.sql             NEW  the three columns and four checks
+  migrations/0008_member_directory.sql             NEW  the three columns and five checks (Task 3b amends it in place)
   crates/domain/
     Cargo.toml                                     modify: icu_collator, icu_locale_core, uuid
     src/lib.rs                                     modify: pub mod directory
@@ -205,16 +253,17 @@ backend/
     src/directory/address.rs                       NEW  Recipients, mailto, copy text, length guard
     src/directory/collation.rs                     NEW  NameCollator (ICU4X)
     src/directory/listing.rs                       NEW  SectionId, Person, arrange
+    src/directory/history.rs                       NEW  HeldRole, RoleLabel, role_label (D3)
   crates/persistence/src/membership/
     mod.rs                                         modify: modules and re-exports
-    error.rs                                       modify: five variants
+    error.rs                                       modify: six variants
     sql.rs                                         modify: ensure_membership takes the expected id
-    profile.rs                                     NEW  AADs, MemberProfile, set_display_name, set_contact_email
+    profile.rs                                     NEW  AADs, MemberProfile, membership_ended, set_display_name, set_contact_email
     invitations.rs                                 modify: AcceptInvitation.profile, prepare_acceptance
     signup.rs                                      modify: Activation.profile
-    roles.rs                                       modify: revocation clears the contact address
+    roles.rs                                       modify: revocation clears the name and the contact address
     names.rs                                       NEW  MemberName, member_names
-    retention.rs                                   NEW  clear_ended_contact_emails, erase_member_names
+    retention.rs                                   NEW  clear_ended_profiles, erase_member_names
     groups.rs                                      modify: readable_groups, group_members_sql shared
     directory.rs                                   NEW  member_directory and its types
     export.rs                                      NEW  export_addresses
@@ -222,10 +271,11 @@ backend/
     common/membership.rs                           modify: placeholder_envelope, fresh_profile, profile_for
     outbox.rs guests.rs invitations.rs requests.rs signup.rs   modify: pass a profile
     handover_recovery.rs                           modify: pass a profile; the re-invite uses profile_for
-    directory_schema.rs                            NEW  0008
+    invitations.rs roles.rs                        modify: raw-SQL revocation fixtures clear the name (D3)
+    directory_schema.rs                            NEW  0008 (Task 3b: the name check)
     member_profile.rs                              NEW  capture at acceptance and activation
     profile_edits.rs                               NEW  edits
-    directory_retention.rs                         NEW  sweep, erasure, names for history
+    directory_retention.rs                         NEW  sweep, erasure, history's role and year
     authorization.rs                               modify: directory entries in the matrix
     directory.rs                                   NEW  sections agree with group reads; entries
     address_export.rs                              NEW  export and its audit
@@ -1565,20 +1615,277 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Capture the display name at acceptance and activation; revocation takes the address
+### Task 3b: Amend migration 0008 for D3: a revoked membership holds no name
 
-This changes #3418/#3501's accept path (spec §8's #3418 row). Every caller now passes a `MemberProfile`.
+Added 28 September 2026 for Erik's decision **D3**, after Tasks 1–3 were built. A display name is valid only while the membership is active; once it ends, the name is cleared like the contact address, and history shows role and year instead (Rulings (D3) D3-1 to D3-8). Task 3b keeps its letter so that Tasks 4–9 and the execution ledger's rulings Q1–Q8 keep their numbers.
+
+`0008` is edited **in place**, which the Global Constraints allow only while no persistent database has applied it. Step 1 checks that first.
+
+**Files:**
+- Modify: `backend/migrations/0008_member_directory.sql`
+- Modify: `backend/crates/app/tests/directory_schema.rs`
+
+**Interfaces:**
+- Consumes: Task 1's migration and tests.
+- Produces:
+  - check `memberships_display_name_only_while_current`: `revoked_at is null or encrypted_display_name is null`, the twin of `memberships_contact_email_only_while_current`;
+  - `name_erased_at`, unchanged in type, now documented as the Article 17 marker that also suppresses the role-and-year label (Ruling D3-4);
+  - `schema_contract` stays at version 8.
+
+- [ ] **Step 1: Confirm that no persistent database has applied 0008 (read only)**
+
+The persistent database is `fau` in the compose `db`, the one the `migrate` service targets. The `fau_test_*` databases are excluded on purpose: the test template's name is a hash of the migration set (`common::TEMPLATE_PREFIX`), so an edited `0008` builds a fresh template, and the per-test databases are throwaway.
+
+```bash
+for d in $(psql -Atq postgres://postgres:postgres@db:5432/postgres \
+             -c "select datname from pg_database where datallowconn and datname not like 'fau\_test\_%' order by 1"); do
+  printf '%s: ' "$d"
+  psql -Atq "postgres://postgres:postgres@db:5432/$d" -c \
+    "select coalesce(max(n.nspname || '._sqlx_migrations'), 'no migrations table')
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where c.relname = '_sqlx_migrations'"
+done
+```
+
+Expected (as observed on 28 September 2026):
+```
+fau: no migrations table
+postgres: no migrations table
+template1: no migrations table
+```
+
+If any database prints a table name, run `select version from <that table> where version = 8` there. If that returns a row, **stop**: do not edit `0008`. Report to the controller, because the change then becomes a new `0009`.
+
+- [ ] **Step 2: Write the failing test**
+
+Apply to `backend/crates/app/tests/directory_schema.rs`:
+
+```diff
+--- a/backend/crates/app/tests/directory_schema.rs
++++ b/backend/crates/app/tests/directory_schema.rs
+@@ -1,5 +1,7 @@
+ //! Migration 0008: the member directory's fields on `memberships` (groups design §4.1,
+-//! §4.2), proven in SQL before any Rust depends on them.
++//! §4.2), proven in SQL before any Rust depends on them. Under Erik's D3 (28 September
++//! 2026) neither field outlives the membership: a revoked membership holds no name and no
++//! contact address.
+ 
+ mod common;
+ use common::TestDb;
+@@ -98,52 +100,72 @@ async fn both_fields_hold_only_a_bounded_envelope() {
+ }
+ 
+ #[tokio::test]
+-async fn a_revoked_membership_holds_no_contact_email() {
++async fn a_revoked_membership_holds_neither_a_name_nor_a_contact_email() {
+     let db = TestDb::migrated().await;
+     let pool = db.admin_pool();
+     let (_, m) = seed(&pool).await;
+-    set(&pool, m, "encrypted_contact_email", Some(envelope(1, 60)))
+-        .await
+-        .unwrap();
+-    set(&pool, m, "encrypted_display_name", Some(envelope(1, 60)))
+-        .await
+-        .unwrap();
+-
+-    // Revoking without clearing the address is refused.
+-    let err =
+-        sqlx::query("update memberships set revoked_at = '2026-09-23T10:00:00Z' where id = $1")
++    let checks = [
++        (
++            "encrypted_display_name",
++            "memberships_display_name_only_while_current",
++        ),
++        (
++            "encrypted_contact_email",
++            "memberships_contact_email_only_while_current",
++        ),
++    ];
++    let revoke = |clear: &'static str| {
++        let pool = pool.clone();
++        async move {
++            sqlx::query(&format!(
++                "update memberships set revoked_at = '2026-09-23T10:00:00Z'{clear} where id = $1"
++            ))
+             .bind(m)
+             .execute(&pool)
+             .await
+-            .unwrap_err();
+-    assert_eq!(
+-        constraint_name(&err).as_deref(),
+-        Some("memberships_contact_email_only_while_current")
+-    );
++            .map(|_| ())
++        }
++    };
+ 
+-    // Clearing it in the same statement is accepted, and the name stays (§4.2).
+-    sqlx::query(
+-        "update memberships set revoked_at = '2026-09-23T10:00:00Z', encrypted_contact_email = null
+-          where id = $1",
+-    )
+-    .bind(m)
+-    .execute(&pool)
+-    .await
+-    .unwrap();
+-    let err = set(&pool, m, "encrypted_contact_email", Some(envelope(1, 60)))
++    // Each field on its own blocks the revocation, with its own check.
++    for (column, constraint) in checks {
++        set(&pool, m, column, Some(envelope(1, 60))).await.unwrap();
++        let err = revoke("").await.unwrap_err();
++        assert_eq!(
++            constraint_name(&err).as_deref(),
++            Some(constraint),
++            "{column}"
++        );
++        set(&pool, m, column, None).await.unwrap();
++    }
++
++    // Clearing both in the same statement is accepted: under D3 the name goes too.
++    for (column, _) in checks {
++        set(&pool, m, column, Some(envelope(1, 60))).await.unwrap();
++    }
++    revoke(", encrypted_display_name = null, encrypted_contact_email = null")
+         .await
+-        .unwrap_err();
+-    assert_eq!(
+-        constraint_name(&err).as_deref(),
+-        Some("memberships_contact_email_only_while_current")
+-    );
+-    let name: Option<Vec<u8>> =
+-        sqlx::query_scalar("select encrypted_display_name from memberships where id = $1")
+-            .bind(m)
+-            .fetch_one(&pool)
++        .unwrap();
++    for (column, constraint) in checks {
++        let err = set(&pool, m, column, Some(envelope(1, 60)))
+             .await
+-            .unwrap();
+-    assert_eq!(name, Some(envelope(1, 60)));
++            .unwrap_err();
++        assert_eq!(
++            constraint_name(&err).as_deref(),
++            Some(constraint),
++            "{column}"
++        );
++    }
++
++    // Positive control, the re-invitation path: reopened, the row takes a new name.
++    sqlx::query("update memberships set revoked_at = null where id = $1")
++        .bind(m)
++        .execute(&pool)
++        .await
++        .unwrap();
++    set(&pool, m, "encrypted_display_name", Some(envelope(1, 60)))
++        .await
++        .unwrap();
+ }
+ 
+ #[tokio::test]
+```
+
+- [ ] **Step 3: Run it to verify it fails**
+
+Run: `cargo test -p fau-app --test directory_schema`
+Expected: `a_revoked_membership_holds_neither_a_name_nor_a_contact_email` FAILS. The revocation with only a name set is accepted, so `unwrap_err` panics with `called Result::unwrap_err() on an Ok value`. The other 3 tests pass.
+
+- [ ] **Step 4: Amend the migration**
+
+Overwrite `backend/migrations/0008_member_directory.sql` with:
+
+```sql
+-- 0008: the member directory's two fields (#3502; groups design §4.1, §4.2, as amended by
+-- Erik's D3 of 28 September 2026).
+--
+-- Both are per membership, so one person can go by different names in two FAU-er, and
+-- both are content: the backend encrypts them under the FAU's record key with AAD
+-- (tenant, 'memberships', <column>, membership id). This table holds the envelopes only,
+-- and no key material. The checks are structural, as for groups.encrypted_name in 0007:
+-- version byte 1 and 42..512 octets, i.e. 41 bytes of version, nonce and tag around
+-- 1..471 bytes of plaintext. A display name (1..100 characters, at most 400 bytes of UTF-8)
+-- and an address (at most 254 bytes) both fit with headroom.
+--
+-- **Neither field outlives the membership (D3).** A membership has ended when it is
+-- revoked, or when none of its role assignments is still running or yet to start. The
+-- two *_only_while_current checks hold that for revocation; fau_persistence's
+-- clear_ended_profiles sweep clears both fields from a membership whose roles simply ran
+-- out. History then shows an ended membership as its role and year ("Leder 2025–2026"),
+-- computed from role_assignments at read time, never a name. So there is no name history
+-- to keep.
+--
+-- * encrypted_display_name: required by the code when an invitation is accepted or an FAU
+--   activated, so every membership created from here on has one while it is active.
+--   Nullable because rows created before this migration have none, because an ended
+--   membership holds none, and because an Article 17 erasure removes it.
+-- * encrypted_contact_email: optional, the member's own statement, never verified and never
+--   mailed by the system.
+-- * name_erased_at: an Article 17 erasure. History shows "Tidligere medlem" for the
+--   membership, never a name and not even its role and year, and the row cannot be
+--   accepted into again.
+alter table memberships
+  add column encrypted_display_name  bytea,
+  add column encrypted_contact_email bytea,
+  add column name_erased_at          timestamptz;
+
+alter table memberships add constraint memberships_display_name_is_an_envelope
+  check (encrypted_display_name is null
+         or (get_byte(encrypted_display_name, 0) = 1
+             and octet_length(encrypted_display_name) between 42 and 512));
+alter table memberships add constraint memberships_contact_email_is_an_envelope
+  check (encrypted_contact_email is null
+         or (get_byte(encrypted_contact_email, 0) = 1
+             and octet_length(encrypted_contact_email) between 42 and 512));
+alter table memberships add constraint memberships_display_name_only_while_current
+  check (revoked_at is null or encrypted_display_name is null);
+alter table memberships add constraint memberships_contact_email_only_while_current
+  check (revoked_at is null or encrypted_contact_email is null);
+alter table memberships add constraint memberships_erasure_leaves_nothing
+  check (name_erased_at is null
+         or (encrypted_display_name is null and encrypted_contact_email is null));
+
+-- fau_app already holds select, insert, update, delete on memberships (0002).
+
+insert into schema_contract (version) values (8);
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p fau-app --test directory_schema --test migrations --test schema_review --test membership_schema`
+Expected: PASS. `directory_schema` shows 4 passed. The others are unchanged: no code writes a name yet, so no existing test revokes a named membership.
+
+Mutation check: drop the new `memberships_display_name_only_while_current`, and the test fails again as in Step 3.
+
+- [ ] **Step 6: Format and lint**
+
+Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: no output from `fmt`, and clippy finishes with no warnings.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend/migrations/0008_member_directory.sql \
+        backend/crates/app/tests/directory_schema.rs
+git commit -m "Amend migration 0008 for D3: a revoked membership holds no name (#3502)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: Capture the display name at acceptance and activation; revocation takes both fields
+
+This changes #3418/#3501's accept path (spec §8's #3418 row). Every caller now passes a `MemberProfile`. Under D3, revocation clears the name as well as the contact address (Ruling D3-2).
 
 **Files:**
 - Modify: `backend/crates/persistence/src/membership/error.rs`, `sql.rs`, `invitations.rs`, `signup.rs`, `roles.rs`, `mod.rs`
 - Create: `backend/crates/persistence/src/membership/profile.rs`
 - Modify: `backend/crates/app/tests/common/membership.rs`
-- Modify: `backend/crates/app/tests/{outbox,guests,invitations,requests,signup,handover_recovery}.rs`
+- Modify: `backend/crates/app/tests/{outbox,guests,invitations,requests,signup,handover_recovery,roles}.rs`
 - Test: `backend/crates/app/tests/member_profile.rs`
 
 **Interfaces:**
 - Consumes:
-  - the columns and checks from Task 1;
+  - the columns and checks from Tasks 1 and 3b;
   - `fau_crypto::Ciphertext` (`from_stored`, `as_bytes`, `len`);
   - `lock_tenant`, `upsert_verified_account` and `hash_token`/`looks_like_token`.
 - Produces:
@@ -1587,7 +1894,8 @@ This changes #3418/#3501's accept path (spec §8's #3418 row). Every caller now 
   - `struct MemberProfile { membership_id: Uuid, encrypted_display_name: Ciphertext, encrypted_contact_email: Option<Ciphertext> }`;
   - `AcceptInvitation { token, acceptor, admin_end_override, profile: MemberProfile }` and `Activation { tenant_id, registrant, profile: MemberProfile }`;
   - `prepare_acceptance(pool, token: &str, acceptor: &VerifiedEmail) -> Result<AcceptanceTarget, MembershipError>`, with `struct AcceptanceTarget { tenant_id: Uuid, membership_id: Uuid }`;
-  - `MembershipError::{DisplayNameMalformed, ContactEmailMalformed, AcceptanceTargetChanged, MembershipErased}`;
+  - `MembershipError::{DisplayNameMalformed, ContactEmailMalformed, AcceptanceTargetChanged, MembershipErased, MembershipEnded}` (`MembershipEnded` is first returned in Task 5);
+  - `revoke_membership` clears `encrypted_display_name` and `encrypted_contact_email` in the statement that revokes;
   - `pub(crate) ensure_membership(conn, tenant_id, account_id, expected_id) -> Result<(Uuid, bool), _>`;
   - `pub(crate) write_profile(conn, tenant_id, &MemberProfile)`;
   - `pub(crate) check_display_name` and `check_contact_email`;
@@ -1601,6 +1909,7 @@ Create `backend/crates/app/tests/member_profile.rs`:
 //! The directory fields enter the system (groups design §4.1, §8's #3418 row; #3502): a
 //! display name is required when an invitation is accepted or an FAU activated, a contact
 //! address is optional, and both are bound to the membership `prepare_acceptance` names.
+//! Under D3 both leave with the membership: revocation clears them.
 
 mod common;
 use common::membership::*;
@@ -1826,6 +2135,11 @@ async fn a_profile_for_another_membership_is_refused() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        fields(&pool, first.membership_id).await,
+        (None, None),
+        "revocation took the name (D3)"
+    );
 
     // Invited back: prepare names the old membership, which acceptance reopens.
     let token = invite(&pool, &fau, "kari@example.test").await;
@@ -1858,7 +2172,7 @@ async fn a_profile_for_another_membership_is_refused() {
             .unwrap();
     assert!(revoked);
 
-    // Positive control: the prepared id is accepted, and replaces the old name.
+    // Positive control: the prepared id is accepted, and the reopened row is named again.
     accept_invitation(
         &pool,
         AcceptInvitation {
@@ -1956,11 +2270,11 @@ async fn prepare_answers_for_an_expired_invitation_so_acceptance_can_say_why() {
     assert!(matches!(err, MembershipError::Acceptance(_)), "{err:?}");
 }
 
-/// The contact address goes with the membership; the name stays (§4.2). Without the
-/// clearing in `revoke_membership`, migration 0008's
+/// Both fields go with the membership (D3). Without the clearing in `revoke_membership`,
+/// migration 0008's `memberships_display_name_only_while_current` or
 /// `memberships_contact_email_only_while_current` refuses the revocation outright.
 #[tokio::test]
-async fn revoking_a_membership_clears_its_contact_address_and_keeps_its_name() {
+async fn revoking_a_membership_clears_its_name_and_contact_address() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
@@ -1998,10 +2312,7 @@ async fn revoking_a_membership_clears_its_contact_address_and_keeps_its_name() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        fields(&pool, kari).await,
-        (Some(envelope(3).as_bytes().to_vec()), None)
-    );
+    assert_eq!(fields(&pool, kari).await, (None, None));
 }
 ```
 
@@ -2017,7 +2328,7 @@ Apply to `backend/crates/persistence/src/membership/error.rs`:
 ```diff
 --- a/backend/crates/persistence/src/membership/error.rs
 +++ b/backend/crates/persistence/src/membership/error.rs
-@@ -128,6 +128,18 @@
+@@ -128,6 +128,22 @@ pub enum MembershipError {
      #[error("cohort not found")]
      UnknownCohort,
  
@@ -2032,6 +2343,10 @@ Apply to `backend/crates/persistence/src/membership/error.rs`:
 +    AcceptanceTargetChanged,
 +    #[error("the membership's name was erased")]
 +    MembershipErased,
++    /// The membership has ended -- it is revoked, or none of its role assignments is still
++    /// running or yet to start -- so it holds no name (Erik's D3, 28 September 2026).
++    #[error("the membership has ended")]
++    MembershipEnded,
 +
      // Infrastructure.
      #[error("the operating system's random source failed")]
@@ -2187,8 +2502,10 @@ impl MemberProfile {
 }
 
 /// Writes both fields onto a membership that is not revoked (the caller has just created
-/// or reopened it). Replaces whatever a re-invited person had before: a new acceptance
-/// states the name that applies from now on.
+/// or reopened it). A re-invited former member's row holds no name by then (D3: revocation
+/// and the `clear_ended_profiles` sweep cleared it), so the new acceptance states the name
+/// that applies from now on; one whose roles ran out before the sweep reached them has
+/// theirs replaced.
 pub(crate) async fn write_profile(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -2213,7 +2530,7 @@ pub(crate) async fn write_profile(
 }
 ```
 
-- [ ] **Step 6: Take the profile at acceptance and activation, and clear the address on revocation**
+- [ ] **Step 6: Take the profile at acceptance and activation, and clear both fields on revocation**
 
 Apply to `backend/crates/persistence/src/membership/invitations.rs`:
 
@@ -2390,14 +2707,17 @@ Apply to `backend/crates/persistence/src/membership/roles.rs`:
 ```diff
 --- a/backend/crates/persistence/src/membership/roles.rs
 +++ b/backend/crates/persistence/src/membership/roles.rs
-@@ -255,7 +255,10 @@
+@@ -255,7 +255,13 @@ pub async fn revoke_membership(
  
      let now = ts_param(at.now());
      sqlx::query(
 -        "update memberships set revoked_at = $3::timestamptz where tenant_id = $1 and id = $2",
-+        // The contact address goes with the membership (groups design §4.2); the name stays,
-+        // because history shows the names that applied at the time.
-+        "update memberships set revoked_at = $3::timestamptz, encrypted_contact_email = null
++        // Neither field outlives the membership (D3, 28 September 2026): history shows an
++        // ended membership as its role and year, never a name. Migration 0008's two
++        // *_only_while_current checks refuse a revocation that forgets either.
++        "update memberships
++            set revoked_at = $3::timestamptz,
++                encrypted_display_name = null, encrypted_contact_email = null
 +          where tenant_id = $1 and id = $2",
      )
      .bind(req.tenant_id)
@@ -2570,20 +2890,86 @@ Apply to `backend/crates/app/tests/handover_recovery.rs`:
 
 (The diff is against the file as the command above left it.)
 
+Two tests sabotage a membership into the revoked state with raw SQL. Under D3 a revoked membership may hold no name (Task 3b's `memberships_display_name_only_while_current`), and every membership now has one, so each fixture clears the fields in the same statement. The `invitations.rs` diff is against the file as the perl command left it:
+
+Apply to `backend/crates/app/tests/invitations.rs`:
+
+```diff
+--- a/backend/crates/app/tests/invitations.rs
++++ b/backend/crates/app/tests/invitations.rs
+@@ -648,11 +648,16 @@
+         t0,
+     )
+     .await;
+-    sqlx::query("update memberships set revoked_at = now() where id = $1")
+-        .bind(first.membership_id)
+-        .execute(&db.admin_pool())
+-        .await
+-        .unwrap();
++    // D3: a revoked membership holds no name, so the sabotage clears it too (#3502).
++    sqlx::query(
++        "update memberships
++            set revoked_at = now(), encrypted_display_name = null, encrypted_contact_email = null
++          where id = $1",
++    )
++    .bind(first.membership_id)
++    .execute(&db.admin_pool())
++    .await
++    .unwrap();
+ 
+     let again = add_member(
+         &pool,
+```
+
+Apply to `backend/crates/app/tests/roles.rs`:
+
+```diff
+--- a/backend/crates/app/tests/roles.rs
++++ b/backend/crates/app/tests/roles.rs
+@@ -532,13 +532,18 @@ async fn a_revoked_membership_with_an_unrevoked_admin_assignment_is_not_an_admin
+     )
+     .await;
+     // No persistence function reaches this shape -- arranged directly with the
+-    // superuser pool, per the global constraints (fix round 1, item 5).
+-    sqlx::query("update memberships set revoked_at = now() where tenant_id = $1 and id = $2")
+-        .bind(fau.tenant_id)
+-        .bind(other.membership_id)
+-        .execute(&admin_pool)
+-        .await
+-        .unwrap();
++    // superuser pool, per the global constraints (fix round 1, item 5). D3: a revoked
++    // membership holds no name, so the name goes with it (#3502).
++    sqlx::query(
++        "update memberships
++            set revoked_at = now(), encrypted_display_name = null, encrypted_contact_email = null
++          where tenant_id = $1 and id = $2",
++    )
++    .bind(fau.tenant_id)
++    .bind(other.membership_id)
++    .execute(&admin_pool)
++    .await
++    .unwrap();
+     assert!(
+         !revoked(&pool, "role_assignments", other.assignment_ids[0]).await,
+         "the assignment itself stays unrevoked; only the membership was sabotaged"
+```
+
+The `roles.rs` fixture is the one reachable shape of a revoked membership whose assignments are not revoked. It is why Task 5's `membership_ended` tests `m.revoked_at` as well as the assignments.
+
 - [ ] **Step 8: Run the tests to verify they pass**
 
-Run: `cargo test -p fau-app --test member_profile --test invitations --test handover_recovery --test signup --test guests --test requests --test outbox && cargo test -p fau-persistence --lib`
+Run: `cargo test -p fau-app --test member_profile --test invitations --test handover_recovery --test signup --test guests --test requests --test outbox --test roles && cargo test -p fau-persistence --lib`
 Expected: PASS. `member_profile` shows 7 passed. The six changed suites pass as before.
 
 Mutation checks:
 - In `ensure_membership`, drop the `id != expected_id` branch, and `a_profile_for_another_membership_is_refused` fails.
 - In `prepare_acceptance`, drop `m.tenant_id = $1`, and `prepare_names_only_this_faus_membership_and_only_for_the_recipient` fails.
-- Drop the `encrypted_contact_email = null` from `revoke_membership`, and the revocation test fails on `memberships_contact_email_only_while_current`.
+- Drop `encrypted_display_name = null` from `revoke_membership`, and `revoking_a_membership_clears_its_name_and_contact_address` fails on `memberships_display_name_only_while_current`. Drop `encrypted_contact_email = null`, and it fails on `memberships_contact_email_only_while_current`.
 
 - [ ] **Step 9: Run the whole workspace once**
 
 The accept path is shared, so run all of it: `ps aux | grep '[c]argo test'` (must be empty), then `cargo test --workspace`.
-Expected: every suite passes.
+Expected: every suite passes (736 in the dry run at this state). `roles` includes the re-fixtured `a_revoked_membership_with_an_unrevoked_admin_assignment_is_not_an_admin`.
 
 - [ ] **Step 10: Format and lint**
 
@@ -2601,7 +2987,8 @@ git add backend/crates/persistence/src/membership/ \
         backend/crates/app/tests/invitations.rs \
         backend/crates/app/tests/requests.rs \
         backend/crates/app/tests/signup.rs \
-        backend/crates/app/tests/handover_recovery.rs
+        backend/crates/app/tests/handover_recovery.rs \
+        backend/crates/app/tests/roles.rs
 git commit -m "Capture the display name when an invitation is accepted or an FAU activated (#3502)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2617,10 +3004,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes:
-  - `check_display_name` and `check_contact_email` (Task 4);
-  - `membership_access`, `is_admin_today`, `lock_tenant`, `require_open`, `write_audit` and `Audit::member`.
+  - `check_display_name` and `check_contact_email`, and `MembershipError::MembershipEnded` (Task 4);
+  - `membership_access`, `is_admin_today`, `lock_tenant`, `require_open`, `date_param`, `write_audit` and `Audit::member`.
 - Produces:
-  - `struct SetDisplayName { tenant_id, actor_membership_id, membership_id, encrypted_display_name: Ciphertext }` and `set_display_name(pool, SetDisplayName, Moment) -> Result<(), MembershipError>`;
+  - `pub(crate) membership_ended(date_param: &str) -> String`, the SQL predicate "membership `m` has ended" (revoked, or no assignment running or still to come), shared with Task 6 (Ruling D3-2);
+  - `struct SetDisplayName { tenant_id, actor_membership_id, membership_id, encrypted_display_name: Ciphertext }` and `set_display_name(pool, SetDisplayName, Moment) -> Result<(), MembershipError>`, refusing an ended target with `MembershipEnded` (Ruling D3-6);
   - `struct SetContactEmail { tenant_id, membership_id, encrypted_contact_email: Option<Ciphertext> }` and `set_contact_email(pool, SetContactEmail, Moment) -> Result<(), MembershipError>`;
   - audit actions `membership.display_name_changed {by_admin}` and `membership.contact_email_changed {cleared}`.
 
@@ -2630,8 +3018,9 @@ Create `backend/crates/app/tests/profile_edits.rs`:
 
 ```rust
 //! Editing the directory fields (groups design §4.1; #3502): a member edits their own name,
-//! an admin corrects anyone's, and only the member sets their contact address. Every
-//! refusal a non-admin can reach is the same `NotAuthorized`, whatever the target is.
+//! an admin corrects that of anyone still active, and only the member sets their contact
+//! address. An ended membership takes no name (D3). Every refusal a non-admin can reach is
+//! the same `NotAuthorized`, whatever the target is.
 
 mod common;
 use common::groups::*;
@@ -2730,12 +3119,43 @@ async fn a_member_edits_their_own_name_and_the_audit_holds_no_name() {
     );
 }
 
+/// Mutation check: drop the `membership_ended` test from `set_display_name`, and the
+/// revoked row fails on migration 0008's `memberships_display_name_only_while_current`
+/// while the ran-out row is renamed.
 #[tokio::test]
-async fn an_admin_corrects_anyones_name_including_a_former_members() {
+async fn an_admin_corrects_an_active_members_name_and_an_ended_membership_takes_none() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
     let kari = member(&pool, &fau, "kari@example.test").await;
+    rename(&pool, fau.tenant_id, fau.admin_membership_id, kari, 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        name_of(&pool, kari).await.as_deref(),
+        Some(envelope(8).as_bytes())
+    );
+    assert_eq!(
+        last_audit(&pool, "membership.display_name_changed").await,
+        serde_json::json!({ "by_admin": true })
+    );
+
+    // Active before it has begun: every role is still to come.
+    let next_year = add_member(
+        &pool,
+        &fau,
+        "neste@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 10, 1), day(2027, 9, 1)),
+        at(T0),
+    )
+    .await
+    .membership_id;
+    rename(&pool, fau.tenant_id, fau.admin_membership_id, next_year, 6)
+        .await
+        .unwrap();
+
+    // Revoked: the name went with it, and a correction cannot bring one back.
     revoke_membership(
         &pool,
         RevokeMembership {
@@ -2748,17 +3168,41 @@ async fn an_admin_corrects_anyones_name_including_a_former_members() {
     )
     .await
     .unwrap();
-    rename(&pool, fau.tenant_id, fau.admin_membership_id, kari, 8)
-        .await
-        .unwrap();
     assert_eq!(
-        name_of(&pool, kari).await.as_deref(),
-        Some(envelope(8).as_bytes())
+        rename(&pool, fau.tenant_id, fau.admin_membership_id, kari, 9).await,
+        Err(MembershipError::MembershipEnded)
     );
+    assert_eq!(name_of(&pool, kari).await, None);
+
+    // Ran out, and the sweep has not reached it yet: the old name stays untouched until
+    // it does, and no new one is accepted.
+    let month = add_member(
+        &pool,
+        &fau,
+        "maaned@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+        at(T0),
+    )
+    .await
+    .membership_id;
+    let before = name_of(&pool, month).await;
     assert_eq!(
-        last_audit(&pool, "membership.display_name_changed").await,
-        serde_json::json!({ "by_admin": true })
+        set_display_name(
+            &pool,
+            SetDisplayName {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                membership_id: month,
+                encrypted_display_name: envelope(9),
+            },
+            at("2026-10-01T10:00:00Z"),
+        )
+        .await,
+        Err(MembershipError::MembershipEnded)
     );
+    assert_eq!(name_of(&pool, month).await, before);
+
     // Only an admin learns that an id does not exist.
     assert_eq!(
         rename(
@@ -2976,11 +3420,15 @@ Apply to `backend/crates/persistence/src/membership/profile.rs`:
 ```diff
 --- a/backend/crates/persistence/src/membership/profile.rs
 +++ b/backend/crates/persistence/src/membership/profile.rs
-@@ -9,14 +9,22 @@
+@@ -9,14 +9,26 @@
  //!
  //! **The contact address is the member's own statement.** It is not verified, and no system
  //! mail is ever sent to it: login, invitations and recovery keep using the account address.
 +//! So only the member sets it. An admin may correct a name, not an address.
++//!
++//! **Neither field outlives the membership** (Erik's D3, 28 September 2026). Once a
++//! membership has ended ([`membership_ended`]) it holds no name, so no edit gives it one;
++//! history shows it as its role and year instead (`member_names`).
 +//!
 +//! **Order** (as in the rest of `membership`): tenant state, then authority, then row state.
  
@@ -2996,11 +3444,11 @@ Apply to `backend/crates/persistence/src/membership/profile.rs`:
  
 +use super::access::membership_access;
  use super::error::MembershipError;
-+use super::sql::{is_admin_today, lock_tenant, require_open, write_audit, Audit};
++use super::sql::{date_param, is_admin_today, lock_tenant, require_open, write_audit, Audit};
  
  /// The associated data a display name is encrypted with, with the tenant and the
  /// membership's id.
-@@ -97,3 +105,134 @@
+@@ -99,3 +111,159 @@ pub(crate) async fn write_profile(
      .await?;
      Ok(())
  }
@@ -3014,12 +3462,33 @@ Apply to `backend/crates/persistence/src/membership/profile.rs`:
 +    pub encrypted_display_name: Ciphertext,
 +}
 +
-+/// A member edits their own name, or an admin corrects anyone's (§4.1), including a former
-+/// member's, since history shows the names that applied at the time. Refused while the FAU
-+/// is frozen, and for a name an Article 17 erasure removed (`MembershipErased`).
++/// SQL: membership `m` has ended on the date bound as `date_param` (for example `$3`). It
++/// is revoked, or none of its role assignments is still running or yet to start (plan R8).
++/// A handover grant does not keep a membership going: it is a recovery right, not a role.
++///
++/// The one definition that editing ([`set_display_name`]), the retention sweep
++/// (`clear_ended_profiles`) and history (`member_names`) share (D3). `revoked_at` is tested
++/// on its own too: `revoke_membership` revokes the running and future assignments with the
++/// membership, but a row revoked any other way must still count as ended.
++pub(crate) fn membership_ended(date_param: &str) -> String {
++    format!(
++        "(m.revoked_at is not null
++          or not exists (select 1 from role_assignments ra
++                          where ra.tenant_id = m.tenant_id and ra.membership_id = m.id
++                            and ra.revoked_at is null
++                            and ra.ends_on_exclusive > {date_param}::date))"
++    )
++}
++
++/// A member edits their own name, or an admin corrects the name of anyone whose membership
++/// is still active (§4.1). Refused while the FAU is frozen, for a name an Article 17
++/// erasure removed (`MembershipErased`), and for a membership that has ended
++/// (`MembershipEnded`): under D3 an ended membership holds no name, and history shows its
++/// role and year instead. A membership whose roles are all still to come is active.
 +///
 +/// **Authority before state:** a member naming anyone but themselves gets `NotAuthorized`
-+/// whether or not the id exists; only an admin learns `UnknownMembership`.
++/// whether or not the id exists; only an admin learns `UnknownMembership` or
++/// `MembershipEnded`.
 +pub async fn set_display_name(
 +    pool: &PgPool,
 +    req: SetDisplayName,
@@ -3043,18 +3512,22 @@ Apply to `backend/crates/persistence/src/membership/profile.rs`:
 +        }
 +        true
 +    };
-+    let erased: Option<bool> = sqlx::query_scalar(
-+        "select name_erased_at is not null from memberships
-+          where tenant_id = $1 and id = $2 for update",
-+    )
++    let row: Option<(bool, bool)> = sqlx::query_as(&format!(
++        "select m.name_erased_at is not null, {}
++           from memberships m
++          where m.tenant_id = $1 and m.id = $2 for update",
++        membership_ended("$3")
++    ))
 +    .bind(req.tenant_id)
 +    .bind(req.membership_id)
++    .bind(date_param(at.today()))
 +    .fetch_optional(&mut *tx)
 +    .await?;
-+    match erased {
++    match row {
 +        None => return Err(MembershipError::UnknownMembership),
-+        Some(true) => return Err(MembershipError::MembershipErased),
-+        Some(false) => {}
++        Some((true, _)) => return Err(MembershipError::MembershipErased),
++        Some((false, true)) => return Err(MembershipError::MembershipEnded),
++        Some((false, false)) => {}
 +    }
 +    sqlx::query(
 +        "update memberships set encrypted_display_name = $3 where tenant_id = $1 and id = $2",
@@ -3163,6 +3636,7 @@ Mutation checks:
 - Drop the `is_admin_today` branch (let any actor through), and `nobody_else_may_edit_a_name_and_every_refusal_looks_the_same` fails on its first row.
 - Drop the standing check on the own path, and its `no standing` row fails.
 - Drop `tenant_id = $1` from the row lookup, and the cross-FAU admin row returns `Ok` instead of `UnknownMembership`.
+- Let an ended membership through (`Some((false, true)) => {}`), and `an_admin_corrects_an_active_members_name_and_an_ended_membership_takes_none` fails: the revoked row hits `memberships_display_name_only_while_current`, and the ran-out row is renamed. This was run in the dry run.
 
 - [ ] **Step 5: Format and lint**
 
@@ -3182,9 +3656,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 6: Retention: the ended-membership sweep, erasure, and names for history
+### Task 6: Retention: the ended-membership sweep, erasure, and history's role-and-year label
+
+Rewritten 28 September 2026 for D3. A name no longer survives the end of a membership: the sweep clears it with the contact address, and history shows an ended membership as the role it held and its years (Rulings D3-2 to D3-5).
 
 **Files:**
+- Create: `backend/crates/domain/src/directory/history.rs` (unit tests inside)
+- Modify: `backend/crates/domain/src/directory/mod.rs`
 - Create: `backend/crates/persistence/src/membership/retention.rs`
 - Create: `backend/crates/persistence/src/membership/names.rs`
 - Modify: `backend/crates/persistence/src/membership/mod.rs`
@@ -3192,33 +3670,41 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes:
+  - `membership_ended` (Task 5);
   - `authorize(.., Resource::Fau, Action::Read, ..)` and `denied`, `read_transaction` and `lock_tenant`;
-  - `Audit::system`;
+  - `Audit::system`; `parse_date`, `from_micros` and `fau_domain::time::oslo_today`;
   - `MembershipError::MembershipErased` (Task 4), which `ensure_membership` and `set_display_name` already return for an erased row.
 - Produces:
-  - `clear_ended_contact_emails(pool, Moment) -> Result<u64, MembershipError>`;
+  - in `fau_domain::directory::history`:
+    - `struct HeldRole { name: String, class: CapabilityClass, from: Date, until: Date }` (the days actually held, `until` exclusive; redacted `Debug`);
+    - `struct RoleLabel { role: String, first_year: i16, last_year: i16 }` with `is_one_year()` (redacted `Debug`);
+    - `role_label(&[HeldRole], on: Date) -> Option<RoleLabel>`;
+  - `clear_ended_profiles(pool, Moment) -> Result<u64, MembershipError>`;
   - `erase_member_names(pool, account_id: Uuid, Moment) -> Result<u64, MembershipError>`;
-  - `enum MemberName { Named(Ciphertext), Unnamed, Former }`;
+  - `enum MemberName { Named(Ciphertext), Unnamed, Ended(Vec<HeldRole>), Former }`;
   - `member_names(pool, Viewer, &[Uuid], Moment) -> Result<Vec<(Uuid, MemberName)>, MembershipError>`;
-  - audit actions `membership.contact_email_cleared {cause: "membership_ended"}` and `membership.name_erased {}`, both by the system actor.
+  - audit actions `membership.profile_cleared {cause: "membership_ended"}` and `membership.name_erased {}`, both by the system actor.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 Create `backend/crates/app/tests/directory_retention.rs`:
 
 ```rust
-//! How long the directory fields live (groups design §4.2, §10; #3502): the name survives
-//! the end of a membership while the contact address does not, and an erasure replaces the
-//! name with "Tidligere medlem".
+//! How long the directory fields live (groups design §4.2 as amended by Erik's D3, 28
+//! September 2026; §10; #3502): neither the name nor the contact address outlives the
+//! membership, history shows an ended membership as its role and years, and an erasure
+//! shows "Tidligere medlem".
 
 mod common;
 use common::groups::*;
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
+use fau_domain::directory::history::HeldRole;
 use fau_domain::membership::period::Period;
 use fau_domain::membership::vocabulary::{CapabilityClass, Visibility};
 use fau_persistence::membership::*;
+use jiff::civil::Date;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -3254,12 +3740,14 @@ async fn with_contact(pool: &PgPool, fau: &Fau, m: Uuid, marker: u8) {
     .unwrap();
 }
 
-async fn contact_of(pool: &PgPool, m: Uuid) -> Option<Vec<u8>> {
-    sqlx::query_scalar("select encrypted_contact_email from memberships where id = $1")
-        .bind(m)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+async fn fields(pool: &PgPool, m: Uuid) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    sqlx::query_as(
+        "select encrypted_display_name, encrypted_contact_email from memberships where id = $1",
+    )
+    .bind(m)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn name(pool: &PgPool, fau: &Fau, m: Uuid, at_: &str) -> MemberName {
@@ -3272,11 +3760,22 @@ async fn name(pool: &PgPool, fau: &Fau, m: Uuid, at_: &str) -> MemberName {
     names.into_iter().next().unwrap().1
 }
 
-/// Mutation check: drop `ra.tenant_id = m.tenant_id` from the sweep's condition and Kari's
-/// running role in FAU B keeps her FAU A address; drop `ra.revoked_at is null` and the
-/// revoked-only membership keeps its address.
+/// "Medlem", held from `from` up to (not including) `until`.
+fn medlem(from: Date, until: Date) -> MemberName {
+    MemberName::Ended(vec![HeldRole {
+        name: "Medlem".into(),
+        class: CapabilityClass::Member,
+        from,
+        until,
+    }])
+}
+
+/// Mutation checks: drop `ra.tenant_id = m.tenant_id` from `membership_ended` and Kari's
+/// running role in FAU B keeps her FAU A fields; drop `ra.revoked_at is null` and the
+/// stepped-down member keeps theirs; make `member_names` ignore `ended` and the read before
+/// the sweep returns the name.
 #[tokio::test]
-async fn the_sweep_clears_an_address_once_no_role_runs_or_is_still_to_come() {
+async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_come() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
@@ -3286,6 +3785,10 @@ async fn the_sweep_clears_an_address_once_no_role_runs_or_is_still_to_come() {
     let long = period(day(2026, 9, 1), day(2027, 9, 1));
 
     let ends = join(&pool, &a, "ends@example.test", short)
+        .await
+        .membership_id;
+    // A name and no contact address: the sweep takes the name all the same.
+    let quiet = join(&pool, &a, "quiet@example.test", short)
         .await
         .membership_id;
     let renewed = join(&pool, &a, "renewed@example.test", short)
@@ -3326,48 +3829,69 @@ async fn the_sweep_clears_an_address_once_no_role_runs_or_is_still_to_come() {
     }
     revoke(&pool, &a, live_assignment(&pool, stepped_down).await, t0).await;
 
-    // While the short roles run, the sweep clears only the one whose role was revoked.
+    // While the short roles run, the sweep clears only the one whose role was revoked, and
+    // history shows it as the role it held until the revocation day (T0, 23 September).
     assert_eq!(
-        clear_ended_contact_emails(&pool, at("2026-09-30T10:00:00Z"))
+        clear_ended_profiles(&pool, at("2026-09-30T10:00:00Z"))
             .await
             .unwrap(),
         1
     );
-    assert_eq!(contact_of(&pool, stepped_down).await, None);
-    assert!(contact_of(&pool, ends).await.is_some());
+    assert_eq!(fields(&pool, stepped_down).await, (None, None));
+    assert_eq!(
+        name(&pool, &a, stepped_down, "2026-09-30T10:00:00Z").await,
+        medlem(day(2026, 9, 1), day(2026, 9, 23))
+    );
+    assert!(fields(&pool, ends).await.0.is_some());
 
-    // The day the short roles end: every address without a running or future role goes.
+    // The day the short roles end, history already shows the role, before any sweep.
     let after = at("2026-10-01T10:00:00Z");
-    assert_eq!(clear_ended_contact_emails(&pool, after).await.unwrap(), 2);
-    assert_eq!(contact_of(&pool, ends).await, None);
-    assert_eq!(contact_of(&pool, kari_a).await, None);
-    assert_eq!(
-        contact_of(&pool, renewed).await.as_deref(),
-        Some(envelope(2).as_bytes())
-    );
-    assert_eq!(
-        contact_of(&pool, kari_b).await.as_deref(),
-        Some(envelope(4).as_bytes())
-    );
-    // Idempotent, and the names stay.
-    assert_eq!(clear_ended_contact_emails(&pool, after).await.unwrap(), 0);
+    assert!(fields(&pool, ends).await.0.is_some(), "not swept yet");
     assert_eq!(
         name(&pool, &a, ends, "2026-10-01T10:00:00Z").await,
+        medlem(day(2026, 9, 1), day(2026, 10, 1))
+    );
+
+    // Then the sweep clears every membership without a running or future role.
+    assert_eq!(clear_ended_profiles(&pool, after).await.unwrap(), 3);
+    for gone in [ends, quiet, kari_a] {
+        assert_eq!(fields(&pool, gone).await, (None, None));
+    }
+    assert_eq!(
+        fields(&pool, renewed).await,
+        (
+            Some(placeholder_envelope().as_bytes().to_vec()),
+            Some(envelope(2).as_bytes().to_vec())
+        ),
+        "a role still to come keeps both"
+    );
+    assert_eq!(
+        fields(&pool, kari_b).await,
+        (
+            Some(placeholder_envelope().as_bytes().to_vec()),
+            Some(envelope(4).as_bytes().to_vec())
+        ),
+        "another FAU's membership is its own"
+    );
+    assert_eq!(
+        name(&pool, &a, renewed, "2026-10-01T10:00:00Z").await,
         MemberName::Named(placeholder_envelope())
     );
+    // Idempotent.
+    assert_eq!(clear_ended_profiles(&pool, after).await.unwrap(), 0);
 
     let causes: Vec<String> = sqlx::query_scalar(
         "select params->>'cause' from audit_events
-          where action = 'membership.contact_email_cleared' and actor_kind = 'system'",
+          where action = 'membership.profile_cleared' and actor_kind = 'system'",
     )
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(causes, ["membership_ended"; 3]);
+    assert_eq!(causes, ["membership_ended"; 4]);
 }
 
 #[tokio::test]
-async fn erasure_replaces_the_name_in_every_fau_and_the_old_row_cannot_be_rejoined() {
+async fn erasure_shows_former_member_in_every_fau_even_after_the_membership_ended() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
@@ -3375,11 +3899,22 @@ async fn erasure_replaces_the_name_in_every_fau_and_the_old_row_cannot_be_rejoin
     let b = active_fau(&pool, "admin-b@example.test", t0).await;
     let year = period(day(2026, 9, 1), day(2027, 9, 1));
     let in_a = join(&pool, &a, "kari@example.test", year).await;
-    let in_b = join(&pool, &b, "kari@example.test", year).await;
+    let in_b = join(
+        &pool,
+        &b,
+        "kari@example.test",
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+    )
+    .await;
     let ola = join(&pool, &a, "ola@example.test", year)
         .await
         .membership_id;
     with_contact(&pool, &a, in_a.membership_id, 1).await;
+    // Before the erasure, Kari's ended membership in B shows its role and years.
+    assert_eq!(
+        name(&pool, &b, in_b.membership_id, "2026-10-02T10:00:00Z").await,
+        medlem(day(2026, 9, 1), day(2026, 10, 1))
+    );
 
     assert_eq!(
         erase_member_names(&pool, in_a.account_id, t0)
@@ -3392,10 +3927,11 @@ async fn erasure_replaces_the_name_in_every_fau_and_the_old_row_cannot_be_rejoin
         MemberName::Former
     );
     assert_eq!(
-        name(&pool, &b, in_b.membership_id, T0).await,
-        MemberName::Former
+        name(&pool, &b, in_b.membership_id, "2026-10-02T10:00:00Z").await,
+        MemberName::Former,
+        "not even the role and year"
     );
-    assert_eq!(contact_of(&pool, in_a.membership_id).await, None);
+    assert_eq!(fields(&pool, in_a.membership_id).await, (None, None));
     assert_eq!(
         name(&pool, &a, ola, T0).await,
         MemberName::Named(placeholder_envelope()),
@@ -3492,6 +4028,15 @@ async fn names_for_history_are_for_members_and_admins_of_that_fau_only() {
     let kari = join(&pool, &a, "kari@example.test", year)
         .await
         .membership_id;
+    // Active with no standing yet: every role is still to come, so the name applies.
+    let next = join(
+        &pool,
+        &a,
+        "neste@example.test",
+        period(day(2026, 10, 1), day(2027, 9, 1)),
+    )
+    .await
+    .membership_id;
     let in_b = join(&pool, &b, "ola@example.test", year)
         .await
         .membership_id;
@@ -3505,10 +4050,21 @@ async fn names_for_history_are_for_members_and_admins_of_that_fau_only() {
         membership_id: m,
     };
     // Another FAU's id, an unknown id and a repeat are left out.
-    let names = member_names(&pool, viewer(kari), &[kari, in_b, Uuid::now_v7(), kari], t0)
-        .await
-        .unwrap();
-    assert_eq!(names, [(kari, MemberName::Named(placeholder_envelope()))]);
+    let names = member_names(
+        &pool,
+        viewer(kari),
+        &[kari, in_b, Uuid::now_v7(), kari, next],
+        t0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            (kari, MemberName::Named(placeholder_envelope())),
+            (next, MemberName::Named(placeholder_envelope()))
+        ]
+    );
     assert_eq!(
         member_names(&pool, viewer(guest), &[kari], t0).await,
         Err(MembershipError::NotAuthorized)
@@ -3521,31 +4077,302 @@ async fn names_for_history_are_for_members_and_admins_of_that_fau_only() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+Create `backend/crates/domain/src/directory/history.rs` with only its `#[cfg(test)] mod tests { .. }` block for now (the whole file is in Step 3), and register it:
 
-Run: `cargo test -p fau-app --test directory_retention`
-Expected: compile errors, `cannot find function clear_ended_contact_emails`, `erase_member_names` and `member_names`, and `cannot find type MemberName`.
+Apply to `backend/crates/domain/src/directory/mod.rs`:
+
+```diff
+--- a/backend/crates/domain/src/directory/mod.rs
++++ b/backend/crates/domain/src/directory/mod.rs
+@@ -8,4 +8,5 @@
+ 
+ pub mod address;
+ pub mod collation;
++pub mod history;
+ pub mod listing;
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `cargo test -p fau-app --test directory_retention` and `cargo test -p fau-domain --lib -- directory::history`
+Expected: compile errors, `cannot find function clear_ended_profiles`, `erase_member_names` and `member_names`, `cannot find type MemberName` and `unresolved import fau_domain::directory::history::HeldRole`; in the domain, `cannot find type HeldRole` and `cannot find function role_label`.
 
 - [ ] **Step 3: Write the implementation**
+
+Create `backend/crates/domain/src/directory/history.rs`:
+
+```rust
+//! How history shows someone whose membership has ended (Erik's D3, 28 September 2026).
+//!
+//! A display name exists only while the membership is active. Once it ends, history -- an
+//! author, a minute-taker, an audit line -- shows the role the person held and its years,
+//! "Leder 2025–2026", never a name. Persistence (`member_names`) hands over the roles the
+//! membership actually held, read from `role_assignments` when history is rendered, and
+//! [`role_label`] picks the one that fits the moment being shown.
+//!
+//! **The rule** (Rulings D3-3 and D3-5):
+//! - the role held on the day of the event; among several held that day, an admin-class
+//!   role before a member-class one before a guest's, then the one that started first;
+//! - an event after every role ended shows the last role that ended, and an event before any
+//!   role began shows the first one to begin;
+//! - one role only, never a list, and never the unit or cohort it sits on, since a place
+//!   narrows a role down to a person;
+//! - the years are the calendar years of the days the assignment was actually held, from
+//!   its first day to its last.
+//!
+//! The screen renders a [`RoleLabel`] through the catalogue (#3439), never as prose built
+//! here. The proposed Bokmål source strings are `member.endedRole.oneYear` = "{role} {year}"
+//! and `member.endedRole.years` = "{role} {firstYear}–{lastYear}", with the years passed as
+//! strings so ICU does not group their digits.
+
+use std::fmt;
+
+use jiff::civil::Date;
+
+use crate::membership::vocabulary::CapabilityClass;
+
+/// One role a membership held, over the days it was actually held: from `from` up to, but
+/// not including, `until`. An assignment revoked early ends where it was revoked. Built
+/// only for non-empty spans, so `from < until`. `Debug` is hand-written: `name` is a role
+/// name, which is never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeldRole {
+    pub name: String,
+    pub class: CapabilityClass,
+    pub from: Date,
+    pub until: Date,
+}
+
+impl fmt::Debug for HeldRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeldRole")
+            .field("name", &"[redacted]")
+            .field("class", &self.class)
+            .field("from", &self.from)
+            .field("until", &self.until)
+            .finish()
+    }
+}
+
+/// What history shows for an ended membership: a role and its years. `Debug` is
+/// hand-written for the same reason as [`HeldRole`]'s.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RoleLabel {
+    pub role: String,
+    pub first_year: i16,
+    pub last_year: i16,
+}
+
+impl RoleLabel {
+    /// Whether the catalogue's one-year form applies ("Kasserer 2026") rather than the span
+    /// ("Leder 2025–2026").
+    pub fn is_one_year(&self) -> bool {
+        self.first_year == self.last_year
+    }
+}
+
+impl fmt::Debug for RoleLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RoleLabel")
+            .field("role", &"[redacted]")
+            .field("first_year", &self.first_year)
+            .field("last_year", &self.last_year)
+            .finish()
+    }
+}
+
+fn rank(class: CapabilityClass) -> u8 {
+    match class {
+        CapabilityClass::Admin => 0,
+        CapabilityClass::Member => 1,
+        CapabilityClass::Guest => 2,
+    }
+}
+
+/// The label for an event on `on`, from the roles an ended membership held. `None` when it
+/// held none, which the screen shows as "Tidligere medlem".
+pub fn role_label(held: &[HeldRole], on: Date) -> Option<RoleLabel> {
+    let during = held
+        .iter()
+        .filter(|r| r.from <= on && on < r.until)
+        .min_by_key(|r| (rank(r.class), r.from));
+    let after = || {
+        held.iter()
+            .filter(|r| r.until <= on)
+            .min_by_key(|r| (std::cmp::Reverse(r.until), rank(r.class), r.from))
+    };
+    let before = || held.iter().min_by_key(|r| (r.from, rank(r.class)));
+    let chosen = during.or_else(after).or_else(before)?;
+    let last_day = chosen.until.yesterday().unwrap_or(chosen.from);
+    Some(RoleLabel {
+        role: chosen.name.clone(),
+        first_year: chosen.from.year(),
+        last_year: last_day.year(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::civil::date;
+
+    fn held(name: &str, class: CapabilityClass, from: Date, until: Date) -> HeldRole {
+        HeldRole {
+            name: name.to_owned(),
+            class,
+            from,
+            until,
+        }
+    }
+
+    fn shown(held: &[HeldRole], on: Date) -> Option<(String, i16, i16)> {
+        role_label(held, on).map(|l| (l.role, l.first_year, l.last_year))
+    }
+
+    fn two_years() -> Vec<HeldRole> {
+        vec![
+            held(
+                "Kasserer",
+                CapabilityClass::Member,
+                date(2024, 9, 1),
+                date(2025, 9, 1),
+            ),
+            held(
+                "Leder",
+                CapabilityClass::Admin,
+                date(2025, 9, 1),
+                date(2026, 9, 1),
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_role_held_on_the_day_is_shown_with_its_years() {
+        let h = two_years();
+        assert_eq!(
+            shown(&h, date(2025, 1, 10)),
+            Some(("Kasserer".into(), 2024, 2025))
+        );
+        assert_eq!(
+            shown(&h, date(2026, 3, 1)),
+            Some(("Leder".into(), 2025, 2026))
+        );
+        // The first day belongs to the new role, the day before to the old one.
+        assert_eq!(
+            shown(&h, date(2025, 9, 1)),
+            Some(("Leder".into(), 2025, 2026))
+        );
+        assert_eq!(
+            shown(&h, date(2025, 8, 31)),
+            Some(("Kasserer".into(), 2024, 2025))
+        );
+    }
+
+    #[test]
+    fn outside_every_role_the_nearest_end_or_the_first_start_is_shown() {
+        let h = two_years();
+        assert_eq!(
+            shown(&h, date(2027, 1, 1)),
+            Some(("Leder".into(), 2025, 2026)),
+            "after the end: the last role that ended"
+        );
+        assert_eq!(
+            shown(&h, date(2024, 1, 1)),
+            Some(("Kasserer".into(), 2024, 2025)),
+            "before any start: the first role to begin"
+        );
+    }
+
+    #[test]
+    fn on_one_day_an_admin_role_wins_then_the_earliest_start() {
+        let h = vec![
+            held(
+                "Kontaktforelder",
+                CapabilityClass::Member,
+                date(2025, 8, 1),
+                date(2026, 8, 1),
+            ),
+            held(
+                "Leder",
+                CapabilityClass::Admin,
+                date(2025, 9, 1),
+                date(2026, 9, 1),
+            ),
+            held(
+                "Dugnadsansvarlig",
+                CapabilityClass::Member,
+                date(2025, 7, 1),
+                date(2026, 7, 1),
+            ),
+        ];
+        assert_eq!(shown(&h, date(2025, 10, 1)).unwrap().0, "Leder");
+        assert_eq!(
+            shown(&h, date(2025, 8, 15)).unwrap().0,
+            "Dugnadsansvarlig",
+            "two member roles: the one that started first"
+        );
+    }
+
+    #[test]
+    fn a_role_within_one_calendar_year_has_one_year() {
+        let whole = [held(
+            "Sekretær",
+            CapabilityClass::Member,
+            date(2026, 1, 1),
+            date(2027, 1, 1),
+        )];
+        let label = role_label(&whole, date(2026, 6, 1)).unwrap();
+        assert_eq!((label.first_year, label.last_year), (2026, 2026));
+        assert!(label.is_one_year());
+        let short = [held(
+            "Medlem",
+            CapabilityClass::Member,
+            date(2026, 9, 1),
+            date(2026, 10, 1),
+        )];
+        assert!(role_label(&short, date(2026, 9, 2)).unwrap().is_one_year());
+        assert!(!role_label(&two_years(), date(2026, 3, 1))
+            .unwrap()
+            .is_one_year());
+    }
+
+    #[test]
+    fn nothing_held_is_no_label() {
+        assert_eq!(shown(&[], date(2026, 1, 1)), None);
+    }
+
+    #[test]
+    fn debug_never_prints_a_role_name() {
+        let h = two_years();
+        let label = role_label(&h, date(2026, 3, 1)).unwrap();
+        assert!(!format!("{h:?}").contains("Leder"));
+        assert!(!format!("{h:?}").contains("Kasserer"));
+        assert!(!format!("{label:?}").contains("Leder"));
+    }
+}
+```
 
 Create `backend/crates/persistence/src/membership/retention.rs`:
 
 ```rust
-//! How long the directory fields live (groups design §4.2; #3502).
+//! How long the directory fields live (groups design §4.2 as amended by Erik's D3, 28
+//! September 2026; #3502).
 //!
-//! - **The contact address goes with the membership.** Revocation clears it in the same
-//!   statement (`revoke_membership`, held by migration 0008's
-//!   `memberships_contact_email_only_while_current`). A membership whose roles simply ran
-//!   out is not revoked, so [`clear_ended_contact_emails`], a scheduled sweep, clears it once
-//!   no role assignment is running or still to come.
-//! - **The name stays** after the membership ends: history shows the names that applied at
-//!   the time (prosjektgrunnlag §8). This is a new retention statement for the privacy
-//!   notice and the DPA.
-//! - **An Article 17 erasure** replaces the name everywhere with "Tidligere medlem":
-//!   [`erase_member_names`] removes both fields from every membership the account holds and
-//!   marks them erased. It is the storage step of #3426's erasure flow, which decides who
-//!   asks for it and what else goes. Database backups keep the old ciphertext until they age
-//!   out; only deleting the FAU shreds it (key-service design §3.1).
+//! - **Neither field outlives the membership.** A display name is valid only while the
+//!   membership is active; once it has ended (`membership_ended`: revoked, or no role
+//!   assignment still running or yet to start) the name goes, exactly like the contact
+//!   address. History then shows the membership as its role and year, computed at read time
+//!   (`member_names`), so there is no name history to keep.
+//! - Revocation clears both fields in the same statement (`revoke_membership`, held by
+//!   migration 0008's two `*_only_while_current` checks). A membership whose roles simply ran
+//!   out is not revoked, so [`clear_ended_profiles`], a daily sweep, clears it. Until the
+//!   sweep runs, nothing shows the name: `member_names` decides "ended" at read time, and the
+//!   directory lists only people with standing today.
+//! - **An Article 17 erasure** removes both fields from every membership the account holds
+//!   and marks them erased ([`erase_member_names`]). History then shows "Tidligere medlem",
+//!   not even the role and year. It is the storage step of #3426's erasure flow, which
+//!   decides who asks for it and what else goes. Database backups keep the old ciphertext
+//!   until they age out; only deleting the FAU shreds it (key-service design §3.1).
 //! - **Deleting the FAU** shreds its record key, and with it every name and address.
 
 use fau_domain::time::Moment;
@@ -3554,28 +4381,23 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::error::MembershipError;
+use super::profile::membership_ended;
 use super::sql::{date_param, lock_tenant, ts_param, write_audit, Audit};
 
-/// Membership `m` has no role assignment still running or yet to start on the date bound as
-/// `date_param` (for example `$1`).
-fn ended_on(date_param: &str) -> String {
-    format!(
-        "not exists (select 1 from role_assignments ra
-                      where ra.tenant_id = m.tenant_id and ra.membership_id = m.id
-                        and ra.revoked_at is null and ra.ends_on_exclusive > {date_param}::date)"
-    )
-}
-
-/// The scheduled sweep: clears the contact address of every membership whose roles have all
+/// The daily sweep: clears the name and the contact address of every membership that has
 /// ended, each clearing audited. Per FAU, under that FAU's lock, and re-checked under it, so
-/// a role granted concurrently is never swept past. Returns how many addresses it cleared.
-pub async fn clear_ended_contact_emails(pool: &PgPool, at: Moment) -> Result<u64, MembershipError> {
+/// a role granted concurrently is never swept past. It clears at once, without the
+/// account's three-month grace: that grace protects re-recognition of the account, and a
+/// returning member states their name again when they accept. Returns how many memberships
+/// it cleared.
+pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, MembershipError> {
     let today = date_param(at.today());
     let tenants: Vec<Uuid> = sqlx::query_scalar(&format!(
         "select distinct m.tenant_id from memberships m
-          where m.encrypted_contact_email is not null and {}
+          where (m.encrypted_display_name is not null or m.encrypted_contact_email is not null)
+            and {}
           order by m.tenant_id",
-        ended_on("$1")
+        membership_ended("$1")
     ))
     .bind(&today)
     .fetch_all(pool)
@@ -3585,10 +4407,13 @@ pub async fn clear_ended_contact_emails(pool: &PgPool, at: Moment) -> Result<u64
         let mut tx = pool.begin().await?;
         lock_tenant(&mut tx, tenant_id).await?;
         let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
-            "update memberships m set encrypted_contact_email = null
-              where m.tenant_id = $1 and m.encrypted_contact_email is not null and {}
+            "update memberships m
+                set encrypted_display_name = null, encrypted_contact_email = null
+              where m.tenant_id = $1
+                and (m.encrypted_display_name is not null or m.encrypted_contact_email is not null)
+                and {}
              returning m.id",
-            ended_on("$2")
+            membership_ended("$2")
         ))
         .bind(tenant_id)
         .bind(&today)
@@ -3600,7 +4425,7 @@ pub async fn clear_ended_contact_emails(pool: &PgPool, at: Moment) -> Result<u64
                 at,
                 Audit::system(
                     tenant_id,
-                    "membership.contact_email_cleared",
+                    "membership.profile_cleared",
                     "membership",
                     *id,
                     json!({ "cause": "membership_ended" }),
@@ -3615,9 +4440,10 @@ pub async fn clear_ended_contact_emails(pool: &PgPool, at: Moment) -> Result<u64
 }
 
 /// Erases the account's name and contact address from every FAU it belongs to, in one
-/// transaction, locking those FAU-er in id order. Idempotent: an already-erased membership
-/// is left as it is. Each erasure is audited, without the name. Returns how many memberships
-/// it erased.
+/// transaction, locking those FAU-er in id order, and marks each membership erased, an
+/// ended one included: the marker is what makes history show "Tidligere medlem" instead of
+/// the role and year. Idempotent: an already-erased membership is left as it is. Each
+/// erasure is audited, without the name. Returns how many memberships it erased.
 ///
 /// An erased membership cannot be accepted into again (`MembershipErased`): a new name on
 /// the old row would re-attach history to it. #3426 decides how an erased person rejoins.
@@ -3672,37 +4498,54 @@ pub async fn erase_member_names(
 Create `backend/crates/persistence/src/membership/names.rs`:
 
 ```rust
-//! Names for rendering history (groups design §4.2; #3502): an author, a minute-taker, an
-//! audit line. A name stays after the membership ends, and an Article 17 erasure turns it
-//! into "Tidligere medlem" everywhere, because every renderer reads it from here.
+//! Names for rendering history (groups design §4.2 as amended by Erik's D3, 28 September
+//! 2026; #3502): an author, a minute-taker, an audit line. Every renderer reads them from
+//! here, so the retention rules hold everywhere at once:
+//! - an active membership has its name;
+//! - an ended one (`membership_ended`, decided now, at read time, so a sweep that has not
+//!   run yet never lets a name through) is shown as a role and its years, from the roles it
+//!   actually held (`fau_domain::directory::history::role_label`);
+//! - an Article 17 erasure is "Tidligere medlem", with neither name nor role.
+
+use std::collections::HashMap;
 
 use fau_crypto::Ciphertext;
 use fau_domain::authz::Action;
-use fau_domain::time::Moment;
+use fau_domain::directory::history::HeldRole;
+use fau_domain::membership::vocabulary::CapabilityClass;
+use fau_domain::time::{oslo_today, Moment};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::authz::{authorize, denied, read_transaction, Resource, Viewer};
 use super::error::MembershipError;
+use super::profile::membership_ended;
+use super::sql::{date_param, from_micros, parse_date};
 
-/// A stored name, as the session will show it.
+/// A membership as history shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberName {
-    /// Encrypted under the record key with `DISPLAY_NAME_AAD` and the membership's id.
+    /// An active membership's name, encrypted under the record key with `DISPLAY_NAME_AAD`
+    /// and the membership's id.
     Named(Ciphertext),
-    /// A membership created before migration 0008.
+    /// An active membership created before migration 0008, which has no name.
     Unnamed,
-    /// An Article 17 erasure replaced the name (§4.2). Bokmål source string for the
-    /// catalogue (#3439): "Tidligere medlem". Never listed by the directory; history
-    /// renderers ([`member_names`]) show it.
+    /// The membership has ended (D3): the roles it held, never empty, ordered by start. The
+    /// renderer picks one for the event's date with `role_label` and renders it through the
+    /// catalogue ("Leder 2025–2026").
+    Ended(Vec<HeldRole>),
+    /// An Article 17 erasure, or an ended membership that never held a role. Bokmål source
+    /// string for the catalogue (#3439): "Tidligere medlem". Never listed by the directory.
     Former,
 }
 
-/// The names that apply to `membership_ids` in the viewer's FAU, for rendering history --
-/// an author, a minute-taker, an audit line -- including former members, whose names stay
-/// (§4.2), and erased ones, which come back as [`MemberName::Former`]. Ids not in this FAU
-/// are left out. Members and admins only: a guest's history rendering is decided with the
-/// first feature that shows a guest history (#3503), so a guest gets `NotAuthorized`.
+type MembershipRow = (Uuid, Option<Vec<u8>>, bool, bool);
+type AssignmentRow = (Uuid, String, String, String, String, Option<i64>);
+
+/// How `membership_ids` in the viewer's FAU appear in history (see [`MemberName`]). Ids not
+/// in this FAU are left out, and a repeat comes back once. Members and admins only: a
+/// guest's history rendering is decided with the first feature that shows a guest history
+/// (#3503), so a guest gets `NotAuthorized`.
 pub async fn member_names(
     pool: &PgPool,
     viewer: Viewer,
@@ -3713,27 +4556,74 @@ pub async fn member_names(
     authorize(&mut tx, viewer, Resource::Fau, Action::Read, at)
         .await?
         .map_err(|d| denied(d, MembershipError::NotAuthorized))?;
-    let rows: Vec<(Uuid, Option<Vec<u8>>, bool)> = sqlx::query_as(
-        "select id, encrypted_display_name, name_erased_at is not null from memberships
-          where tenant_id = $1 and id = any($2)",
-    )
+    let rows: Vec<MembershipRow> = sqlx::query_as(&format!(
+        "select m.id, m.encrypted_display_name, m.name_erased_at is not null, {}
+           from memberships m
+          where m.tenant_id = $1 and m.id = any($2)",
+        membership_ended("$3")
+    ))
     .bind(viewer.tenant_id)
     .bind(membership_ids)
+    .bind(date_param(at.today()))
+    .fetch_all(&mut *tx)
+    .await?;
+    let ended: Vec<Uuid> = rows
+        .iter()
+        .filter(|(_, _, erased, ended)| !erased && *ended)
+        .map(|(id, ..)| *id)
+        .collect();
+    let assignments: Vec<AssignmentRow> = sqlx::query_as(
+        "select ra.membership_id, r.name, r.capability_class,
+                to_char(ra.starts_on, 'YYYY-MM-DD'), to_char(ra.ends_on_exclusive, 'YYYY-MM-DD'),
+                (extract(epoch from ra.revoked_at) * 1000000)::bigint
+           from role_assignments ra
+           join roles r on r.tenant_id = ra.tenant_id and r.id = ra.role_id
+          where ra.tenant_id = $1 and ra.membership_id = any($2)
+          order by ra.membership_id, ra.starts_on, ra.id",
+    )
+    .bind(viewer.tenant_id)
+    .bind(&ended)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for id in membership_ids {
-        if let Some((_, name, erased)) = rows.iter().find(|r| r.0 == *id) {
-            let name = match (erased, name) {
-                (true, _) => MemberName::Former,
-                (false, Some(n)) => MemberName::Named(Ciphertext::from_stored(n.clone())),
-                (false, None) => MemberName::Unnamed,
-            };
-            if !out.iter().any(|(m, _)| m == id) {
-                out.push((*id, name));
-            }
+
+    let mut held: HashMap<Uuid, Vec<HeldRole>> = HashMap::new();
+    for (membership, name, class, starts, ends, revoked_us) in assignments {
+        let from = parse_date(&starts)?;
+        let mut until = parse_date(&ends)?;
+        if let Some(us) = revoked_us {
+            until = until.min(oslo_today(from_micros(us)?));
         }
+        if from < until {
+            held.entry(membership).or_default().push(HeldRole {
+                name,
+                class: CapabilityClass::from_code(&class).ok_or_else(MembershipError::decode)?,
+                from,
+                until,
+            });
+        }
+    }
+
+    let mut out: Vec<(Uuid, MemberName)> = Vec::with_capacity(rows.len());
+    for id in membership_ids {
+        if out.iter().any(|(m, _)| m == id) {
+            continue;
+        }
+        let Some((_, name, erased, ended)) = rows.iter().find(|r| r.0 == *id) else {
+            continue;
+        };
+        let shown = match (erased, ended) {
+            (true, _) => MemberName::Former,
+            (false, true) => match held.remove(id) {
+                Some(roles) => MemberName::Ended(roles),
+                None => MemberName::Former,
+            },
+            (false, false) => match name {
+                Some(n) => MemberName::Named(Ciphertext::from_stored(n.clone())),
+                None => MemberName::Unnamed,
+            },
+        };
+        out.push((*id, shown));
     }
     Ok(out)
 }
@@ -3744,7 +4634,7 @@ Apply to `backend/crates/persistence/src/membership/mod.rs`:
 ```diff
 --- a/backend/crates/persistence/src/membership/mod.rs
 +++ b/backend/crates/persistence/src/membership/mod.rs
-@@ -31,8 +31,10 @@
+@@ -31,8 +31,10 @@ mod events;
  mod groups;
  mod handover;
  mod invitations;
@@ -3755,7 +4645,7 @@ Apply to `backend/crates/persistence/src/membership/mod.rs`:
  mod roles;
  mod signup;
  mod sql;
-@@ -55,6 +57,7 @@
+@@ -55,6 +57,7 @@ pub use invitations::{
      InvitationMessage, InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole,
      RoleChoice, INVITATION_MESSAGE_AAD,
  };
@@ -3763,11 +4653,11 @@ Apply to `backend/crates/persistence/src/membership/mod.rs`:
  pub use profile::{
      set_contact_email, set_display_name, MemberProfile, SetContactEmail, SetDisplayName,
      CONTACT_EMAIL_AAD, DISPLAY_NAME_AAD, MEMBER_FIELD_CIPHERTEXT_BYTES,
-@@ -64,6 +67,7 @@
+@@ -64,6 +67,7 @@ pub use requests::{
      decline_request, lapse_requests, AccessRequestMessage, CreateAccessRequest,
      CreateReplacementProposal, RequestDecision, ACCESS_REQUEST_MESSAGE_AAD, MESSAGE_MAX_BYTES,
  };
-+pub use retention::{clear_ended_contact_emails, erase_member_names};
++pub use retention::{clear_ended_profiles, erase_member_names};
  pub use roles::{
      grant_role, revoke_membership, revoke_role_assignment, GrantRole, RevokeAssignment,
      RevokeMembership,
@@ -3775,13 +4665,17 @@ Apply to `backend/crates/persistence/src/membership/mod.rs`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p fau-app --test directory_retention`
-Expected: PASS, 3 tests.
+Run: `cargo test -p fau-app --test directory_retention && cargo test -p fau-domain --lib -- directory`
+Expected: PASS. `directory_retention` shows 3 passed. The domain's `directory` tests are 28: Tasks 2 and 3's 22, and 6 in `history`.
 
-Mutation checks:
-- Drop `ra.tenant_id = m.tenant_id` from `ended_on`, and the sweep test fails: Kari's running role in FAU B keeps her FAU A address. This was checked while planning.
-- Drop `ra.revoked_at is null`, and the stepped-down member keeps their address.
+Mutation checks, each run in the dry run:
+- Drop `and ra.ends_on_exclusive > {date_param}::date` from `membership_ended`, and the sweep and erasure tests fail: a role that ran out counts as running.
+- Drop `and ra.revoked_at is null`, and the stepped-down member keeps their fields.
+- Make `member_names` ignore "ended" (`match (erased, *ended && false)`), and the read before the sweep returns the name.
+- In `history.rs`, rank the admin class last, and `on_one_day_an_admin_role_wins_then_the_earliest_start` fails. Pick the earliest end instead of the latest after every role has ended, and `outside_every_role_the_nearest_end_or_the_first_start_is_shown` fails.
 - Drop the `authorize` call from `member_names`, and the guest row returns names.
+
+`ra.tenant_id = m.tenant_id` in `membership_ended` is the composite-key convention, not a tested guard: membership ids are UUIDv7 and unique across FAU-er, so removing it changes no result.
 
 - [ ] **Step 5: Format and lint**
 
@@ -3791,11 +4685,13 @@ Expected: no output from `fmt`, and clippy finishes with no warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add backend/crates/persistence/src/membership/retention.rs \
+git add backend/crates/domain/src/directory/history.rs \
+        backend/crates/domain/src/directory/mod.rs \
+        backend/crates/persistence/src/membership/retention.rs \
         backend/crates/persistence/src/membership/names.rs \
         backend/crates/persistence/src/membership/mod.rs \
         backend/crates/app/tests/directory_retention.rs
-git commit -m "Clear contact addresses when a membership ends; erase names on request (#3502)
+git commit -m "Clear a name and contact address when the membership ends; show role and year in history (#3502)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4457,7 +5353,10 @@ Create `backend/crates/persistence/src/membership/directory.rs`:
 //!   inside a group they can read.
 //!
 //! "Current" means standing today: a usable membership holding a role assignment valid
-//! today. A person whose name an Article 17 erasure removed is not listed.
+//! today. A person whose name an Article 17 erasure removed is not listed. Everyone listed
+//! is therefore active, so under D3 (28 September 2026) their name still applies: an entry's
+//! `name` is only ever `MemberName::Named` or `MemberName::Unnamed`, never `Ended` or
+//! `Former`.
 //!
 //! **What a person represents** is derived, never typed: their role assignments valid
 //! today (role name, plus unit or cohort), and the listed groups they are in (§4.1).
@@ -4498,6 +5397,7 @@ pub struct DirectoryPerson {
     pub membership_id: Uuid,
     /// The viewer's own entry, where the screen offers editing.
     pub is_viewer: bool,
+    /// `Named`, or `Unnamed` for a membership created before migration 0008.
     pub name: MemberName,
     pub address: DirectoryAddress,
     /// Holds only guest-class roles today: marked "Gjest".
@@ -5015,10 +5915,10 @@ Apply to `backend/crates/persistence/src/membership/error.rs`:
 ```diff
 --- a/backend/crates/persistence/src/membership/error.rs
 +++ b/backend/crates/persistence/src/membership/error.rs
-@@ -139,6 +139,8 @@
-     AcceptanceTargetChanged,
-     #[error("the membership's name was erased")]
-     MembershipErased,
+@@ -143,6 +143,8 @@ pub enum MembershipError {
+     /// running or yet to start -- so it holds no name (Erik's D3, 28 September 2026).
+     #[error("the membership has ended")]
+     MembershipEnded,
 +    #[error("nothing was selected")]
 +    EmptySelection,
  
@@ -5550,21 +6450,30 @@ behaviour or bind later work. All are open to challenge:
   bound to the membership id. Acceptance is therefore two calls: `prepare_acceptance` names the
   FAU and the membership, the session encrypts, and `accept_invitation` stores. A mismatch is
   refused, never stored. The registrant's name is captured at activation the same way.
-- **Who edits.** A member edits their own name, and an admin corrects anyone's, a former
-  member's included. Only the member sets their contact address. An edit overwrites the name,
-  and no name history is kept (open question below).
-- **Retention.** A contact address is cleared when the membership is revoked (a database check
-  enforces it). It is also cleared when no role is running or still to come, by a daily sweep,
-  at once and without the account's three-month grace. The name stays. An Article 17 erasure is
-  a storage step for #3426: both fields go, the person is not listed, history shows
-  "Tidligere medlem", and the old membership cannot be rejoined.
+- **A name is valid only while the membership is active (Erik's D3, 28 September).** When the
+  membership ends (it is revoked, or no role is running or still to come), the name is cleared
+  like the contact address. Revocation clears both in the same statement, and two database
+  checks enforce it. A daily sweep clears a membership whose roles ran out, at once and without
+  the account's three-month grace. There is therefore no name history.
+- **History shows an ended membership as its role and year** ("Leder 2025–2026"), computed from
+  the role assignments when history is rendered, never stored. The role is the one held on the
+  day of the event: admin class first, then the earliest start. After every role has ended, it
+  is the last role that ended. It is one role, without unit or cohort. The years are the
+  calendar years the assignment was actually held. The catalogue strings are proposals:
+  "{role} {year}" and "{role} {firstYear}–{lastYear}".
+- **Who edits.** A member edits their own name, and an admin corrects the name of anyone still
+  active. An ended membership takes no name (`MembershipEnded`). Only the member sets their
+  contact address.
+- **Article 17 erasure** is a storage step for #3426: both fields go, the person is not listed,
+  history shows "Tidligere medlem" (not even role and year, since a single-holder role with its
+  year identifies the person), and the old membership cannot be rejoined.
 - **What the directory shows.** The FAU-wide section, for members and admins only, never lists
   a guest. Beyond it, each group the viewer may read, through the same rule and SQL as the group
   reads. Only people with standing today are listed. A group the viewer cannot read never
   appears as part of a person.
 - **Collation is ICU4X** (`icu_collator` 2.3), already mostly in the dependency tree. Bokmål and
-  Nynorsk are tailored. Sámi falls back to the root order until ICU4X data is generated for it
-  (open question below).
+  Nynorsk are tailored. Sámi falls back to the root order until ICU4X data is generated for it,
+  which D4 places at the time a Sámi locale is added.
 - **Links and copying.** The `mailto:` link joins addresses with a bare `,` (RFC 6068), and the
   copy text with `, `, with `; ` ready for Outlook. Bcc is the default above 10 distinct
   addresses. The length guard allows 1,800 characters and refuses 1,801.
@@ -5572,14 +6481,13 @@ behaviour or bind later work. All are open to challenge:
   (all, the FAU-wide section, or one group). No addresses and no member ids. Allowed while
   frozen.
 
-**Open questions for Erik:**
-- Should history keep dated name versions, since prosjektgrunnlag §8 wants "the names that
-  applied at the time"? Today an edit overwrites.
-- Should Sámi collation data be generated now or when a Sámi locale is added?
+**Open questions for Erik:** none from this card. D3 closed the name-history question, and D4
+closed the Sámi one.
 
 **Spec against code:** ADR-003 §6 still lists member names as plaintext. The accepted #3500
-spec and the key-service design encrypt them, and the later documents win. Spec §4.3's "`, ` per
-RFC 6068" is split: `,` in the link and `, ` in the copy text.
+spec and the key-service design encrypt them, and the later documents win. Spec §4.2's "the
+name stays after the membership ends" is overridden by D3 and needs updating in the spec. Spec
+§4.3's "`, ` per RFC 6068" is split: `,` in the link and `, ` in the copy text.
 ```
 
 - [ ] **Step 4: Full verification**
@@ -5602,7 +6510,7 @@ Expected: formatting and both clippy runs are clean, and every test passes. That
 - `directory` (4);
 - `address_export` (3).
 
-It also includes the new `authorization` and `key_chain` tests and the 18 domain `directory` unit tests. The pre-existing suites must be unchanged in outcome. The dry run passed 748 tests in `cargo test --workspace`.
+It also includes the new `authorization` and `key_chain` tests and the 28 domain `directory` unit tests (6 of them in `history`). The pre-existing suites must be unchanged in outcome, apart from the two raw-SQL revocation fixtures that Task 4 re-fixtures. The amended dry run passed 760 tests in `cargo test --workspace`.
 
 - [ ] **Step 5: Commit**
 
@@ -5615,7 +6523,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 After this, the controller:
 - runs the final whole-branch review (superpowers:requesting-code-review);
-- updates #3502 in Favro, attaching this plan and stating the rulings and the two open questions in the comment itself, since Erik reads Favro, not the repo;
+- updates #3502 in Favro, attaching this plan and stating the rulings, including the Rulings (D3), in the comment itself, since Erik reads Favro, not the repo;
 - leaves merging and pushing to Erik.
 
 ---
@@ -5628,6 +6536,20 @@ After this, the controller:
 - `image.rs` needs the repository's `Dockerfile` beside `backend/`. In the throwaway copy it was copied in; in the repository it is already there.
 - Five mutations were applied and each was caught (Tasks 7 and 8, and the sweep's tenant pairing in Task 6); then the code was restored.
 
+**D3 amendment dry run (28 September 2026).** Tasks 3b–9 were re-verified on a throwaway copy of `backend/` (and the `Dockerfile`) taken from branch HEAD `b72bb55`, so Tasks 1–3 as built, with Task 3's fix round `290a814`, were the base.
+- Each task was applied from this document's own blocks by a script. It writes every `Create`/`Overwrite` block, applies every `Apply to` diff with `git apply`, and runs Task 4's perl command. The result was compared with the tested tree: identical for Tasks 3b, 4, 5 and 6.
+- Task 3b's RED was seen (1 of 4 failing, on `unwrap_err` of an accepted revocation) before the migration was amended.
+- Per task, its binaries passed: `directory_schema` 4, `migrations` 25, `schema_review` 6, `membership_schema` 13; Task 4's seven suites plus `roles` and the persistence unit tests; `profile_edits` 6; `directory_retention` 3 and the domain's 28 `directory` tests; `directory` 4, `authorization` 6, `group_reads` 4, `groups` 9; `address_export` 3.
+- After Task 4 and on the final state, `cargo test --workspace --no-fail-fast` passed 736 and 760 tests. On the final state, `fmt --check`, both clippy runs and the `test-routes` suites were clean.
+- Mutations caught:
+  - Task 3b: the name check dropped;
+  - Task 5: an ended target let through;
+  - Task 6: the running-role date test dropped, `ra.revoked_at is null` dropped, and `member_names` ignoring "ended";
+  - Task 6's domain: the admin class ranked last, and the earliest end picked instead of the latest.
+- **Correction to the earlier dry run:** dropping `ra.tenant_id = m.tenant_id` from the sweep's predicate is *not* caught, and cannot be, because membership ids are unique across FAU-er. Task 6 now says so, rather than claiming it.
+- Found by the dry run, not by reading: two existing tests (`invitations.rs`, `roles.rs`) revoke a membership with raw SQL. Under Task 3b's check they must clear the name too. Task 4 now carries both fixture diffs.
+- The execution ledger's rulings Q1–Q8 keep their task numbers, because the new task is 3b. They are carried in dispatches as before. None of them conflicts with D3; Q4's extra `member_names` viewer rows still apply to the rewritten Task 6 test.
+
 **Spec coverage (§4, §8, §10):**
 
 | Requirement | Where it lands |
@@ -5637,8 +6559,8 @@ After this, the controller:
 | §4.1 both encrypted under the FAU key | Global constraints; Task 9 end to end |
 | §4.1 what a person represents: current roles plus unit or cohort, plus groups; no past roles | Task 7 (`roles`, `group_ids`; the past-role assertion) |
 | §4.2 contact address disappears when the membership ends | Task 4 (revocation, database check), Task 6 (sweep) |
-| §4.2 name survives the end of the membership | Tasks 4, 6 (`member_names` after end) |
-| §4.2 Article 17 replaces the name with "Tidligere medlem" | Task 6 (R9) |
+| ~~§4.2 name survives the end of the membership~~ D3: the name disappears when the membership ends; history shows role and year | Task 3b (database check), Task 4 (revocation), Task 5 (no edits), Task 6 (sweep, `member_names` → `Ended`, `role_label`) |
+| §4.2 Article 17 replaces the name with "Tidligere medlem" | Task 6 (R9, D3-4: not even role and year) |
 | §4.2 crypto-shredding removes everything | Record key (key-service §3.1); nothing new |
 | §4.3 grouped by group, guests marked, locale-aware collation | Tasks 3, 7 (R11–R13) |
 | §4.3 a person selected through two groups appears once | Tasks 2, 3, 8 |
@@ -5651,7 +6573,7 @@ After this, the controller:
 | §8 #3418 row: display name captured at acceptance | Task 4 |
 | §8 #3439 row: Bokmål strings, collation per locale | R20, Task 3 |
 | §8 privacy notice and DPA | "What later cards get" |
-| §10 directory: guard at the boundary; once through two groups; name survives while address goes; erasure; audit count | Tasks 2, 3/8, 4/6, 6, 8 |
+| §10 directory: guard at the boundary; once through two groups; ~~name survives while address goes~~ both go, role and year remain (D3); erasure; audit count | Tasks 2, 3/8, 3b/4/6, 6, 8 |
 | §10 matrix: directory entry rows | Task 7 (`directory_entries_in_the_matrix`) |
 
 The screen itself (htmx, "Velg alle", the filter and the clipboard call) is deliberately not built (R1).
@@ -5663,7 +6585,10 @@ The screen itself (htmx, "Velg alle", the filter and the clipboard call) is deli
 - `AcceptanceTarget { tenant_id, membership_id }`;
 - `SetDisplayName { tenant_id, actor_membership_id, membership_id, encrypted_display_name }`;
 - `SetContactEmail { tenant_id, membership_id, encrypted_contact_email }`;
-- `MemberName::{Named, Unnamed, Former}` and `DirectoryAddress::{Contact, Login}`;
+- `MemberName::{Named, Unnamed, Ended(Vec<HeldRole>), Former}` and `DirectoryAddress::{Contact, Login}`;
+- `HeldRole { name, class, from, until }`, `RoleLabel { role, first_year, last_year }` and `role_label(&[HeldRole], Date) -> Option<RoleLabel>`;
+- `membership_ended(&str) -> String` (Task 5), used by `set_display_name`, `clear_ended_profiles` and `member_names`;
+- `MembershipError::MembershipEnded` (Task 4, first returned in Task 5);
 - `DirectorySection { section: SectionId, encrypted_group_name, members }`;
 - `AddressExport { purpose, scope, membership_ids }` and `ExportScope::{All, Fau, Group}`;
 - `Recipients::{new, mailto, copy_text, default_field}`;

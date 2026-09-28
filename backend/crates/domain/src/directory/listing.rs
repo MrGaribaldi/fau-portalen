@@ -41,13 +41,7 @@ impl fmt::Debug for Section {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Section")
             .field("id", &self.id)
-            .field(
-                "title",
-                &self
-                    .title
-                    .as_ref()
-                    .map(|t| format!("[redacted, {} chars]", t.chars().count())),
-            )
+            .field("title", &self.title.as_ref().map(|_| "[redacted]"))
             .field("members", &self.members)
             .finish()
     }
@@ -74,12 +68,8 @@ pub enum Place {
 impl fmt::Debug for Place {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Place::Unit(s) => {
-                write!(f, "Place::Unit([redacted, {} chars])", s.chars().count())
-            }
-            Place::Cohort(s) => {
-                write!(f, "Place::Cohort([redacted, {} chars])", s.chars().count())
-            }
+            Place::Unit(_) => f.write_str("Place::Unit([redacted])"),
+            Place::Cohort(_) => f.write_str("Place::Cohort([redacted])"),
         }
     }
 }
@@ -96,10 +86,7 @@ pub struct RoleHeld {
 impl fmt::Debug for RoleHeld {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RoleHeld")
-            .field(
-                "name",
-                &format!("[redacted, {} chars]", self.name.chars().count()),
-            )
+            .field("name", &"[redacted]")
             .field("place", &self.place)
             .finish()
     }
@@ -121,7 +108,9 @@ pub struct Person {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
     pub sections: Vec<Section>,
-    /// Every person listed in any section, once, in name order.
+    /// Every `Person` the caller passed in, once (deduplicated by `membership_id`), in
+    /// name order. Not filtered to people who appear in a `Section`: it is the caller's
+    /// job to pass exactly the people it wants described.
     pub people: Vec<Person>,
 }
 
@@ -367,7 +356,8 @@ mod tests {
         let debug = format!("{s:?}");
         assert!(!debug.contains("Oppfølging"));
         assert!(!debug.contains("rektor"));
-        assert!(debug.contains("28 chars"), "{debug}");
+        assert!(!debug.contains("chars"), "no length side-channel: {debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
 
         let role = RoleHeld {
             name: "Kontaktforelder".into(),
@@ -376,11 +366,13 @@ mod tests {
         let debug = format!("{role:?}");
         assert!(!debug.contains("Kontaktforelder"));
         assert!(!debug.contains("Nordbytoppen"));
+        assert!(!debug.contains("chars"), "no length side-channel: {debug}");
 
         let place = Place::Cohort("Klasse 7B ved Nordre Skole".into());
         let debug = format!("{place:?}");
         assert!(!debug.contains("Klasse"));
         assert!(!debug.contains("Nordre"));
+        assert!(!debug.contains("chars"), "no length side-channel: {debug}");
 
         // Containers that hold these types must not leak through their own derived
         // `Debug` either: a `Person`'s roles, and a `Listing`'s sections.
@@ -393,6 +385,7 @@ mod tests {
         assert!(!debug.contains("Leder for foreldrekomiteen"));
         assert!(!debug.contains("Nordre Skole"));
         assert!(!debug.contains("Kari"));
+        assert!(!debug.contains("chars"), "no length side-channel: {debug}");
 
         let listing = Listing {
             sections: vec![section(
@@ -405,5 +398,44 @@ mod tests {
         let debug = format!("{listing:?}");
         assert!(!debug.contains("Oppfølging"));
         assert!(!debug.contains("rektor"));
+        assert!(!debug.contains("chars"), "no length side-channel: {debug}");
+    }
+
+    /// Deleting `.then(a.membership_id.cmp(&b.membership_id))` from the people sort in
+    /// `arrange` leaves every other test green, because they all use names that already
+    /// differ. Two people who share a `ShownName` need the id as the tiebreaker to get a
+    /// stable order (controller ruling Q9). Mutation-checked: removing that `.then(...)`
+    /// makes this test fail (shown, then reverted).
+    #[test]
+    fn ties_in_name_break_by_membership_id() {
+        // Same collation key ("Åse" twice), different ids: the lower id must sort first,
+        // deterministically, however `sort_by` happens to compare them.
+        let people = vec![person(9, Some("Åse"), &[]), person(2, Some("Åse"), &[])];
+        let sections = vec![section(SectionId::Fau, None, &[9, 2])];
+        let l = arrange(sections, people, &NameCollator::for_locale("nb-NO"));
+        assert_eq!(
+            l.people.iter().map(|p| p.membership_id).collect::<Vec<_>>(),
+            [id(2), id(9)],
+            "the lower membership id must come first when names tie"
+        );
+    }
+
+    /// Same as above for groups: two `Group` sections sharing a title need the group id as
+    /// the tiebreaker. Deleting `.then(x.cmp(&y))` from the section sort in `arrange` leaves
+    /// every other test green, because none of them gives two groups the same title.
+    /// Mutation-checked: removing that `.then(...)` makes this test fail (shown, then
+    /// reverted).
+    #[test]
+    fn ties_in_group_title_break_by_group_id() {
+        let sections = vec![
+            section(SectionId::Group(id(9)), Some("Dugnad"), &[]),
+            section(SectionId::Group(id(2)), Some("Dugnad"), &[]),
+        ];
+        let l = arrange(sections, Vec::new(), &NameCollator::for_locale("nb-NO"));
+        assert_eq!(
+            l.sections.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [SectionId::Group(id(2)), SectionId::Group(id(9))],
+            "the lower group id must come first when titles tie"
+        );
     }
 }

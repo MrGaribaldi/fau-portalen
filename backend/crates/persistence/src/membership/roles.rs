@@ -8,6 +8,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::error::MembershipError;
+use super::events::{notify, Change};
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
@@ -169,6 +170,14 @@ pub async fn revoke_role_assignment(
     .bind(&now)
     .execute(&mut *tx)
     .await?;
+    notify(
+        &mut tx,
+        req.tenant_id,
+        Change::AccessRevoked {
+            membership_id: holder,
+        },
+    )
+    .await?;
     write_audit(
         &mut tx,
         at,
@@ -283,6 +292,14 @@ pub async fn revoke_membership(
         req.actor_membership_id,
         req.membership_id,
         at,
+    )
+    .await?;
+    notify(
+        &mut tx,
+        req.tenant_id,
+        Change::AccessRevoked {
+            membership_id: req.membership_id,
+        },
     )
     .await?;
     write_audit(

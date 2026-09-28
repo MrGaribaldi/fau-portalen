@@ -27,6 +27,7 @@
 mod access;
 mod authz;
 mod error;
+mod events;
 mod handover;
 mod invitations;
 mod requests;
@@ -38,6 +39,7 @@ mod token;
 pub use access::effective_access;
 pub use authz::{authorize, read_transaction, Resource, Viewer};
 pub use error::{ExistingFau, MembershipError};
+pub use events::{Change, Hub, HubClock, Subscription, EVENTS_CHANNEL, SUBSCRIPTION_BUFFER};
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{
     accept_invitation, invitation_message, issue_invitation, resend_invitation,

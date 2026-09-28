@@ -17,6 +17,11 @@ services:
       FAU_MIGRATE_PASSWORD: ${FAU_MIGRATE_PASSWORD:-fau_migrate}
       FAU_APP_PASSWORD: ${FAU_APP_PASSWORD:-fau_app}
       FAU_REGISTER_PASSWORD: ${FAU_REGISTER_PASSWORD:-fau_register}
+    # Docker's default /dev/shm is 64 MB. Postgres puts parallel-query shared memory
+    # there (dynamic_shared_memory_type=posix), and the dev database has crash-restarted
+    # ("exited with exit code 2", a background process) under full parallel test runs.
+    # Raised on 28 September 2026 to test that hypothesis.
+    shm_size: 256m
     ports:
       - "127.0.0.1:${FAU_DB_PORT:-5433}:5432"
     volumes:

@@ -286,7 +286,8 @@ pub async fn rename_group(
 }
 
 /// Closes or opens a group (D11). Closing reduces access, so it is allowed while the FAU is
-/// frozen; opening is not. Setting the current visibility again writes nothing.
+/// frozen and on an archived group (ruling P13); opening is neither. Setting the current
+/// visibility again writes nothing.
 pub async fn set_group_visibility(
     pool: &PgPool,
     req: SetGroupVisibility,
@@ -297,15 +298,15 @@ pub async fn set_group_visibility(
     if req.visibility == Visibility::Open {
         require_open(&state)?;
     }
-    if manage(
+    let archived = manage(
         &mut tx,
         req.tenant_id,
         req.actor_membership_id,
         req.group_id,
         at,
     )
-    .await?
-    {
+    .await?;
+    if archived && req.visibility == Visibility::Open {
         return Err(MembershipError::GroupArchived);
     }
     let current: String =

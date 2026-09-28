@@ -13,10 +13,11 @@ use fau_domain::authz::{Action, Denied};
 use fau_domain::membership::vocabulary::{CapabilityClass, Visibility};
 use fau_persistence::membership::{
     add_group_member, archive_group, authorize, create_group, remove_group_member, rename_group,
-    revoke_membership, set_group_visibility, ArchiveGroup, CreateGroup, GroupBinding,
+    revoke_membership, set_group_visibility, ArchiveGroup, Change, CreateGroup, GroupBinding,
     GroupMemberChange, Hub, MembershipError, RenameGroup, Resource, RevokeMembership,
-    SetGroupVisibility, Subscription,
+    SetGroupVisibility, Subscription, Viewer, EVENTS_CHANNEL,
 };
+use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -392,11 +393,60 @@ async fn closing_opening_renaming_and_archiving() {
         .unwrap();
     assert_eq!(audit_count(&pool, "group.archived").await, 1);
     let other = member(&pool, &fau, "ny@example.test").await;
+    let outsider = Viewer {
+        tenant_id: fau.tenant_id,
+        membership_id: other,
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    assert_eq!(
+        authorize(
+            &mut conn,
+            outsider,
+            Resource::Group(group),
+            Action::Read,
+            t0
+        )
+        .await
+        .unwrap(),
+        Ok(()),
+        "an archived open group is still readable by a non-member"
+    );
+
+    // Closing reduces access, so an archived group may still be closed (ruling P13): audited
+    // and announced like any other visibility change, and hidden from non-members after.
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(EVENTS_CHANNEL).await.unwrap();
+    set_group_visibility(&pool, visibility(&fau, group, Visibility::Closed), t0)
+        .await
+        .expect("an archived group may be closed");
+    assert_eq!(audit_count(&pool, "group.closed").await, 2);
+    let announced = tokio::time::timeout(Duration::from_secs(5), listener.recv())
+        .await
+        .expect("an announcement within five seconds")
+        .unwrap();
+    assert_eq!(
+        Change::parse(announced.payload()),
+        Some((fau.tenant_id, Change::Changed(Resource::Group(group))))
+    );
+    assert_eq!(
+        authorize(
+            &mut conn,
+            outsider,
+            Resource::Group(group),
+            Action::Read,
+            t0
+        )
+        .await
+        .unwrap(),
+        Err(Denied::Hidden),
+        "once closed, the archived group is hidden from a non-member"
+    );
+
     for err in [
         rename_group(&pool, rename(&fau, group), t0)
             .await
             .unwrap_err(),
-        set_group_visibility(&pool, visibility(&fau, group, Visibility::Closed), t0)
+        set_group_visibility(&pool, visibility(&fau, group, Visibility::Open), t0)
             .await
             .unwrap_err(),
         add_group_member(&pool, change(&fau, admin, group, other), t0)

@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::error::MembershipError;
 use super::events::{notify, Change};
+use super::groups::remove_from_all_groups;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
@@ -287,6 +288,14 @@ pub async fn revoke_membership(
     .execute(&mut *tx)
     .await?;
     withdraw_pending_requests(
+        &mut tx,
+        req.tenant_id,
+        req.actor_membership_id,
+        req.membership_id,
+        at,
+    )
+    .await?;
+    remove_from_all_groups(
         &mut tx,
         req.tenant_id,
         req.actor_membership_id,

@@ -3059,3 +3059,16 @@ The deferred items are filed on #3417, #3419 and #3503.
   memory exhausting Docker's 64 MB `/dev/shm`. The container was recreated on the same data
   volume, and verbose connection logging is still on. If a full-parallelism
   `cargo test --workspace` run no longer crashes it, the hypothesis holds.
+
+## #3502 started; dev database crash fixed — 28 September 2026
+
+- Erik asked the agent to start **#3502, the member directory**, after the database check and the
+  branch cleanup. He has little time to review today. It is planned from the accepted #3500 design
+  (docs/groups-directory-chat-calendar-design.md §4) and executed on branch `directory-3502`, the
+  same way #3501 was. Merging and pushing stay Erik's.
+- **The dev Postgres crash is fixed, with high confidence.** With `shm_size: 256m`, three
+  default-parallelism runs passed 701/701 with no crash. A 4× stress test followed, with four
+  concurrent workspace runs. It hit the connection cap (98 of 100 connections, 41 refused
+  cleanly) and caused no backend crash or restart. Before the change, a single run could crash
+  it. `--test-threads=4` is no longer needed. The one formal causal test left would be reverting
+  to 64 MB.

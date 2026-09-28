@@ -12,9 +12,10 @@ use common::membership::*;
 use common::TestDb;
 use fau_persistence::membership::{
     revoke_membership, Change, Hub, HubClock, MembershipError, Resource, RevokeMembership,
-    Subscription, EVENTS_CHANNEL,
+    Subscription, EVENTS_CHANNEL, SUBSCRIPTION_BUFFER,
 };
 use jiff::Timestamp;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -185,6 +186,55 @@ async fn a_stream_whose_role_has_ended_closes_at_its_next_delivery() {
 }
 
 #[tokio::test]
+async fn revoking_a_role_discards_whatever_was_already_buffered() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+    let (hub, _) = hub(&db).await;
+    let mut bystander = hub.subscribe(w.viewer("admin_out")).await.unwrap();
+    let mut member = hub.subscribe(w.viewer("member_in")).await.unwrap();
+
+    // Two changes the member can see (it is in both `open` and `closed`), left unread:
+    // buffered in its channel, not drained, while the bystander reads along.
+    announce(
+        &pool,
+        w.fau.tenant_id,
+        Change::Changed(Resource::Group(w.open)),
+    )
+    .await;
+    announce(
+        &pool,
+        w.fau.tenant_id,
+        Change::Changed(Resource::Group(w.closed)),
+    )
+    .await;
+    assert_eq!(next(&mut bystander).await, Some(Resource::Group(w.open)));
+    assert_eq!(next(&mut bystander).await, Some(Resource::Group(w.closed)));
+
+    revoke(
+        &pool,
+        &w.fau,
+        live_assignment(&pool, w.membership("member_in")).await,
+        at(T0),
+    )
+    .await;
+
+    announce(
+        &pool,
+        w.fau.tenant_id,
+        Change::Changed(Resource::Group(w.open)),
+    )
+    .await;
+    assert_eq!(next(&mut bystander).await, Some(Resource::Group(w.open)));
+
+    assert_eq!(
+        next(&mut member).await,
+        None,
+        "revocation discards whatever was already buffered, rather than delivering it first"
+    );
+}
+
+#[tokio::test]
 async fn a_guest_may_subscribe_and_a_person_without_standing_may_not() {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
@@ -205,5 +255,127 @@ async fn a_guest_may_subscribe_and_a_person_without_standing_may_not() {
         hub.subscriber_count(),
         1,
         "a refused subscription leaves nothing behind"
+    );
+}
+
+/// Ruling R2, Minor 1: falling more than `SUBSCRIPTION_BUFFER` deliveries behind closes the
+/// stream. Unlike a revocation (`revoking_a_role_discards_whatever_was_already_buffered`),
+/// this is not hiding anything the viewer was not entitled to: it is exactly
+/// `SUBSCRIPTION_BUFFER` Some, then None, because falling behind only ever drops the
+/// sender (see `HubInner::retain`'s doc comment) rather than signalling the subscription's
+/// `CloseSignal` -- so whatever tokio's mpsc channel already buffered still drains.
+#[tokio::test]
+async fn a_subscription_more_than_the_buffer_behind_is_closed() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+    let (hub, _) = hub(&db).await;
+    // Never read until after every change is announced: it falls behind.
+    let mut slow = hub.subscribe(w.viewer("member_out")).await.unwrap();
+    let mut bystander = hub.subscribe(w.viewer("admin_out")).await.unwrap();
+    assert_eq!(hub.subscriber_count(), 2);
+
+    let total = SUBSCRIPTION_BUFFER + 1;
+    for _ in 0..total {
+        announce(
+            &pool,
+            w.fau.tenant_id,
+            Change::Changed(Resource::Group(w.open)),
+        )
+        .await;
+    }
+    for n in 0..total {
+        assert_eq!(
+            next(&mut bystander).await,
+            Some(Resource::Group(w.open)),
+            "the bystander keeps reading and sees every change ({n})"
+        );
+    }
+
+    // By the time the bystander has seen all `total`, the single-threaded dispatch loop
+    // has already processed the slow subscriber for every one of those same
+    // notifications too (both are handled inside the same `dispatch` call, in order), so
+    // its removal -- on the buffer's 65th notification -- has already happened.
+    for n in 0..SUBSCRIPTION_BUFFER {
+        assert_eq!(
+            next(&mut slow).await,
+            Some(Resource::Group(w.open)),
+            "buffered items still drain once a lagging stream is closed ({n})"
+        );
+    }
+    assert_eq!(
+        next(&mut slow).await,
+        None,
+        "more than SUBSCRIPTION_BUFFER deliveries behind closes the stream"
+    );
+    assert_eq!(
+        hub.subscriber_count(),
+        1,
+        "the lagging subscription is gone"
+    );
+}
+
+/// I3: a listener failure must not reconnect silently. When the LISTEN connection itself
+/// dies, every existing stream must close -- whether the fix's `Err` retry loop or sqlx's
+/// own eager reconnect handles the recovery -- and the hub must keep working afterward.
+///
+/// The hub gets its own pool tagged with a unique `application_name` (a query parameter on
+/// the connection URL, the minimal way to identify it in `pg_stat_activity` without
+/// touching production code), read back immediately after `Hub::start` -- before anything
+/// else uses that pool -- so exactly one row can match.
+#[tokio::test]
+async fn a_killed_listener_connection_closes_every_stream_and_the_hub_keeps_working() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+
+    let app_name = format!("fau_hub_test_{}", db.name);
+    let hub_url = format!("{}?application_name={app_name}", db.url());
+    let hub_pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&hub_url)
+        .await
+        .expect("connect the hub's dedicated pool");
+    let now = Arc::new(Mutex::new(T0.parse::<Timestamp>().unwrap()));
+    let read = now.clone();
+    let clock: HubClock = Arc::new(move || *read.lock().unwrap());
+    let hub = Hub::start(hub_pool, clock).await.expect("start the hub");
+
+    let admin = db.admin_pool();
+    let pid: i32 =
+        sqlx::query_scalar("select pid from pg_stat_activity where application_name = $1")
+            .bind(&app_name)
+            .fetch_one(&admin)
+            .await
+            .expect("find the hub's listener backend by its application_name");
+
+    let mut member = hub.subscribe(w.viewer("member_out")).await.unwrap();
+
+    sqlx::query("select pg_terminate_backend($1)")
+        .bind(pid)
+        .execute(&admin)
+        .await
+        .expect("terminate the listener's backend");
+
+    assert_eq!(
+        next(&mut member).await,
+        None,
+        "a killed listener connection closes every existing stream"
+    );
+
+    let mut fresh = hub
+        .subscribe(w.viewer("member_out"))
+        .await
+        .expect("the hub keeps refusing and admitting correctly after reconnecting");
+    announce(
+        &pool,
+        w.fau.tenant_id,
+        Change::Changed(Resource::Group(w.open)),
+    )
+    .await;
+    assert_eq!(
+        next(&mut fresh).await,
+        Some(Resource::Group(w.open)),
+        "a fresh subscription after the reconnect receives new changes"
     );
 }

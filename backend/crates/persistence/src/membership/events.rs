@@ -14,15 +14,21 @@
 //! - **Closing** (Rulings R2, R3). Every closed subscription ends with
 //!   [`Subscription::recv`] returning `None`, which ends the SSE body. The client
 //!   reconnects and is authorized afresh. A subscription closes when:
-//!   - [`Change::AccessRevoked`] arrives for its membership;
-//!   - its viewer has lost all standing (a role reached its end date), at its next delivery;
-//!   - it falls more than [`SUBSCRIPTION_BUFFER`] deliveries behind;
-//!   - the listener reconnects, which closes every subscription, since the gap cannot be
-//!     replayed.
+//!   - [`Change::AccessRevoked`] arrives for its membership, or its viewer has lost all
+//!     standing (a role reached its end date), at its next delivery. Both discard whatever
+//!     was already buffered and unread (fix round 1, I1): a revoked viewer must not go on
+//!     reading up to [`SUBSCRIPTION_BUFFER`] changes it saw while it still had access, so
+//!     these two close a [`CloseSignal`] that [`Subscription::recv`] checks ahead of the
+//!     channel;
+//!   - it falls more than [`SUBSCRIPTION_BUFFER`] deliveries behind, or the listener
+//!     reconnects (below): both merely drop the sender, so whatever is already buffered
+//!     still drains before `None` -- there is nothing to hide from a viewer who could read
+//!     it, only a gap in what it was told.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -33,7 +39,7 @@ use jiff::Timestamp;
 use serde_json::{json, Value};
 use sqlx::postgres::PgListener;
 use sqlx::{PgConnection, PgPool};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -111,10 +117,46 @@ pub(crate) async fn notify(
 /// a clock they can move.
 pub type HubClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
+/// Tells a [`Subscription`] to stop, discarding whatever is already buffered in its
+/// channel (fix round 1, I1). Dropping the `Sender` alone is not enough: tokio's
+/// `Receiver::recv` still drains everything already queued before it returns `None`, and a
+/// revoked viewer must not go on reading changes it saw while it still had access.
+///
+/// `close()` sets the flag before notifying, and [`Subscription::recv`] checks the flag
+/// before it creates its `Notified` future, then re-checks by racing that future against
+/// `receiver.recv()`, `biased` so a pending close always wins over a buffered item. Two
+/// bracketing accesses, not one -- to avoid a race, [`Subscription::recv`] must create the
+/// `Notified` future *before* its flag check (see `tokio::sync::Notify`'s own
+/// documentation): `notify_waiters` only wakes futures that already exist, so one created
+/// after the check could miss a `close()` that lands in between.
+struct CloseSignal {
+    closed: AtomicBool,
+    notify: Notify,
+}
+
+impl CloseSignal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            closed: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
 struct Subscriber {
     id: u64,
     membership_id: Uuid,
     sender: mpsc::Sender<Resource>,
+    close: Arc<CloseSignal>,
 }
 
 struct HubInner {
@@ -154,6 +196,7 @@ impl Hub {
     pub async fn subscribe(&self, viewer: Viewer) -> Result<Subscription, MembershipError> {
         let (sender, receiver) = mpsc::channel(SUBSCRIPTION_BUFFER);
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let close = CloseSignal::new();
         // Registered before the standing check. A revocation that commits after the check
         // is announced after registration and closes this subscription; one that committed
         // before it is seen by the check.
@@ -165,14 +208,20 @@ impl Hub {
                 id,
                 membership_id: viewer.membership_id,
                 sender,
+                close: close.clone(),
             });
         let subscription = Subscription {
             receiver,
             tenant_id: viewer.tenant_id,
             id,
             hub: Arc::downgrade(&self.inner),
+            close,
         };
         let mut conn = self.inner.pool.acquire().await?;
+        // Must stay equivalent to what `authorize` itself calls `Denied::NoAccess` (fix
+        // round 1, minor 3): both read `evaluate_access` through `membership_access`, so a
+        // viewer this admits but dispatch's `authorize` would refuse as `NoAccess` -- or
+        // the reverse -- would be a bug, not a design choice.
         let access = membership_access(
             &mut conn,
             viewer.tenant_id,
@@ -199,12 +248,27 @@ pub struct Subscription {
     tenant_id: Uuid,
     id: u64,
     hub: Weak<HubInner>,
+    close: Arc<CloseSignal>,
 }
 
 impl Subscription {
     /// The next changed resource the viewer may read, or `None` once the stream is closed.
+    ///
+    /// The `Notified` future is created before the flag check, and the check happens before
+    /// the `select!`, precisely so a `close()` landing at any point from here on is either
+    /// seen by the flag or wakes the future -- never missed (see [`CloseSignal`]). `biased`
+    /// makes a pending close win even when the channel already has something buffered, so
+    /// an `AccessRevoked` or an ended role discards it rather than delivering it first.
     pub async fn recv(&mut self) -> Option<Resource> {
-        self.receiver.recv().await
+        let notified = self.close.notify.notified();
+        if self.close.is_closed() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = notified => None,
+            v = self.receiver.recv() => v,
+        }
     }
 }
 
@@ -245,7 +309,8 @@ impl HubInner {
     }
 
     /// Keeps only the tenant's subscribers for which `keep` holds. Dropping a subscriber
-    /// drops its sender, which closes its stream.
+    /// drops its sender: whatever it already buffered still drains before its stream ends
+    /// (lag and reconnect closes: nothing here was hidden from a viewer who could read it).
     fn retain(&self, tenant_id: Uuid, keep: impl Fn(&Subscriber) -> bool) {
         let mut map = self.subscribers();
         let empty = match map.get_mut(&tenant_id) {
@@ -264,6 +329,27 @@ impl HubInner {
         self.retain(tenant_id, |s| s.id != id);
     }
 
+    /// As [`HubInner::retain`], but for a removal that must also discard whatever is
+    /// already buffered (fix round 1, I1): [`Change::AccessRevoked`] and a viewer who has
+    /// lost all standing. Signals every matching subscriber's [`CloseSignal`] before
+    /// dropping it.
+    fn close_and_remove(&self, tenant_id: Uuid, matches: impl Fn(&Subscriber) -> bool) {
+        let mut map = self.subscribers();
+        let empty = match map.get_mut(&tenant_id) {
+            Some(subs) => {
+                for s in subs.iter().filter(|s| matches(s)) {
+                    s.close.close();
+                }
+                subs.retain(|s| !matches(s));
+                subs.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            map.remove(&tenant_id);
+        }
+    }
+
     fn close_all(&self) {
         self.subscribers().clear();
     }
@@ -271,31 +357,69 @@ impl HubInner {
     async fn dispatch(&self, tenant_id: Uuid, change: Change) {
         match change {
             Change::AccessRevoked { membership_id } => {
-                self.retain(tenant_id, |s| s.membership_id != membership_id);
+                // A stale `AccessRevoked` can close a newer stream of the same membership
+                // (fix round 1, minor 2) if the membership was revoked and later re-added
+                // -- `ensure_membership` reopens the same row -- and this notification is
+                // only now being dispatched (e.g. after a listener reconnect re-plays
+                // nothing, but ordinary delivery lag still could). Harmless: the client
+                // just reconnects and is authorized afresh, the same as any other close.
+                self.close_and_remove(tenant_id, |s| s.membership_id == membership_id);
             }
             Change::Changed(resource) => {
-                let targets: Vec<(u64, Uuid, mpsc::Sender<Resource>)> = self
+                let targets: Vec<(u64, Uuid, mpsc::Sender<Resource>, Arc<CloseSignal>)> = self
                     .subscribers()
                     .get(&tenant_id)
                     .map(|subs| {
                         subs.iter()
-                            .map(|s| (s.id, s.membership_id, s.sender.clone()))
+                            .map(|s| (s.id, s.membership_id, s.sender.clone(), s.close.clone()))
                             .collect()
                     })
                     .unwrap_or_default();
-                for (id, membership_id, sender) in targets {
-                    let viewer = Viewer {
-                        tenant_id,
-                        membership_id,
-                    };
-                    match self.decide(viewer, resource).await {
+                if targets.is_empty() {
+                    return;
+                }
+                // One connection and one `authorize` per distinct membership for the whole
+                // dispatch (fix round 1, I2's cheap part): every subscription of the same
+                // membership shares the same answer, and there is no reason to acquire a
+                // fresh connection per subscriber. Concurrent dispatch across a tenant's
+                // subscribers is deferred to the load test, #3508.
+                let mut conn = match self.pool.acquire().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not acquire a connection to authorize a change; closing every stream it would have reached");
+                        for (id, _, _, _) in &targets {
+                            self.remove(tenant_id, *id);
+                        }
+                        return;
+                    }
+                };
+                let now = self.now();
+                let mut decisions: HashMap<Uuid, Result<Decision, MembershipError>> =
+                    HashMap::new();
+                for (id, membership_id, sender, close) in targets {
+                    if let Entry::Vacant(e) = decisions.entry(membership_id) {
+                        let viewer = Viewer {
+                            tenant_id,
+                            membership_id,
+                        };
+                        let decision =
+                            authorize(&mut conn, viewer, resource, Action::Read, now).await;
+                        e.insert(decision);
+                    }
+                    match decisions
+                        .get(&membership_id)
+                        .expect("just computed or already present")
+                    {
                         Ok(Ok(())) => {
                             if sender.try_send(resource).is_err() {
                                 // Full (too far behind) or already dropped.
                                 self.remove(tenant_id, id);
                             }
                         }
-                        Ok(Err(Denied::NoAccess)) => self.remove(tenant_id, id),
+                        Ok(Err(Denied::NoAccess)) => {
+                            close.close();
+                            self.remove(tenant_id, id);
+                        }
                         Ok(Err(Denied::Hidden | Denied::Forbidden)) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "could not authorize a change for a stream; closing it");
@@ -305,15 +429,6 @@ impl HubInner {
                 }
             }
         }
-    }
-
-    async fn decide(
-        &self,
-        viewer: Viewer,
-        resource: Resource,
-    ) -> Result<Decision, MembershipError> {
-        let mut conn = self.pool.acquire().await?;
-        authorize(&mut conn, viewer, resource, Action::Read, self.now()).await
     }
 }
 
@@ -338,7 +453,32 @@ async fn listen(mut listener: PgListener, weak: Weak<HubInner>) {
                 tracing::warn!(kind = %safe_error_kind(&e), "change listener failed; closing every stream");
                 hub.close_all();
                 drop(hub);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // sqlx's own eager reconnect already failed once to get here (fix round 1,
+                // I3): left alone, the *next* `try_recv()` would reconnect and re-listen
+                // silently inside itself, with no return to this loop to close streams
+                // again -- so a viewer that subscribed during the outage, or a
+                // `AccessRevoked` sent while nobody here was listening, would never be
+                // told. Instead: force the reconnect ourselves, retrying on the same
+                // backoff, and only once `listen` succeeds, close every stream again --
+                // whether it predates the failure or was opened during it, none of them
+                // can be trusted to have seen everything since the connection dropped.
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    match listener.listen(EVENTS_CHANNEL).await {
+                        Ok(()) => break,
+                        Err(e) => tracing::warn!(
+                            kind = %safe_error_kind(&e),
+                            "change listener could not reconnect; retrying"
+                        ),
+                    }
+                }
+                let Some(hub) = weak.upgrade() else {
+                    return;
+                };
+                tracing::warn!(
+                    "change listener reconnected after a failure; closing every stream again"
+                );
+                hub.close_all();
             }
         }
     }

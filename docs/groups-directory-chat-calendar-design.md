@@ -377,7 +377,7 @@ Each piece's plan expands these; they are listed here so none is lost.
 - **Directory:**
   - the mailto length guard at the boundary;
   - a person selected through two groups appears once;
-  - the name survives the end of a membership while the contact email disappears;
+  - both the name and the contact email are cleared when a membership ends, and history shows the ended membership as role and year (D3, §4.2);
   - erasure replaces the name;
   - an audit entry records the count and never the addresses.
 - **Chat:**

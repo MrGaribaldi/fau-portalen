@@ -2947,3 +2947,68 @@ The next improvements go on:
 The trust-statement tightening was already done after the first review.
 
 None of this changes #3501, whose execution continues.
+
+## #3501 built: rulings for Erik's review — 27 September 2026
+
+Groups, the guest member type and one authorization function were built on `groups-3501`
+following docs/superpowers/plans/2026-09-27-groups-guests-authorization-3501.md. The
+plan's rulings, open to challenge:
+
+- **The change stream.**
+  - It stops at `Hub`/`Subscription` in `fau-persistence`. The SSE route waits for #3417's
+    sessions, since nothing identifies a viewer yet.
+  - Each process holds one `LISTEN` connection, and every delivery is re-authorized for its
+    viewer.
+  - These close a membership's streams: revoking a role or a membership, and removing a
+    hand-added group member.
+  - A role reaching its end date closes the stream at its next delivery, without a timer.
+  - A revoked viewer's buffered stream events are discarded, not merely left to drain: it
+    must not go on reading changes it saw while it still had access.
+  - A listener reconnect, or a stream more than 64 deliveries behind, closes streams without
+    discarding what was already buffered; the client reconnects and refetches. On a listener
+    error the hub closes every stream at once, forces its own reconnect and re-`LISTEN`s,
+    then closes every stream again once that succeeds -- none of them, old or newly opened
+    during the outage, can be trusted to have seen everything since the connection dropped.
+- **Guest roles.** A guest role names exactly one group (`roles.group_id`, check
+  `(capability_class = 'guest') = (group_id is not null)`), and only a guest role names a
+  group. A guest role also carries no unit or cohort (constraint
+  `roles_guest_has_no_unit_or_cohort`). A guest in two groups holds two roles or is added by
+  hand. Guest invitations are refused, both at accept and at resend, if the group the guest
+  role names was archived meanwhile.
+- **Binding.** A group binds to at most one unit or cohort. A role holder is in it when the
+  role, valid today, names the group, sits on its unit or sits on its cohort. There is no
+  traversal through `unit_cohorts`.
+- **#3412's remainder.**
+  - Migrated: school years, cohorts, organization units and unit cohorts, all plaintext.
+    `unit_relation` is not migrated.
+  - No transactions create them yet: the initial school configuration is its own work.
+  - Unit kinds are `grade`, `class`, `base` and `teaching_group`, and grades are 1–10.
+- **Hidden means not found for every resource.** A viewer who cannot read something gets
+  the same answer as for an unknown id. `Forbidden` is used only where the viewer can read.
+- **Writing and freezing.**
+  - Writing to a group record is managing it, which is admin-only.
+  - An archived group is read-only for everyone, admins included, and archiving is
+    one-way.
+  - A frozen FAU refuses create, rename, open and add-member. It allows close, archive and
+    remove-member.
+- **Revoking a membership soft-removes its hand-added group memberships,** so a re-invite
+  does not return closed groups.
+- **Guests get no FAU-wide notices.** They receive no recovery notices, neither as current
+  members nor in the 24-month fallback, and a handover grant cannot invite a guest.
+- **Names.** A group name is at most 100 characters, and its ciphertext is 42–512 bytes
+  with version byte 1, checked in code and in the database.
+- **No user-facing strings and no new error codes** until #3417 maps these errors at the edge.
+- **Schema contract.** The minimum stays 2, since 0006 and 0007 are additive.
+
+The #3418 read-path audit found two shortcuts:
+- `access_request_message` checked for an admin directly; it is now routed through
+  `authorize`, which also means it now refuses admins of a pending or closed FAU (a frozen
+  FAU stays active, so it is not refused).
+- Recovery recipients counted any role; guests are now excluded.
+
+`effective_access` now reports `Capability::Guest`. The spec's "migrations stop at 0004" is
+stale: 0005 (#3506) came later.
+
+Proven end to end (`key_chain.rs`): a group's encrypted name never appears in Postgres as
+readable bytes, decrypts correctly under the FAU's record key inside a session, and its
+ciphertext is bound to its own row -- the same bytes under another group's id do not open.

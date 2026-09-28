@@ -700,7 +700,10 @@ pub async fn get_group(
 
 /// The group's current members: added by hand and not removed, or holding a role valid
 /// today that the group follows. Only people with standing today count: a usable
-/// membership with some role valid today. Readable exactly when the group is (Ruling R22).
+/// membership with some *role assignment* valid today -- a handover grant is a temporary
+/// admin-class recovery right (§6.2), not group membership, so a hand-added member whose
+/// only standing came from one would still not appear. Readable exactly when the group
+/// is (Ruling R22).
 pub async fn list_group_members(
     pool: &PgPool,
     viewer: Viewer,

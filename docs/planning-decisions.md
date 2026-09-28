@@ -3012,3 +3012,39 @@ stale: 0005 (#3506) came later.
 Proven end to end (`key_chain.rs`): a group's encrypted name never appears in Postgres as
 readable bytes, decrypts correctly under the FAU's record key inside a session, and its
 ciphertext is bound to its own row -- the same bytes under another group's id do not open.
+
+## #3501 execution: rulings the agent made overnight — 28 September 2026
+
+Erik authorized unattended execution. Every ruling below was made without him and is his to
+reverse. The branch is `groups-3501`: not merged, not pushed.
+
+**Two that change behaviour, for Erik to confirm:**
+- **An archived group can now be closed**; reopening it is still refused. The final review found
+  that the plan made archived groups impossible to close. Archiving is one-way in the MVP, so an
+  open group with sensitive history would have stayed readable to every member forever. Closing
+  is a reducing action, allowed under R13/R14.
+- **`access_request_message` refuses admins of `pending` or `closed` FAUs** (ruling P4). It now
+  goes through `authorize`, which requires an active tenant. A frozen FAU stays `active`, so its
+  admins still read.
+
+**Security gaps the reviews found and closed:**
+- A guest role could carry a unit or cohort, which would have put the guest into every group bound
+  to it. It is now refused by `roles_guest_has_no_unit_or_cohort`.
+- A guest invitation issued before its group was archived still seated the guest at accept, and
+  resend re-armed it. Both now refuse.
+- Under handover, the refusal order revealed whether a hidden group was archived. The guest check
+  now runs first.
+- A revoked viewer still received up to 64 buffered stream events. They are now discarded.
+- After some connection errors, the stream listener retried on a dead socket forever, so
+  revocations stopped closing streams. The listener is now rebuilt.
+
+**Open question for Erik:** a guest can propose a replacement for their own guest-role assignment.
+An admin still has to approve it. It was left as it is.
+
+**Environment:** the shared dev Postgres crash-restarted at 08:57 UTC (10:57 Oslo) under a full
+parallel test run. It is the known "exit code 2" crash. The crashed process had no connection log,
+so it was a background process. The hypothesis is Docker's 64 MB `/dev/shm` with parallel workers.
+The fix (`shm_size` or `max_parallel_workers_per_gather=0`) needs a db restart, which is Erik's
+call; tests run with `--test-threads=4` meanwhile.
+
+The deferred items are filed on #3417, #3419 and #3503.

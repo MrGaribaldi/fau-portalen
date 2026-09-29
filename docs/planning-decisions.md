@@ -3146,3 +3146,68 @@ reading where a note needed interpreting; readings marked *(reading)* await Erik
   testing with actual FAU-er**.
 - **D18:** the etcd retention drop-in can be applied whenever it suits, because nothing uses the
   cluster yet. The change is still planned and inspected before it is applied.
+
+## #3502 built: the member directory, rulings for Erik's review — 28 September 2026
+
+Built from the accepted #3500 design (§4) on branch `directory-3502`. The plan's rulings are in
+docs/superpowers/plans/2026-09-28-member-directory-3502.md, and these are the ones that change
+behaviour or bind later work. All are open to challenge:
+
+- **No screen yet.** #3502 builds the schema, the domain rules and the persistence functions.
+  The htmx screen, its routes and the TypeScript selection module wait for #3417's sessions.
+- **Names and contact addresses are record-key envelopes on `memberships`** (migration 0008),
+  bound to the membership id. Acceptance is therefore two calls: `prepare_acceptance` names the
+  FAU and the membership, the session encrypts, and `accept_invitation` stores. A mismatch is
+  refused, never stored. The registrant's name is captured at activation the same way.
+- **A name is valid only while the membership is active (Erik's D3, 28 September).** When the
+  membership ends (it is revoked, or no role is running or still to come), the name is cleared
+  like the contact address. Revocation clears both in the same statement, and two database
+  checks enforce it. A daily sweep clears a membership whose roles ran out, at once and without
+  the account's three-month grace. There is therefore no name history.
+- **History shows an ended membership as its role and year** ("Leder 2025–2026"), computed from
+  the role assignments when history is rendered, never stored. The role is the one held on the
+  day of the event: admin class first, then the earliest start. After every role has ended, it
+  is the last role that ended. It is one role, without unit or cohort. The years are the
+  calendar years the assignment was actually held. The catalogue strings are proposals:
+  "{role} {year}" and "{role} {firstYear}–{lastYear}".
+- **Who edits.** A member edits their own name, and an admin corrects the name of anyone still
+  active. An ended membership takes no name (`MembershipEnded`). Only the member sets their
+  contact address.
+- **Article 17 erasure** is a storage step for #3426: both fields go, the person is not listed,
+  history shows "Tidligere medlem" (not even role and year, since a single-holder role with its
+  year identifies the person), and the old membership cannot be rejoined.
+- **What the directory shows.** The FAU-wide section, for members and admins only, never lists
+  a guest. Beyond it, each group the viewer may read, through the same rule and SQL as the group
+  reads. Only people with standing today are listed. A group the viewer cannot read never
+  appears as part of a person.
+- **Collation is ICU4X** (`icu_collator` 2.3), already mostly in the dependency tree. Bokmål and
+  Nynorsk are tailored. Sámi falls back to the root order until ICU4X data is generated for it,
+  which D4 places at the time a Sámi locale is added.
+- **Links and copying.** The `mailto:` link joins addresses with a bare `,` (RFC 6068), and the
+  copy text with `, `, with `; ` ready for Outlook. Bcc is the default above 10 distinct
+  addresses. The length guard allows 1,800 characters and refuses 1,801.
+- **Every export is server-side and audited:** the purpose, the count of people and the scope
+  (all, the FAU-wide section, or one group). No addresses and no member ids. Allowed while
+  frozen.
+
+**Open questions for Erik:** none from this card. D3 closed the name-history question, and D4
+closed the Sámi one.
+
+**Spec against code:** ADR-003 §6 still lists member names as plaintext. The accepted #3500
+spec and the key-service design encrypt them, and the later documents win. Spec §4.2's "the
+name stays after the membership ends" is overridden by D3 and needs updating in the spec. Spec
+§4.3's "`, ` per RFC 6068" is split: `,` in the link and `, ` in the copy text.
+
+**Execution notes, beyond the plan's own rulings above:**
+
+- Erik's D3: names only while active; after that, role and year, or "Tidligere medlem" on
+  erasure. Spec §4.2 was amended to match.
+- D4 and D5 were confirmed.
+- `Email::parse` now validates domain labels, so a comma or semicolon can't split an address.
+- Redacted `Debug` is a bare "[redacted]", without a character count.
+- Re-accepting keeps a stored contact address, and `prepare_acceptance` reports
+  `existing_current`.
+- Non-UUIDv7 membership ids are refused.
+- One shared `membership_ended` predicate is used everywhere.
+- Archived groups are neither directory sections nor export scopes.
+- #3426 must serialise erasure with acceptance.

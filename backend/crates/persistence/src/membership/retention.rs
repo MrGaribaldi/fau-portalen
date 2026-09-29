@@ -90,6 +90,13 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
 ///
 /// An erased membership cannot be accepted into again (`MembershipErased`): a new name on
 /// the old row would re-attach history to it. #3426 decides how an erased person rejoins.
+///
+/// **The tenant list is read before anything is locked** (fix round 1, controller ruling
+/// Q12, item 4): the `select tenant_id from memberships where account_id = $1` above runs
+/// before the loop's `lock_tenant`. A membership created for this account in a FAU not yet
+/// in that list -- an acceptance racing this call -- is not covered by this erasure: it
+/// keeps its name. So the caller (#3426) must make an erasure exclusive with an acceptance
+/// for the same account, not just serialise per FAU as this function does.
 pub async fn erase_member_names(
     pool: &PgPool,
     account_id: Uuid,

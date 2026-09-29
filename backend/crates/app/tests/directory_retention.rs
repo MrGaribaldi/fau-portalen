@@ -58,6 +58,34 @@ async fn fields(pool: &PgPool, m: Uuid) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     .unwrap()
 }
 
+async fn assignment_count(pool: &PgPool, m: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from role_assignments where membership_id = $1")
+        .bind(m)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn membership_revoked(pool: &PgPool, m: Uuid) -> bool {
+    sqlx::query_scalar("select revoked_at is not null from memberships where id = $1")
+        .bind(m)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Whether exactly one invitation to `recipient` is still pending -- unaccepted.
+async fn invitation_is_still_pending(pool: &PgPool, recipient: &str) -> bool {
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from invitations where recipient_email = $1 and accepted_at is null",
+    )
+    .bind(recipient)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    count == 1
+}
+
 async fn name(pool: &PgPool, fau: &Fau, m: Uuid, at_: &str) -> MemberName {
     let viewer = Viewer {
         tenant_id: fau.tenant_id,
@@ -78,10 +106,9 @@ fn medlem(from: Date, until: Date) -> MemberName {
     }])
 }
 
-/// Mutation checks: drop `ra.tenant_id = m.tenant_id` from `membership_ended` and Kari's
-/// running role in FAU B keeps her FAU A fields; drop `ra.revoked_at is null` and the
-/// stepped-down member keeps theirs; make `member_names` ignore `ended` and the read before
-/// the sweep returns the name.
+/// Mutation checks: drop `ra.revoked_at is null` from `membership_ended` and the
+/// stepped-down member keeps their fields; make `member_names` ignore `ended` and the read
+/// before the sweep returns the name.
 #[tokio::test]
 async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_come() {
     let db = TestDb::migrated().await;
@@ -308,6 +335,20 @@ async fn erasure_shows_former_member_in_every_fau_even_after_the_membership_ende
     .to_owned();
     let profile = profile_for(&pool, &token, "kari@example.test", t0).await;
     assert_eq!(profile.membership_id, in_a.membership_id);
+
+    // Fix round 1 (controller ruling Q12, carry-in c): the failed acceptance below must
+    // seat nothing. Capture the state before the attempt, so the assertions after it are
+    // a real "unchanged", not just "still revoked/erased" read from the docs.
+    let assignments_before = assignment_count(&pool, in_a.membership_id).await;
+    assert!(
+        membership_revoked(&pool, in_a.membership_id).await,
+        "revoked, before"
+    );
+    assert!(
+        invitation_is_still_pending(&pool, "kari@example.test").await,
+        "unaccepted, before"
+    );
+
     assert_eq!(
         accept_invitation(
             &pool,
@@ -322,6 +363,20 @@ async fn erasure_shows_former_member_in_every_fau_even_after_the_membership_ende
         .await
         .unwrap_err(),
         MembershipError::MembershipErased
+    );
+
+    assert_eq!(
+        assignment_count(&pool, in_a.membership_id).await,
+        assignments_before,
+        "no role assignment was seated"
+    );
+    assert!(
+        membership_revoked(&pool, in_a.membership_id).await,
+        "still revoked"
+    );
+    assert!(
+        invitation_is_still_pending(&pool, "kari@example.test").await,
+        "still unaccepted"
     );
 }
 
@@ -381,5 +436,170 @@ async fn names_for_history_are_for_members_and_admins_of_that_fau_only() {
         member_names(&pool, viewer(in_b), &[kari], t0).await,
         Err(MembershipError::NotAuthorized),
         "a viewer from another FAU"
+    );
+}
+
+/// Fix round 1 (controller ruling Q12, carry-in a): `member_names`' `authorize` call
+/// refuses a viewer whose own standing has lapsed, exactly as it refuses a guest or a
+/// viewer from another FAU (the sibling test above). Each case names the mutation it
+/// catches; the revoked and ran-out cases were demonstrated failing under a temporary
+/// mutation (recorded in the fix-round report), then reverted -- neither mutation is left
+/// in the tree.
+#[tokio::test]
+async fn member_names_refuses_a_viewer_whose_own_standing_has_lapsed() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let a = active_fau(&pool, "admin-a@example.test", t0).await;
+    let year = period(day(2026, 9, 1), day(2027, 9, 1));
+
+    // Revoked via `revoke_membership` (leaving), which revokes both the membership row
+    // and the assignment itself -- deliberately redundant (final review M6's pattern):
+    // either alone still blocks access through the other. So no single-line mutation
+    // defeats this case; it takes both at once: drop `standing.membership_active` from
+    // `evaluate_access`'s guard *and* `!self.revoked` from `AssignmentView::valid_on`
+    // (`fau_domain::membership::access`), and only then does the revoked viewer's own,
+    // still-unexpired role period make their capability look current again.
+    let revoked = join(&pool, &a, "revoked@example.test", year)
+        .await
+        .membership_id;
+    revoke_membership(
+        &pool,
+        RevokeMembership {
+            tenant_id: a.tenant_id,
+            actor_membership_id: revoked,
+            membership_id: revoked,
+            confirm_no_admin: false,
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        member_names(
+            &pool,
+            Viewer {
+                tenant_id: a.tenant_id,
+                membership_id: revoked
+            },
+            &[revoked],
+            t0,
+        )
+        .await,
+        Err(MembershipError::NotAuthorized),
+        "revoked"
+    );
+
+    // Ran out: read after the only role's period ends, with the membership itself never
+    // revoked.
+    //
+    // Mutation check: drop `self.period.contains(day)` from `AssignmentView::valid_on`,
+    // and this fails: a role that ended keeps looking current forever.
+    let ran_out = join(
+        &pool,
+        &a,
+        "ranout@example.test",
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+    )
+    .await
+    .membership_id;
+    assert_eq!(
+        member_names(
+            &pool,
+            Viewer {
+                tenant_id: a.tenant_id,
+                membership_id: ran_out
+            },
+            &[ran_out],
+            at("2026-10-01T10:00:00Z"),
+        )
+        .await,
+        Err(MembershipError::NotAuthorized),
+        "ran out"
+    );
+
+    // Disabled account: standing and a running role otherwise, but the account itself is
+    // unusable.
+    //
+    // Mutation check: drop `a.disabled_at is null` from `ACCOUNT_USABLE`
+    // (`fau_persistence::membership::sql`), and this fails: a disabled account's viewer
+    // reads on regardless.
+    let disabled = join(&pool, &a, "disabled@example.test", year).await;
+    sqlx::query("update accounts set disabled_at = now() where id = $1")
+        .bind(disabled.account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        member_names(
+            &pool,
+            Viewer {
+                tenant_id: a.tenant_id,
+                membership_id: disabled.membership_id
+            },
+            &[disabled.membership_id],
+            t0,
+        )
+        .await,
+        Err(MembershipError::NotAuthorized),
+        "disabled account"
+    );
+}
+
+/// D3 cheap check (fix round 1, item 5): a revocation timestamped 23:30 UTC on 31
+/// December is already 00:30 on 1 January in Oslo (winter, UTC+1), and `member_names`
+/// must cap the held role at the Oslo date (`fau_domain::time::oslo_today`), not the UTC
+/// one. A wrong, UTC-only conversion would report `until` as 31 December instead.
+#[tokio::test]
+async fn a_revocation_at_the_new_year_uses_the_oslo_date_not_the_utc_one() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let a = active_fau(&pool, "admin-a@example.test", t0).await;
+    let m = join(
+        &pool,
+        &a,
+        "nyttaar@example.test",
+        period(day(2026, 1, 1), day(2028, 1, 1)),
+    )
+    .await
+    .membership_id;
+    revoke(
+        &pool,
+        &a,
+        live_assignment(&pool, m).await,
+        at("2026-12-31T23:30:00Z"),
+    )
+    .await;
+    assert_eq!(
+        name(&pool, &a, m, "2027-06-01T10:00:00Z").await,
+        medlem(day(2026, 1, 1), day(2027, 1, 1)),
+        "the Oslo date (1 January), not the UTC one (31 December)"
+    );
+}
+
+/// D3 cheap check (fix round 1, item 5): an assignment revoked before it ever began held
+/// nothing. `member_names`' `from < until` guard drops it, so a membership whose only
+/// role never actually started shows "Tidligere medlem", the same as one that was never
+/// given a role at all -- never an empty-but-present role list.
+#[tokio::test]
+async fn an_assignment_revoked_before_it_began_holds_nothing() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let a = active_fau(&pool, "admin-a@example.test", t0).await;
+    let m = join(
+        &pool,
+        &a,
+        "aldri@example.test",
+        period(day(2027, 1, 1), day(2028, 1, 1)),
+    )
+    .await
+    .membership_id;
+    revoke(&pool, &a, live_assignment(&pool, m).await, t0).await;
+    assert_eq!(
+        name(&pool, &a, m, T0).await,
+        MemberName::Former,
+        "never held a role"
     );
 }

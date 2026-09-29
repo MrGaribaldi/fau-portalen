@@ -603,3 +603,119 @@ async fn an_assignment_revoked_before_it_began_holds_nothing() {
         "never held a role"
     );
 }
+
+async fn profile_cleared_audits(pool: &PgPool, m: Uuid) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        "select actor_kind, subject_type, params::text from audit_events
+          where action = 'membership.profile_cleared' and subject_id = $1",
+    )
+    .bind(m)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn grant(pool: &PgPool, fau: &Fau, m: Uuid, p: Period, at_: &str) {
+    grant_role(
+        pool,
+        GrantRole {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: m,
+            role: new_role("Nytt verv", CapabilityClass::Member),
+            period: p,
+        },
+        at(at_),
+    )
+    .await
+    .unwrap();
+}
+
+/// Final review I1 (controller ruling Q13): a membership whose roles simply ran out is not
+/// revoked, so `grant_role` may reach it before the daily sweep has. Under D3 it holds
+/// neither field any more, so the grant clears both in its own transaction, audited the
+/// way the sweep audits, and the returning member states their name again.
+///
+/// Mutation check: drop the clearing from `grant_role` and the old name and address
+/// become valid again on the new role (shown RED in the final fix report).
+#[tokio::test]
+async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin-a@example.test", at(T0)).await;
+    let m = join(
+        &pool,
+        &a,
+        "tilbake@example.test",
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+    )
+    .await
+    .membership_id;
+    with_contact(&pool, &a, m, 1).await;
+    let later = "2026-10-05T10:00:00Z";
+    assert_eq!(
+        fields(&pool, m).await,
+        (
+            Some(placeholder_envelope().as_bytes().to_vec()),
+            Some(envelope(1).as_bytes().to_vec())
+        ),
+        "ended, but not swept"
+    );
+
+    grant(
+        &pool,
+        &a,
+        m,
+        period(day(2026, 10, 5), day(2027, 10, 5)),
+        later,
+    )
+    .await;
+
+    assert_eq!(fields(&pool, m).await, (None, None));
+    assert_eq!(
+        profile_cleared_audits(&pool, m).await,
+        [(
+            "system".to_owned(),
+            "membership".to_owned(),
+            r#"{"cause": "membership_ended"}"#.to_owned()
+        )]
+    );
+}
+
+/// The control for the test above: an extra role for a member who is still active leaves
+/// both fields alone and writes no clearing.
+///
+/// Mutation check: clear unconditionally in `grant_role` and this fails.
+#[tokio::test]
+async fn granting_an_extra_role_to_an_active_member_keeps_both_fields() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin-a@example.test", at(T0)).await;
+    let m = join(
+        &pool,
+        &a,
+        "aktiv@example.test",
+        period(day(2026, 9, 1), day(2027, 9, 1)),
+    )
+    .await
+    .membership_id;
+    with_contact(&pool, &a, m, 1).await;
+
+    grant(
+        &pool,
+        &a,
+        m,
+        period(day(2026, 10, 5), day(2027, 10, 5)),
+        "2026-10-05T10:00:00Z",
+    )
+    .await;
+
+    assert_eq!(
+        fields(&pool, m).await,
+        (
+            Some(placeholder_envelope().as_bytes().to_vec()),
+            Some(envelope(1).as_bytes().to_vec())
+        )
+    );
+    assert!(profile_cleared_audits(&pool, m).await.is_empty());
+}

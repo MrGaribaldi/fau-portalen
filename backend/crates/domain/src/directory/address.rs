@@ -56,8 +56,9 @@ impl CopySeparator {
     }
 }
 
-/// A `mailto:` link, or the reason there is none.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A `mailto:` link, or the reason there is none. `Debug` prints the link's length, never
+/// the link: it carries every address (final review I2).
+#[derive(Clone, PartialEq, Eq)]
 pub enum Mailto {
     Link(String),
     /// The URL would be `length` characters, more than [`MAILTO_MAX_CHARS`]. "Skriv e-post"
@@ -65,6 +66,15 @@ pub enum Mailto {
     TooLong {
         length: usize,
     },
+}
+
+impl std::fmt::Debug for Mailto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Mailto::Link(url) => write!(f, "Mailto::Link([redacted], {} chars)", url.len()),
+            Mailto::TooLong { length } => write!(f, "Mailto::TooLong {{ length: {length} }}"),
+        }
+    }
 }
 
 /// The addresses of one selection, each once, in first-seen order.
@@ -364,5 +374,21 @@ mod tests {
     fn debug_prints_the_count_only() {
         let r = Recipients::new([e("kari@example.no")]);
         assert_eq!(format!("{r:?}"), "Recipients(1 addresses)");
+    }
+
+    /// Final review I2: a link carries every address, so its `Debug` output must not.
+    #[test]
+    fn mailto_debug_prints_neither_the_link_nor_any_address() {
+        let r = Recipients::new([e("kari@example.no"), e("ola@example.no")]);
+        let link = r.mailto(RecipientField::To);
+        let printed = format!("{link:?}");
+        assert_eq!(printed, "Mailto::Link([redacted], 37 chars)");
+        for leak in ["kari", "ola", "example", "mailto:"] {
+            assert!(!printed.contains(leak), "{leak} in the Debug output");
+        }
+        assert_eq!(
+            format!("{:?}", Mailto::TooLong { length: 1801 }),
+            "Mailto::TooLong { length: 1801 }"
+        );
     }
 }

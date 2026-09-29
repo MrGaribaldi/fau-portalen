@@ -984,18 +984,23 @@ pub async fn prepare_acceptance(
     if recipient != acceptor.email().as_str() {
         return Err(MembershipError::UnknownInvitation);
     }
-    // Whether the row has not ended (`profile::membership_ended`, D3 -- shared with
-    // `ensure_membership` and with editing) is what tells the caller "this is an
-    // already-current member accepting another invitation" (a handover to a sitting
-    // member, or recovery) -- so it can prefill, and so `accept_invitation`'s
-    // `write_profile` knows to keep a stored contact address the new profile leaves
-    // unstated (fix round 1, Q10). Found-but-ended (revoked, or ran out ahead of the
-    // sweep) still names the row: acceptance reopens it.
+    // Whether the row is current -- has not ended (`profile::membership_ended`, D3 --
+    // shared with `ensure_membership` and with editing) and its name was not erased -- is
+    // what tells the caller "this is an already-current member accepting another
+    // invitation" (a handover to a sitting member, or recovery) -- so it can prefill, and
+    // so `accept_invitation`'s `write_profile` knows to keep a stored contact address the
+    // new profile leaves unstated (fix round 1, Q10). Found-but-not-current (ended, ran
+    // out ahead of the sweep, or erased) still names the row: acceptance reopens it (an
+    // erasure is refused later, by `ensure_membership`'s own `MembershipErased` check).
+    //
+    // Fix round 1, Q11 (minor): without `m.name_erased_at is null`, an unrevoked row
+    // whose name was erased -- or, before migration 0008, one created before names
+    // existed at all -- would report `existing_current = true` with no name to prefill.
     let sql = format!(
-        "select m.id, {}
+        "select m.id, (not ({ended}) and m.name_erased_at is null)
            from memberships m join accounts a on a.id = m.account_id
           where m.tenant_id = $1 and a.email = $2",
-        super::profile::membership_ended("$3")
+        ended = super::profile::membership_ended("$3")
     );
     let existing: Option<(Uuid, bool)> = sqlx::query_as(&sql)
         .bind(tenant_id)
@@ -1005,7 +1010,7 @@ pub async fn prepare_acceptance(
         .await?;
     tx.commit().await?;
     let (membership_id, existing_current) = match existing {
-        Some((id, ended)) => (id, !ended),
+        Some((id, current)) => (id, current),
         None => (Uuid::now_v7(), false),
     };
     Ok(AcceptanceTarget {
@@ -1020,11 +1025,12 @@ pub async fn prepare_acceptance(
 pub struct AcceptanceTarget {
     pub tenant_id: Uuid,
     pub membership_id: Uuid,
-    /// Whether this membership already exists and has not ended (`profile::membership_ended`,
-    /// D3) -- an active member reached by a second invitation (a handover to a sitting
-    /// member, or recovery). The caller may prefill an acceptance form with it rather than
-    /// asking again, and knows `write_profile` will keep the stored contact address if the
-    /// new profile leaves it unstated (fix round 1, Q10).
+    /// Whether this is a current membership whose name the caller may prefill: it exists,
+    /// has not ended (`profile::membership_ended`, D3) and its name was not erased -- an
+    /// active member reached by a second invitation (a handover to a sitting member, or
+    /// recovery). The caller may prefill an acceptance form with it rather than asking
+    /// again, and knows `write_profile` will keep the stored contact address if the new
+    /// profile leaves it unstated (fix round 1, Q10).
     pub existing_current: bool,
 }
 

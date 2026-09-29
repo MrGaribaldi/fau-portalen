@@ -392,9 +392,11 @@ async fn a_frozen_fau_takes_no_new_name_or_address_but_lets_one_be_cleared() {
 /// its *role assignment* revoked; this shows the same refusal when the *membership
 /// itself* is revoked outright (`revoke_membership`), which also clears the name.
 ///
-/// Mutation check: swap the own-path's `membership_access` check for a bare
-/// `actor == target` check, and this passes when it should not, since a revoked
-/// membership's row still exists and still equals itself.
+/// Mutation check: skip the own-path's `membership_access` standing check (e.g. replace
+/// it with a bare `actor == target` test), and this test fails: the assertion expects
+/// `NotAuthorized`, but the row-state check that runs afterwards still catches the
+/// revoked row and returns `MembershipEnded` instead -- a different, and here wrong,
+/// refusal.
 #[tokio::test]
 async fn a_revoked_membership_cannot_edit_its_own_name() {
     let db = TestDb::migrated().await;

@@ -268,9 +268,11 @@ async fn a_profile_for_another_membership_is_refused() {
     // it is not existing_current (controller ruling, Task 5 review: the same shared
     // `membership_ended` check `ensure_membership` and editing use).
     //
-    // Mutation check: drop the `revoked_at is not null` arm from `membership_ended`, and
-    // this fails: a row revoked only through this path -- not through
-    // `revoke_role_assignment` -- would be reported active.
+    // Note (fix round 1, Q11): this does not exercise `membership_ended`'s
+    // `revoked_at is not null` arm on its own -- `revoke_membership` above also revokes
+    // every running and future role assignment, so the `not exists (...)` arm alone
+    // already reports this row ended. The arm that can fail only through `revoked_at` is
+    // covered by `a_membership_revoked_by_other_means_still_counts_as_ended`.
     let token = invite(&pool, &fau, "kari@example.test").await;
     let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
         .await
@@ -323,6 +325,116 @@ async fn a_profile_for_another_membership_is_refused() {
         fields(&pool, first.membership_id).await.0.as_deref(),
         Some(envelope(9).as_bytes())
     );
+}
+
+/// Controller ruling Q11 (Task 5 fix round 1): every revoked row `a_profile_for_another_
+/// membership_is_refused` builds went through `revoke_membership`, which also revokes the
+/// running and future role assignments -- so `membership_ended`'s `not exists (...)` arm
+/// alone already reports it ended, and the `m.revoked_at is not null` arm on its own had
+/// no test that could fail if it were dropped. This revokes by direct SQL instead, with a
+/// live role assignment left in place, so only the `revoked_at` arm can catch it.
+///
+/// Mutation check: drop the `m.revoked_at is not null or` arm from `membership_ended`,
+/// and this test fails on both assertions -- `existing_current` comes back `true`
+/// (the running assignment makes `not exists (...)` false too), and `set_display_name`
+/// succeeds instead of returning `MembershipEnded`.
+#[tokio::test]
+async fn a_membership_revoked_by_other_means_still_counts_as_ended() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let kari = add_member(
+        &pool,
+        &fau,
+        "kari@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        year(),
+        t0,
+    )
+    .await
+    .membership_id;
+
+    // Revoked by hand, not through `revoke_membership`: its role assignment is left
+    // running, exactly as D3 requires when a row is "revoked any other way" (0008's
+    // checks: revoked_at is not null or both fields are null).
+    sqlx::query(
+        "update memberships
+            set revoked_at = now(), encrypted_display_name = null, encrypted_contact_email = null
+          where id = $1",
+    )
+    .bind(kari)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let token = invite(&pool, &fau, "kari@example.test").await;
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
+        .await
+        .unwrap();
+    assert_eq!(target.membership_id, kari);
+    assert!(
+        !target.existing_current,
+        "revoked by hand, so not existing_current"
+    );
+
+    assert_eq!(
+        set_display_name(
+            &pool,
+            SetDisplayName {
+                tenant_id: fau.tenant_id,
+                actor_membership_id: fau.admin_membership_id,
+                membership_id: kari,
+                encrypted_display_name: envelope(9),
+            },
+            t0,
+        )
+        .await,
+        Err(MembershipError::MembershipEnded)
+    );
+}
+
+/// Fix round 1, Q11 (minor): `existing_current` must not report an erased row as one
+/// whose name the caller may prefill, even though it is neither revoked nor "ended" by
+/// role assignment. There is no erasure transaction yet (a later task's scope), so this
+/// sets `name_erased_at` by direct SQL, with both fields left null as migration 0008's
+/// `memberships_erasure_leaves_nothing` requires.
+///
+/// Mutation check: drop `and m.name_erased_at is null` from `prepare_acceptance`'s
+/// query, and this fails: an unrevoked, currently-assigned but erased row reports
+/// `existing_current = true`.
+#[tokio::test]
+async fn an_erased_but_unrevoked_membership_is_not_existing_current() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let kari = add_member(
+        &pool,
+        &fau,
+        "kari@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        year(),
+        t0,
+    )
+    .await
+    .membership_id;
+    sqlx::query(
+        "update memberships
+            set name_erased_at = now(), encrypted_display_name = null, encrypted_contact_email = null
+          where id = $1",
+    )
+    .bind(kari)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let token = invite(&pool, &fau, "kari@example.test").await;
+    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
+        .await
+        .unwrap();
+    assert_eq!(target.membership_id, kari, "the erased row is still reused");
+    assert!(!target.existing_current, "erased, so not existing_current");
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use common::groups::*;
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
-use fau_domain::directory::history::HeldRole;
+use fau_domain::directory::history::{ActivePeriod, HeldRole};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::vocabulary::{CapabilityClass, Visibility};
 use fau_persistence::membership::*;
@@ -230,9 +230,22 @@ async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_
         ),
         "another FAU's membership is its own"
     );
+    // #3511: the short role ran out and the next one has not started, so this membership
+    // has an earlier period too -- `Returned`, not `Named` (M1).
     assert_eq!(
         name(&pool, &a, renewed, "2026-10-01T10:00:00Z").await,
-        MemberName::Named(placeholder_envelope())
+        MemberName::Returned {
+            name: placeholder_envelope(),
+            period: ActivePeriod {
+                since: day(2026, 10, 1),
+                earlier: vec![HeldRole {
+                    name: "Medlem".into(),
+                    class: CapabilityClass::Member,
+                    from: day(2026, 9, 1),
+                    until: day(2026, 10, 1),
+                }],
+            },
+        }
     );
     // Idempotent.
     assert_eq!(clear_ended_profiles(&pool, after).await.unwrap(), 0);

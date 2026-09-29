@@ -5,13 +5,15 @@
 //! - an ended one (`membership_ended`, decided now, at read time, so a sweep that has not
 //!   run yet never lets a name through) is shown as a role and its years, from the roles it
 //!   actually held (`fau_domain::directory::history::role_label`);
-//! - an Article 17 erasure is "Tidligere medlem", with neither name nor role.
+//! - an Article 17 erasure is "Tidligere medlem", with neither name nor role;
+//! - an active membership with an earlier period is `Returned`: its name for the current
+//!   period only (#3511, M1).
 
 use std::collections::HashMap;
 
 use fau_crypto::Ciphertext;
 use fau_domain::authz::Action;
-use fau_domain::directory::history::HeldRole;
+use fau_domain::directory::history::{active_period, ActivePeriod, HeldRole};
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_domain::time::{oslo_today, Moment};
 use sqlx::{PgConnection, PgPool};
@@ -30,6 +32,14 @@ pub enum MemberName {
     Named(Ciphertext),
     /// An active membership created before migration 0008, which has no name.
     Unnamed,
+    /// An active membership that had an earlier period (#3511, Erik's M1): its name,
+    /// encrypted as for `Named`, for events on or after `period.since`, and role and year
+    /// for anything earlier (`period.label_on`). Others never see the returner's name on
+    /// their old contributions. Never produced by the directory.
+    Returned {
+        name: Ciphertext,
+        period: ActivePeriod,
+    },
     /// The membership has ended (D3): the roles it held, never empty, ordered by start. The
     /// renderer picks one for the event's date with `role_label` and renders it through the
     /// catalogue ("Leder 2025–2026").
@@ -67,12 +77,12 @@ pub async fn member_names(
     .bind(date_param(at.today()))
     .fetch_all(&mut *tx)
     .await?;
-    let ended: Vec<Uuid> = rows
+    let wanted: Vec<Uuid> = rows
         .iter()
-        .filter(|(_, _, erased, ended)| !erased && *ended)
+        .filter(|(_, _, erased, _)| !erased)
         .map(|(id, ..)| *id)
         .collect();
-    let mut held = held_roles(&mut tx, viewer.tenant_id, &ended).await?;
+    let mut held = held_roles(&mut tx, viewer.tenant_id, &wanted).await?;
     tx.commit().await?;
 
     let mut out: Vec<(Uuid, MemberName)> = Vec::with_capacity(rows.len());
@@ -89,10 +99,17 @@ pub async fn member_names(
                 Some(roles) => MemberName::Ended(roles),
                 None => MemberName::Former,
             },
-            (false, false) => match name {
-                Some(n) => MemberName::Named(Ciphertext::from_stored(n.clone())),
-                None => MemberName::Unnamed,
-            },
+            (false, false) => {
+                let period = active_period(held.get(id).map_or(&[][..], Vec::as_slice), at.today());
+                match name {
+                    Some(n) if !period.earlier.is_empty() => MemberName::Returned {
+                        name: Ciphertext::from_stored(n.clone()),
+                        period,
+                    },
+                    Some(n) => MemberName::Named(Ciphertext::from_stored(n.clone())),
+                    None => MemberName::Unnamed,
+                }
+            }
         };
         out.push((*id, shown));
     }

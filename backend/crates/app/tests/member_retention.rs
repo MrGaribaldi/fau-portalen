@@ -549,3 +549,59 @@ async fn a_grant_restores_a_retained_profile_and_clears_an_expired_one() {
     .await;
     assert_eq!(state(&pool, gone).await, (false, false, None));
 }
+
+/// M1 and spec §6 "history labels for events from an earlier active period after a
+/// return": the returner is `Returned`; an event from the old period labels as the role
+/// and year, an event from the new one as the name. A member with one unbroken period
+/// stays `Named`.
+///
+/// Mutation check: return `Named` for every active row (0008's behaviour) and the first
+/// assertion fails.
+#[tokio::test]
+async fn after_a_return_old_events_keep_role_and_year_and_new_ones_show_the_name() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "back@example.test", year()).await;
+    leave(&pool, &a, m, "2026-10-01T10:00:00Z").await;
+    reinvite(
+        &pool,
+        &a,
+        "back@example.test",
+        new_role("Sekretær", CapabilityClass::Member),
+        period(day(2026, 11, 1), day(2027, 11, 1)),
+        "2026-11-01T10:00:00Z",
+    )
+    .await;
+    let viewer = Viewer {
+        tenant_id: a.tenant_id,
+        membership_id: a.admin_membership_id,
+    };
+    let names = member_names(
+        &pool,
+        viewer,
+        &[m, a.admin_membership_id],
+        at("2026-11-02T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    let MemberName::Returned { name, period: p } = &names[0].1 else {
+        panic!("{:?}", names[0].1)
+    };
+    assert_eq!(name, &envelope(9));
+    assert_eq!(p.since, day(2026, 11, 1));
+    let old = p.label_on(day(2026, 9, 15)).expect("role and year");
+    assert_eq!(
+        (old.role.as_str(), old.first_year, old.last_year),
+        ("Medlem", 2026, 2026)
+    );
+    assert_eq!(
+        p.label_on(day(2026, 11, 1)),
+        None,
+        "the new period shows the name"
+    );
+    assert!(
+        matches!(names[1].1, MemberName::Named(_)),
+        "one unbroken period"
+    );
+}

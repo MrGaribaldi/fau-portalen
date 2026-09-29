@@ -83,6 +83,8 @@ pub enum MembershipError {
     NotAdminRole,
     #[error("membership not found")]
     UnknownMembership,
+    #[error("account not found")]
+    UnknownAccount,
     #[error("the membership is revoked")]
     MembershipRevoked,
     #[error("role assignment not found")]

@@ -73,7 +73,7 @@ pub use requests::{
     decline_request, lapse_requests, AccessRequestMessage, CreateAccessRequest,
     CreateReplacementProposal, RequestDecision, ACCESS_REQUEST_MESSAGE_AAD, MESSAGE_MAX_BYTES,
 };
-pub use retention::{clear_ended_profiles, erase_member_names};
+pub use retention::{clear_ended_profiles, erase_member_names, set_retention_months};
 pub use roles::{
     grant_role, revoke_membership, revoke_role_assignment, GrantRole, RevokeAssignment,
     RevokeMembership,

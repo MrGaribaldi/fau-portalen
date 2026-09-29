@@ -280,6 +280,103 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
     Ok(cleared)
 }
 
+/// The member's own setting (#3511 §4, plan Ruling R8): how long a membership of theirs is
+/// remembered after it ends. `account_id` is the verified login's account (#3417's
+/// session), so a member only ever sets their own.
+///
+/// Recalculates every period the account's memberships are in, in every FAU, from the day
+/// each ended: a longer setting extends a running period, a shorter one shortens it, and a
+/// period that is now over is cleared at once (`retention_shortened`). A period that had
+/// already expired is cleared as expired, never extended. Each moved period is audited as
+/// `membership.retention_changed` by the member.
+///
+/// Locks: the FAU-er are locked in id order *before* the account row is written, so this
+/// never holds the account row while waiting for a tenant lock (`accept_invitation` takes
+/// them the other way round). As for `erase_member_names`, the list is read before the
+/// locks; a membership created meanwhile in another FAU is active and has no period yet,
+/// so the new setting applies when it ends.
+pub async fn set_retention_months(
+    pool: &PgPool,
+    account_id: Uuid,
+    months: RetentionMonths,
+    at: Moment,
+) -> Result<(), MembershipError> {
+    let today = at.today();
+    let mut tx = pool.begin().await?;
+    let tenants: Vec<Uuid> = sqlx::query_scalar(
+        "select distinct tenant_id from memberships
+          where account_id = $1 and profile_retained_until is not null
+          order by tenant_id",
+    )
+    .bind(account_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for tenant_id in &tenants {
+        lock_tenant(&mut tx, *tenant_id).await?;
+    }
+    let found: Option<Uuid> =
+        sqlx::query_scalar("update accounts set retention_months = $2 where id = $1 returning id")
+            .bind(account_id)
+            .bind(months.months())
+            .fetch_optional(&mut *tx)
+            .await?;
+    found.ok_or(MembershipError::UnknownAccount)?;
+
+    for tenant_id in tenants {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "select id, to_char(profile_retained_until, 'YYYY-MM-DD') from memberships
+              where tenant_id = $1 and account_id = $2 and profile_retained_until is not null
+              order by id",
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (id, stamped) in rows {
+            if parse_date(&stamped)? <= today {
+                clear_profile(&mut tx, tenant_id, id, at, "retention_ended").await?;
+                continue;
+            }
+            // Once a membership has ended, no role span changes, so `ended_on` recomputed
+            // here from held roles is the same day as at stamping.
+            let held = held_roles(&mut tx, tenant_id, &[id])
+                .await?
+                .remove(&id)
+                .unwrap_or_default();
+            match keep_until(ended_on(&held, today), months, today) {
+                None => clear_profile(&mut tx, tenant_id, id, at, "retention_shortened").await?,
+                Some(until) if date_param(until) != stamped => {
+                    sqlx::query(
+                        "update memberships set profile_retained_until = $3::date
+                          where tenant_id = $1 and id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(id)
+                    .bind(date_param(until))
+                    .execute(&mut *tx)
+                    .await?;
+                    write_audit(
+                        &mut tx,
+                        at,
+                        Audit::member(
+                            tenant_id,
+                            id,
+                            "membership.retention_changed",
+                            "membership",
+                            id,
+                            json!({ "until": date_param(until) }),
+                        ),
+                    )
+                    .await?;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Erases the account's name and contact address from every FAU it belongs to, in one
 /// transaction, locking those FAU-er in id order, and marks each membership erased, an
 /// ended one included: the marker is what makes history show "Tidligere medlem" instead of

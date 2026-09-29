@@ -8,6 +8,7 @@ use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
 use fau_domain::membership::period::Period;
+use fau_domain::membership::retention::RetentionMonths;
 use fau_domain::membership::vocabulary::{CapabilityClass, RoleName, Visibility};
 use fau_persistence::membership::*;
 use sqlx::PgPool;
@@ -603,5 +604,105 @@ async fn after_a_return_old_events_keep_role_and_year_and_new_ones_show_the_name
     assert!(
         matches!(names[1].1, MemberName::Named(_)),
         "one unbroken period"
+    );
+}
+
+async fn account_of(pool: &PgPool, m: Uuid) -> Uuid {
+    sqlx::query_scalar("select account_id from memberships where id = $1")
+        .bind(m)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Spec §6 "changing the setting shortens an active retention", plan Ruling R8: shorter
+/// moves the date, none clears at once, longer extends a running period, and an already
+/// expired one is never revived. Across FAU-er.
+///
+/// Mutation check: drop the `stamped <= today` clear branch and the expired row is
+/// extended to 2028 instead of cleared.
+#[tokio::test]
+async fn the_setting_recalculates_every_running_period_and_never_revives_an_expired_one() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin-a@example.test", at(T0)).await;
+    let b = active_fau(&pool, "admin-b@example.test", at(T0)).await;
+    let in_a = join(&pool, &a, "kari@example.test", year()).await;
+    let in_b = join(&pool, &b, "kari@example.test", year()).await;
+    leave(&pool, &a, in_a, "2026-10-01T10:00:00Z").await; // until 2027-01-01
+    leave(&pool, &b, in_b, "2026-10-01T10:00:00Z").await;
+    let kari = account_of(&pool, in_a).await;
+    let nov = at("2026-11-01T10:00:00Z");
+
+    set_retention_months(&pool, kari, RetentionMonths::TwentyFour, nov)
+        .await
+        .unwrap();
+    assert_eq!(
+        state(&pool, in_a).await.2.as_deref(),
+        Some("2028-10-01"),
+        "extended"
+    );
+    assert_eq!(
+        state(&pool, in_b).await.2.as_deref(),
+        Some("2028-10-01"),
+        "every FAU"
+    );
+    assert!(audits(&pool, in_a)
+        .await
+        .iter()
+        .any(|(a, p)| a == "membership.retention_changed" && p.contains("2028-10-01")));
+
+    set_retention_months(&pool, kari, RetentionMonths::Three, nov)
+        .await
+        .unwrap();
+    assert_eq!(
+        state(&pool, in_a).await.2.as_deref(),
+        Some("2027-01-01"),
+        "shortened"
+    );
+
+    // One month after leaving, a period of three is running; none clears it now.
+    set_retention_months(&pool, kari, RetentionMonths::None, nov)
+        .await
+        .unwrap();
+    assert_eq!(state(&pool, in_a).await, (false, false, None));
+    assert!(audits(&pool, in_a)
+        .await
+        .iter()
+        .any(|(a, p)| a == "membership.profile_cleared" && p.contains("retention_shortened")));
+    let months: i32 = sqlx::query_scalar("select retention_months from accounts where id = $1")
+        .bind(kari)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(months, 0);
+}
+
+#[tokio::test]
+async fn an_expired_period_is_cleared_not_extended() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "late@example.test", year()).await;
+    leave(&pool, &a, m, "2026-10-01T10:00:00Z").await; // until 2027-01-01, no sweep since
+    let acc = account_of(&pool, m).await;
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::TwentyFour,
+        at("2027-02-01T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state(&pool, m).await, (false, false, None));
+}
+
+#[tokio::test]
+async fn an_unknown_account_is_refused() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    assert_eq!(
+        set_retention_months(&pool, Uuid::now_v7(), RetentionMonths::Six, at(T0)).await,
+        Err(MembershipError::UnknownAccount)
     );
 }

@@ -3,7 +3,7 @@
 //! the sweep clears them after; others see role and year throughout.
 
 mod common;
-use common::groups::seed_group;
+use common::groups::{seed_group, seed_group_member};
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
@@ -798,4 +798,205 @@ async fn an_unknown_account_is_refused() {
         set_retention_months(&pool, Uuid::now_v7(), RetentionMonths::Six, at(T0)).await,
         Err(MembershipError::UnknownAccount)
     );
+}
+
+// ---- Task 9 (Erik's M6): an ended membership leaves every group it was added to by hand.
+
+/// The membership's hand-added group rows still in force.
+async fn hand_groups(pool: &PgPool, m: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "select group_id from group_members
+          where membership_id = $1 and removed_at is null order by group_id",
+    )
+    .bind(m)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// `group.member_removed` audits naming the membership: (actor kind, cause).
+async fn group_removals(pool: &PgPool, m: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "select actor_kind, params->>'cause' from audit_events
+          where action = 'group.member_removed' and params->>'membership_id' = $1
+          order by occurred_at, id",
+    )
+    .bind(m.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+fn short() -> Period {
+    period(day(2026, 9, 1), day(2026, 10, 1))
+}
+
+async fn grant(pool: &PgPool, fau: &Fau, m: Uuid, role: RoleChoice, p: Period, at_: &str) {
+    grant_role(
+        pool,
+        GrantRole {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: m,
+            role,
+            period: p,
+        },
+        at(at_),
+    )
+    .await
+    .unwrap();
+}
+
+/// M6: roles that ran out end the hand-added group memberships at the next sweep, audited
+/// as the system with cause `membership_ended`. An active member of the same group stays.
+///
+/// Mutation check: drop the sweep's group pass in `clear_ended_profiles`, and the row
+/// stays.
+#[tokio::test]
+async fn a_member_whose_roles_ran_out_leaves_their_groups_in_the_sweep() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let y = seed_group(&pool, &a, Visibility::Closed).await;
+    let ran_out = join(&pool, &a, "ranout@example.test", short()).await;
+    let stays = join(&pool, &a, "stays@example.test", year()).await;
+    for m in [ran_out, stays] {
+        seed_group_member(&pool, &a, y, m).await;
+    }
+
+    clear_ended_profiles(&pool, at("2026-10-15T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(hand_groups(&pool, ran_out).await, Vec::<Uuid>::new());
+    assert_eq!(
+        group_removals(&pool, ran_out).await,
+        [("system".to_owned(), "membership_ended".to_owned())]
+    );
+    assert_eq!(
+        hand_groups(&pool, stays).await,
+        [y],
+        "the control keeps its row"
+    );
+    assert_eq!(group_removals(&pool, stays).await, []);
+
+    // Idempotent: a second sweep has nothing left to remove.
+    clear_ended_profiles(&pool, at("2026-10-16T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(group_removals(&pool, ran_out).await.len(), 1);
+}
+
+/// M6: a guest who comes back before any sweep reaches only the group its role names,
+/// not the closed group it was once added to by hand.
+///
+/// Mutation check: remove the group removal from `reopen_profile`, and Y comes back.
+#[tokio::test]
+async fn a_guest_returning_before_any_sweep_reaches_only_the_guest_group() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let y = seed_group(&pool, &a, Visibility::Closed).await;
+    let x = seed_group(&pool, &a, Visibility::Closed).await;
+    let m = join(&pool, &a, "guest@example.test", short()).await;
+    seed_group_member(&pool, &a, y, m).await;
+
+    let guest = RoleChoice::New {
+        name: RoleName::parse("Gjest").unwrap(),
+        capability: CapabilityClass::Guest,
+        group_id: Some(x),
+    };
+    grant(
+        &pool,
+        &a,
+        m,
+        guest,
+        period(day(2026, 10, 15), day(2027, 1, 15)),
+        "2026-10-15T10:00:00Z",
+    )
+    .await;
+    let viewer = Viewer {
+        tenant_id: a.tenant_id,
+        membership_id: m,
+    };
+    let groups = list_groups(&pool, viewer, at("2026-10-16T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(groups.iter().map(|g| g.group_id).collect::<Vec<_>>(), [x]);
+    assert_eq!(hand_groups(&pool, m).await, Vec::<Uuid>::new());
+    assert_eq!(
+        group_removals(&pool, m).await,
+        [("system".to_owned(), "membership_ended".to_owned())]
+    );
+}
+
+/// M6: a return through an invitation starts with no groups. The open group is still
+/// listed, as any member sees an open group, but never as the viewer's own.
+///
+/// Mutation check: remove the group removal from `reopen_profile`, and both come back as
+/// `viewer_in_group`.
+#[tokio::test]
+async fn returning_by_invitation_starts_with_no_groups() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let closed = seed_group(&pool, &a, Visibility::Closed).await;
+    let open = seed_group(&pool, &a, Visibility::Open).await;
+    let m = join(&pool, &a, "back@example.test", short()).await;
+    for g in [closed, open] {
+        seed_group_member(&pool, &a, g, m).await;
+    }
+
+    let (_, again) = reinvite(
+        &pool,
+        &a,
+        "back@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 11, 1), day(2027, 11, 1)),
+        "2026-11-01T10:00:00Z",
+    )
+    .await;
+    assert_eq!(again, m);
+    assert_eq!(hand_groups(&pool, m).await, Vec::<Uuid>::new());
+    assert_eq!(group_removals(&pool, m).await.len(), 2);
+    let viewer = Viewer {
+        tenant_id: a.tenant_id,
+        membership_id: m,
+    };
+    let groups = list_groups(&pool, viewer, at("2026-11-02T10:00:00Z"))
+        .await
+        .unwrap();
+    assert!(
+        groups.iter().all(|g| !g.viewer_in_group),
+        "no group is the returner's own"
+    );
+    assert!(
+        groups.iter().any(|g| g.group_id == open),
+        "open stays visible"
+    );
+}
+
+/// Control for M6: `grant_role` reopens an active member too; that member keeps their
+/// hand-added groups and no removal is written.
+///
+/// Mutation check: remove groups in `reopen_profile` unconditionally (not only when the
+/// membership has ended), and the row goes.
+#[tokio::test]
+async fn an_active_member_keeps_their_groups_when_granted_another_role() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let y = seed_group(&pool, &a, Visibility::Closed).await;
+    let m = join(&pool, &a, "active@example.test", year()).await;
+    seed_group_member(&pool, &a, y, m).await;
+    grant(
+        &pool,
+        &a,
+        m,
+        new_role("Kasserer", CapabilityClass::Member),
+        period(day(2026, 10, 1), day(2027, 10, 1)),
+        "2026-10-01T10:00:00Z",
+    )
+    .await;
+    assert_eq!(hand_groups(&pool, m).await, [y]);
+    assert_eq!(group_removals(&pool, m).await, []);
 }

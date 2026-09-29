@@ -542,15 +542,22 @@ pub async fn remove_group_member(
     Ok(())
 }
 
-/// `revoke_membership`'s cascade (Ruling R15): the membership leaves every group it was
-/// added to by hand, each removal audited. Without it, a re-invite (which reopens the same
-/// membership row) would hand a removed person their closed groups back. Runs inside the
-/// caller's transaction, under its tenant lock.
+/// An ended membership leaves every group it was added to by hand, each removal audited
+/// `group.member_removed` with `{ "membership_id", "cause" }` and notified per group.
+/// Without it, a return (which reopens the same membership row) would hand the person
+/// their closed groups back. Runs inside the caller's transaction, under its tenant lock.
+///
+/// - `revoke_membership` (Ruling R15) passes `Some(actor)` and `"membership_revoked"`:
+///   audited as that member.
+/// - A membership whose roles ran out (Erik's M6, #3511) is ended by the sweep
+///   (`clear_ended_profiles`) or on return (`reopen_profile`), which pass `None` and
+///   `"membership_ended"`: audited as the system.
 pub(crate) async fn remove_from_all_groups(
     conn: &mut PgConnection,
     tenant_id: Uuid,
-    actor_membership_id: Uuid,
+    actor: Option<Uuid>,
     membership_id: Uuid,
+    cause: &'static str,
     at: Moment,
 ) -> Result<(), MembershipError> {
     let groups: Vec<Uuid> = sqlx::query_scalar(
@@ -564,18 +571,12 @@ pub(crate) async fn remove_from_all_groups(
     .fetch_all(&mut *conn)
     .await?;
     for group_id in groups {
-        write_audit(
-            conn,
-            at,
-            audit(
-                tenant_id,
-                actor_membership_id,
-                "group.member_removed",
-                group_id,
-                json!({ "membership_id": membership_id, "cause": "membership_revoked" }),
-            ),
-        )
-        .await?;
+        let params = json!({ "membership_id": membership_id, "cause": cause });
+        let entry = match actor {
+            Some(actor) => audit(tenant_id, actor, "group.member_removed", group_id, params),
+            None => Audit::system(tenant_id, "group.member_removed", "group", group_id, params),
+        };
+        write_audit(conn, at, entry).await?;
         notify(conn, tenant_id, Change::Changed(Resource::Group(group_id))).await?;
     }
     Ok(())

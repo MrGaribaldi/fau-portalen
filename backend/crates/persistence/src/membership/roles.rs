@@ -363,8 +363,9 @@ pub async fn revoke_membership(
     remove_from_all_groups(
         &mut tx,
         req.tenant_id,
-        req.actor_membership_id,
+        Some(req.actor_membership_id),
         req.membership_id,
+        "membership_revoked",
         at,
     )
     .await?;

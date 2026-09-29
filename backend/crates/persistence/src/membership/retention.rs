@@ -14,6 +14,9 @@
 //!   checks). A membership whose roles simply ran out is not revoked, so
 //!   [`clear_ended_profiles`], a daily sweep, notices it: it stamps an end not yet noticed
 //!   ([`settle_profile`]) and clears a period that is over.
+//! - **Group memberships end with the membership, however it ends** (Erik's M6). A
+//!   revocation removes the hand-added `group_members` rows at once; a natural end is
+//!   caught by the sweep, or on return by [`reopen_profile`], whichever comes first.
 //! - **An Article 17 erasure** removes both fields from every membership the account holds
 //!   and marks them erased ([`erase_member_names`]). History then shows "Tidligere medlem",
 //!   not even the role and year. It is the storage step of #3426's erasure flow, which
@@ -30,6 +33,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::error::MembershipError;
+use super::groups::remove_from_all_groups;
 use super::names::held_roles;
 use super::profile::membership_ended;
 use super::sql::{date_param, lock_tenant, parse_date, ts_param, write_audit, Audit};
@@ -202,13 +206,33 @@ pub(crate) async fn settle_profile(
 /// cleared, a retained one kept -- then makes the row current again in one statement
 /// (`revoked_at` and `profile_retained_until` null together, as migration 0009's checks
 /// require), and audits `membership.profile_restored` when something was retained. The
-/// caller holds the tenant lock and adds the role in the same transaction.
+/// caller holds the tenant lock and adds the role in the same transaction, after this.
+///
+/// A membership that had ended first leaves every group it was added to by hand (Erik's
+/// M6): a returner starts with no groups, and a guest reaches only the group its role
+/// names. This is decided on `membership_ended`, not on what `settle_profile` returns,
+/// since a row with no field (`Absent`) can still be ended and hold group rows. An active
+/// member (`grant_role` reopens those too) keeps their groups.
 pub(crate) async fn reopen_profile(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     membership_id: Uuid,
     at: Moment,
 ) -> Result<Settled, MembershipError> {
+    let ended: bool = sqlx::query_scalar(&format!(
+        "select {} from memberships m where m.tenant_id = $1 and m.id = $2",
+        membership_ended("$3")
+    ))
+    .bind(tenant_id)
+    .bind(membership_id)
+    .bind(date_param(at.today()))
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(MembershipError::UnknownMembership)?;
+    if ended {
+        remove_from_all_groups(conn, tenant_id, None, membership_id, "membership_ended", at)
+            .await?;
+    }
     let settled = settle_profile(conn, tenant_id, membership_id, at).await?;
     sqlx::query(
         "update memberships set revoked_at = null, profile_retained_until = null
@@ -237,8 +261,11 @@ pub(crate) async fn reopen_profile(
 
 /// The daily sweep (#3511): settles every ended membership that still holds a field and
 /// whose period is not known to be running: an end not yet noticed is stamped, and an
-/// expired period is cleared. Per FAU, under that FAU's lock, each row re-decided under
-/// it, so a role granted concurrently is never swept past. Returns how many it cleared.
+/// expired period is cleared. It also ends the hand-added group memberships of every
+/// ended membership (Erik's M6), audited as the system with cause `membership_ended`. Per
+/// FAU, under that FAU's lock, taken once for both passes, each row re-decided under it,
+/// so a role granted concurrently is never swept past. Returns how many profiles it
+/// cleared; group removals are not counted.
 pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, MembershipError> {
     let today = date_param(at.today());
     let candidates = |tenant_filter: &str| {
@@ -256,10 +283,34 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
             ended = membership_ended("$1"),
         )
     };
-    let tenants: Vec<Uuid> = sqlx::query_scalar(&(candidates("") + " order by m.tenant_id"))
+    let in_groups = |tenant_filter: &str| {
+        format!(
+            "select {cols} from memberships m
+              where {tenant_filter}
+                exists (select 1 from group_members gm
+                         where gm.tenant_id = m.tenant_id and gm.membership_id = m.id
+                           and gm.removed_at is null)
+                and {ended}",
+            cols = if tenant_filter.is_empty() {
+                "distinct m.tenant_id"
+            } else {
+                "m.id"
+            },
+            ended = membership_ended("$1"),
+        )
+    };
+    let mut tenants: Vec<Uuid> = sqlx::query_scalar(&candidates(""))
         .bind(&today)
         .fetch_all(pool)
         .await?;
+    tenants.extend(
+        sqlx::query_scalar::<_, Uuid>(&in_groups(""))
+            .bind(&today)
+            .fetch_all(pool)
+            .await?,
+    );
+    tenants.sort_unstable();
+    tenants.dedup();
     let mut cleared = 0;
     for tenant_id in tenants {
         let mut tx = pool.begin().await?;
@@ -274,6 +325,15 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
             if settle_profile(&mut tx, tenant_id, id, at).await? == Settled::Cleared {
                 cleared += 1;
             }
+        }
+        let ids: Vec<Uuid> =
+            sqlx::query_scalar(&(in_groups("m.tenant_id = $2 and") + " order by m.id"))
+                .bind(&today)
+                .bind(tenant_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for id in ids {
+            remove_from_all_groups(&mut tx, tenant_id, None, id, "membership_ended", at).await?;
         }
         tx.commit().await?;
     }

@@ -21,6 +21,7 @@ store the data."
 | M2 | Retention period | **3 months by default.** The member can choose none, 3, 6, 12 or 24 months |
 | M3 | Scope | **Per FAU.** Each FAU remembers its own former member, encrypted under that FAU's record key. Deleting or crypto-shredding the FAU removes it |
 | M4 | Timing | **A follow-up card after #3502 is merged**, with migration 0009 |
+| M5 | The account's login email | **Lapses after the same chosen period** once the last membership anywhere ends (at once for none), replacing ADR-003 §6a's fixed 3 months. Decided when reviewing the #3511 plan. #3426 builds the lapse |
 
 ## 3. States of a membership's profile
 
@@ -65,9 +66,11 @@ store the data."
   allowed values checked. Changing it recalculates `profile_retained_until` on that account's
   retained memberships. It never extends a period that has already expired.
 - **Erasure** (#3426) clears everything at once, retained or not.
-- **The account itself.** ADR-003 §6a already keeps a login email "while any active membership
-  exists, lapsing 3 months after the last one ends". The same `retention_months` governs that
-  lapse, so a remembered membership never outlives its account's email. Check that on #3426.
+- **The account itself** (M5, Erik, 29 September 2026). ADR-003 §6a kept a login email "while any
+  active membership exists, lapsing 3 months after the last one ends". That fixed 3 months is
+  replaced by the member's own `retention_months`: the account lapses that many months after its
+  last membership anywhere ends, at once for none. A remembered membership therefore never
+  outlives its account's email. The lapse itself is built by #3426; #3511 only owns the field.
 
 ## 5. Privacy
 

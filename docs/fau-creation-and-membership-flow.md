@@ -300,8 +300,9 @@ When that happens:
   confirmation that names the consequence. That covers an admin revoking the only other admin,
   revoking themselves, or leaving. The confirmation reads "FAU-et får da ingen administrator. Bare
   gjenopprettingskontakten kan gi tilgang etterpå."
-- **Account retention.** Retention follows ADR-003 decision 6a. An account lapses 3 months after its
-  last membership anywhere ends, and a membership ending in one FAU never touches the account's
+- **Account retention.** Retention follows ADR-003 decision 6a. An account lapses after the member's
+  chosen period (`accounts.retention_months`, 3 months by default; amended 29 September 2026, #3511)
+  once its last membership anywhere ends, and a membership ending in one FAU never touches the account's
   standing in another.
 
 ## 8. Implementation split

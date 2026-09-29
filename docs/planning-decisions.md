@@ -3270,3 +3270,14 @@ only role and year. The period is set by the user. His answers:
 This amends D3: the name is hidden when the membership ends, and destroyed when the period ends
 or on erasure. Design in docs/member-retention-design.md. The new retention statement goes to
 #3426.
+
+## #3511: the account lapse follows the member's chosen period — 29 September 2026
+
+- **M5 (Erik, in chat, on reviewing the #3511 plan's R10):** the login email's lapse uses the
+  member's own `accounts.retention_months` (none, 3, 6, 12 or 24 months; default 3) instead of
+  ADR-003 §6a's fixed three months. An account lapses that many months after its last membership
+  anywhere ends, and at once for none. One setting now governs both the account and each FAU's
+  remembered name and address, so a remembered membership never outlives its account's email.
+- Amended: ADR-003 §6a (docs/identity-and-encryption.md), docs/fau-creation-and-membership-flow.md,
+  docs/member-retention-design.md §4. No lapse code exists yet; #3426 builds it to this rule.
+- Erik also chose subagent-driven execution of docs/superpowers/plans/2026-09-29-member-retention-3511.md.

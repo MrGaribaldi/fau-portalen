@@ -3297,8 +3297,9 @@ throughout. The plan's rulings, one line each:
   (`revoke_membership`, or `settle_profile` for a natural end), so changing the setting later is
   an explicit recalculation, never a silent side effect.
 - **R2:** `ended_on` is the latest day any role stopped being held, and never later than today.
-  A row that held no role at all ended on its revocation date (the membership's, else its latest
-  assignment's), so recomputing never moves a period (final review I2, `ended_on_for`).
+  When no role span was held, the end is the latest role revocation, else the membership's
+  revocation, else today (Erik, 29 September 2026: "use the revocation date"), so recomputing
+  never moves a period (final review I2, `ended_on_for`).
 - **R3:** the check constraint holds only the shape — a revoked row keeps a field only while
   `profile_retained_until` is set — because a check cannot read the clock; the date comparison
   belongs to the sweep.
@@ -3335,9 +3336,17 @@ and year; and that the member can shorten their period to none at any time.
 removes them at once, audited as the revoking actor with cause `membership_revoked`; an end noticed
 by the sweep or on return is audited as the system with cause `membership_ended`.
 
-**Open question for Erik:** `add_group_member` still accepts a membership whose roles simply ran
-out (only a revoked one is refused). The row is removed by the next sweep or return and grants
-nothing in the meantime, but under M6 an explicit `MembershipEnded` refusal may be wanted instead.
+**Decisions (Erik, 29 September 2026), closing the open questions of the final review:**
+
+- Adding someone whose roles ran out to a group is refused with `MembershipEndedInviteAsGuest`, so
+  that the screen can offer "invite as guest to this group". A revoked membership stays
+  `MembershipRevoked`: an admin removed them. Proposed Bokmål source string for the catalogue
+  (#3439; the screen card owns the final text):
+  `group.addMember.endedInviteAsGuest` = "Medlemskapet til {name} er avsluttet. Vil du invitere
+  vedkommende som gjest i denne gruppen?"
+- A member may extend a running period with `set_retention_months` even while the FAU is frozen. It
+  is the member's own account-wide setting, and crypto-shredding on deletion destroys everything
+  regardless of the date.
 
 **Bokmål source strings for the setting** (proposed; the screen card #3417 owns the final text):
 `retention.setting.label` = "Hvor lenge skal vi huske deg etter at du går ut?",

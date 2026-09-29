@@ -450,8 +450,11 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
 /// settles under whatever `retention_months` is visible to it at that moment, so it can
 /// be stamped under the old value if that happens before this transaction commits.
 ///
-/// Runs on a frozen FAU too, with no `require_open`: it is the member's own privacy setting
-/// over their own fields, it grants nothing, and it never revives a period already over.
+/// Runs on a frozen FAU too, with no `require_open`, and may then extend a running period
+/// (Erik, 29 September 2026, recorded in docs/planning-decisions.md's "#3511 built"): it is
+/// the member's own account-wide setting over their own fields, it grants nothing, it never
+/// revives a period already over, and crypto-shredding on the FAU's deletion destroys
+/// everything regardless of the date.
 pub async fn set_retention_months(
     pool: &PgPool,
     account_id: Uuid,

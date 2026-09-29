@@ -376,7 +376,7 @@ async fn tenant_status_is_constrained() {
 
 #[tokio::test]
 async fn retention_months_defaults_to_three() {
-    // ADR-003 decision 6a: member-elected retention is designed for, not built.
+    // ADR-003 decision 6a: the default of the member's chosen period (#3511).
     let db = TestDb::migrated().await;
     let pool = db.admin_pool();
     let acc = Uuid::now_v7();

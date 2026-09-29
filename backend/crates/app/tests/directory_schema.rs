@@ -100,18 +100,18 @@ async fn both_fields_hold_only_a_bounded_envelope() {
 }
 
 #[tokio::test]
-async fn a_revoked_membership_holds_neither_a_name_nor_a_contact_email() {
+async fn a_revoked_membership_without_a_retention_date_holds_neither_field() {
     let db = TestDb::migrated().await;
     let pool = db.admin_pool();
     let (_, m) = seed(&pool).await;
     let checks = [
         (
             "encrypted_display_name",
-            "memberships_display_name_only_while_current",
+            "memberships_display_name_only_while_current_or_retained",
         ),
         (
             "encrypted_contact_email",
-            "memberships_contact_email_only_while_current",
+            "memberships_contact_email_only_while_current_or_retained",
         ),
     ];
     let revoke = |clear: &'static str| {

@@ -3256,3 +3256,17 @@ states their name again, following D3-7. Until they do, the directory shows "Nav
 - **#3488 was already fixed.** The etcd-s3-retention drop-in was applied on 10 September, and on
   29 September S3 held about 170 hourly snapshots. Only the upstream issue remains, and Erik files
   it.
+
+## Remembering a former member for a chosen period — 29 September 2026
+
+Erik asked for a way to keep a former member's display name for a few months, so that someone who
+comes back (for example as a guest, to continue some work) is recognised, while the FAU shows
+only role and year. The period is set by the user. His answers:
+- **M1:** others see role and year on old contributions, even after the person returns.
+- **M2:** 3 months by default; the user chooses none, 3, 6, 12 or 24.
+- **M3:** remembered per FAU, under that FAU's record key.
+- **M4:** built as a follow-up card after #3502 merges, with migration 0009.
+
+This amends D3: the name is hidden when the membership ends, and destroyed when the period ends
+or on erasure. Design in docs/member-retention-design.md. The new retention statement goes to
+#3426.

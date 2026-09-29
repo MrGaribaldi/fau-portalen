@@ -618,9 +618,6 @@ async fn account_of(pool: &PgPool, m: Uuid) -> Uuid {
 /// Spec §6 "changing the setting shortens an active retention", plan Ruling R8: shorter
 /// moves the date, none clears at once, longer extends a running period, and an already
 /// expired one is never revived. Across FAU-er.
-///
-/// Mutation check: drop the `stamped <= today` clear branch and the expired row is
-/// extended to 2028 instead of cleared.
 #[tokio::test]
 async fn the_setting_recalculates_every_running_period_and_never_revives_an_expired_one() {
     let db = TestDb::migrated().await;
@@ -678,6 +675,10 @@ async fn the_setting_recalculates_every_running_period_and_never_revives_an_expi
     assert_eq!(months, 0);
 }
 
+/// Mutation check: skip the settle-under-the-old-setting step (fix round 1, Important 1)
+/// and this already-revoked, already-stamped row is extended to 2028 instead of cleared --
+/// `settle_profile` is what notices the stamped date is already past `today` and clears
+/// it before the new setting is ever applied.
 #[tokio::test]
 async fn an_expired_period_is_cleared_not_extended() {
     let db = TestDb::migrated().await;
@@ -695,6 +696,98 @@ async fn an_expired_period_is_cleared_not_extended() {
     .await
     .unwrap();
     assert_eq!(state(&pool, m).await, (false, false, None));
+    assert_eq!(
+        audits(&pool, m).await.last().unwrap(),
+        &(
+            "membership.profile_cleared".to_owned(),
+            r#"{"cause": "retention_ended"}"#.to_owned()
+        )
+    );
+
+    // Calling again with the same value touches a row with no fields left to settle, so
+    // it writes no second `retention_changed` audit.
+    let before = audits(&pool, m).await.len();
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::TwentyFour,
+        at("2027-02-02T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(audits(&pool, m).await.len(), before, "no new audit");
+}
+
+/// Fix round 1, Important 1: an unstamped natural end -- no revocation, and no sweep run
+/// since the roles ran out, so `profile_retained_until` is still null -- must settle
+/// under the *old* setting before the new one is written, so a period already over under
+/// the old setting is never revived by a longer new one.
+///
+/// Mutation check: skip the settle-under-the-old-setting step and this membership, left
+/// untouched by the old (tenant-list) query, keeps its name instead of being cleared.
+#[tokio::test]
+async fn an_unstamped_natural_end_already_over_is_settled_before_the_new_setting_applies() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(
+        &pool,
+        &a,
+        "unswept@example.test",
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+    )
+    .await;
+    set_months_by_sql(&pool, "unswept@example.test", 0).await;
+    let acc = account_of(&pool, m).await;
+    // The role ran out 2026-10-01; two weeks later, with the old setting of none, the
+    // period is already over. No sweep has run.
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::TwentyFour,
+        at("2026-10-15T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state(&pool, m).await, (false, false, None));
+}
+
+/// The reverse of the case above: an unstamped natural end still within its old (default,
+/// three-month) period is stamped by the settle-first step, then the new setting of none
+/// clears it at once. Since the row was still running, not already expired, the clear is
+/// `retention_shortened` (the settle step's own `retention_ended`/`membership_ended`
+/// causes are for an already-over period, which this is not).
+#[tokio::test]
+async fn an_unstamped_natural_end_within_its_old_period_is_stamped_then_shortened_to_cleared() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(
+        &pool,
+        &a,
+        "default@example.test",
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+    )
+    .await;
+    // retention_months stays the account's default of three; no sweep has run since the
+    // natural end on 2026-10-01.
+    let acc = account_of(&pool, m).await;
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::None,
+        at("2026-10-15T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state(&pool, m).await, (false, false, None));
+    assert_eq!(
+        audits(&pool, m).await.last().unwrap(),
+        &(
+            "membership.profile_cleared".to_owned(),
+            r#"{"cause": "retention_shortened"}"#.to_owned()
+        )
+    );
 }
 
 #[tokio::test]

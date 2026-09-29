@@ -280,21 +280,38 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
     Ok(cleared)
 }
 
-/// The member's own setting (#3511 §4, plan Ruling R8): how long a membership of theirs is
-/// remembered after it ends. `account_id` is the verified login's account (#3417's
-/// session), so a member only ever sets their own.
+/// The member's own setting (#3511 §4, plan Ruling R8, overridden in part by fix round
+/// 1's ruling below): how long a membership of theirs is remembered after it ends.
+/// `account_id` is the verified login's account (#3417's session), so a member only ever
+/// sets their own.
 ///
-/// Recalculates every period the account's memberships are in, in every FAU, from the day
-/// each ended: a longer setting extends a running period, a shorter one shortens it, and a
-/// period that is now over is cleared at once (`retention_shortened`). A period that had
-/// already expired is cleared as expired, never extended. Each moved period is audited as
+/// First settles every membership the account still holds a field on, in every FAU,
+/// under the setting that is about to be replaced (fix round 1, Important 1): an
+/// unstamped natural end -- no revocation, and no sweep since the roles ran out, so
+/// `profile_retained_until` is still null -- is stamped or cleared exactly as
+/// [`settle_profile`] would do it on its own, under the *old* months. Without this step a
+/// longer new setting could revive a period that had already run out under the old one,
+/// and a period of none would leave an unswept natural end's fields in place instead of
+/// clearing them at once. An active membership settles as `Active` and is left alone.
+///
+/// Then writes the new setting on the account, and recalculates every period still
+/// stamped, in every FAU, from the day it ended: a longer setting extends a period that
+/// is still running, and a shorter one shortens it or clears it at once if the new period
+/// is already over (`retention_shortened`). **Every row reaching this step is guaranteed
+/// not yet over under the old setting** -- the settle-first step above already cleared
+/// any that were (as `retention_ended` or `membership_ended`), so there is no "already
+/// past its stamped date" case left to check here; the two clearing causes above are the
+/// only ones this function itself audits. Each moved period is audited as
 /// `membership.retention_changed` by the member.
 ///
-/// Locks: the FAU-er are locked in id order *before* the account row is written, so this
-/// never holds the account row while waiting for a tenant lock (`accept_invitation` takes
-/// them the other way round). As for `erase_member_names`, the list is read before the
-/// locks; a membership created meanwhile in another FAU is active and has no period yet,
-/// so the new setting applies when it ends.
+/// Locks: the FAU-er are locked in id order *before* the account row is written -- the
+/// same order `accept_invitation` uses (tenant lock, then the account row), not the other
+/// way round. As for `erase_member_names`, the tenant list is read before the locks; a
+/// membership created meanwhile in another FAU is active and has no period yet, so the
+/// new setting applies when it ends. A membership that ends concurrently in an FAU not on
+/// that pre-read list -- for instance one accepted into after this transaction's read --
+/// settles under whatever `retention_months` is visible to it at that moment, so it can
+/// be stamped under the old value if that happens before this transaction commits.
 pub async fn set_retention_months(
     pool: &PgPool,
     account_id: Uuid,
@@ -305,7 +322,8 @@ pub async fn set_retention_months(
     let mut tx = pool.begin().await?;
     let tenants: Vec<Uuid> = sqlx::query_scalar(
         "select distinct tenant_id from memberships
-          where account_id = $1 and profile_retained_until is not null
+          where account_id = $1 and name_erased_at is null
+            and (encrypted_display_name is not null or encrypted_contact_email is not null)
           order by tenant_id",
     )
     .bind(account_id)
@@ -314,6 +332,25 @@ pub async fn set_retention_months(
     for tenant_id in &tenants {
         lock_tenant(&mut tx, *tenant_id).await?;
     }
+
+    // Settle each such membership under the old setting, still in the accounts row,
+    // before that row is overwritten below (Important 1).
+    for tenant_id in &tenants {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select id from memberships
+              where tenant_id = $1 and account_id = $2 and name_erased_at is null
+                and (encrypted_display_name is not null or encrypted_contact_email is not null)
+              order by id",
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for id in ids {
+            settle_profile(&mut tx, *tenant_id, id, at).await?;
+        }
+    }
+
     let found: Option<Uuid> =
         sqlx::query_scalar("update accounts set retention_months = $2 where id = $1 returning id")
             .bind(account_id)
@@ -333,10 +370,6 @@ pub async fn set_retention_months(
         .fetch_all(&mut *tx)
         .await?;
         for (id, stamped) in rows {
-            if parse_date(&stamped)? <= today {
-                clear_profile(&mut tx, tenant_id, id, at, "retention_ended").await?;
-                continue;
-            }
             // Once a membership has ended, no role span changes, so `ended_on` recomputed
             // here from held roles is the same day as at stamping.
             let held = held_roles(&mut tx, tenant_id, &[id])

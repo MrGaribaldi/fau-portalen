@@ -147,7 +147,8 @@ pub enum MembershipError {
     #[error("the membership's name was erased")]
     MembershipErased,
     /// The membership has ended -- it is revoked, or none of its role assignments is still
-    /// running or yet to start -- so it holds no name (Erik's D3, 28 September 2026).
+    /// running or yet to start. Under D3, as amended by #3511 (M1-M4, 29 September 2026), a
+    /// retained name may still sit on the row, but it is never open to editing while ended.
     #[error("the membership has ended")]
     MembershipEnded,
     /// The export's audit trail (#3502 Task 8): a selection of nobody has nothing to hand

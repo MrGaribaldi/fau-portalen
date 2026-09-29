@@ -1,6 +1,7 @@
 # Remembering a former member: design
 
-Status: **agreed in chat with Erik, 29 September 2026; not built.** It follows #3502 (the member
+Status: **agreed in chat with Erik, 29 September 2026; built on branch retention-3511, not
+merged.** It follows #3502 (the member
 directory) and amends Erik's decision D3: a display name is shown only while a membership is
 active. The name is no longer destroyed the moment the membership ends. It is kept hidden for a
 period the member chooses, so that a person who comes back is recognised.

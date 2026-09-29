@@ -3286,3 +3286,61 @@ or on erasure. Design in docs/member-retention-design.md. The new retention stat
   whose roles ran out and who came back, for example as a guest, reached their old groups again. "They should not
   retain group memberships, since they could be invited back to other groups. If the FAU wants to give further
   access, they can give them a role instead of just being a guest." Built as Task 9 of the #3511 plan.
+
+## #3511 built: remembering a former member — 29 September 2026
+
+Tasks 1–7 and 9 of the #3511 plan are built on branch `retention-3511`, not merged (Task 8 is
+this documentation pass). Each task's review came back clean; fmt and clippy are clean
+throughout. The plan's rulings, one line each:
+
+- **R1:** the period is stored, not recomputed on every read — set when the end is noticed
+  (`revoke_membership`, or `settle_profile` for a natural end), so changing the setting later is
+  an explicit recalculation, never a silent side effect.
+- **R2:** `ended_on` is the latest day any role stopped being held, and never later than today —
+  a row that held no role at all ended today.
+- **R3:** the check constraint holds only the shape — a revoked row keeps a field only while
+  `profile_retained_until` is set — because a check cannot read the clock; the date comparison
+  belongs to the sweep.
+- **R4:** coming back goes through one function, `retention::reopen_profile` — settle first (an
+  expired profile clears, a retained one is kept), then clear `revoked_at` and
+  `profile_retained_until` together, auditing `membership.profile_restored` when something was
+  retained.
+- **R5:** history labels by period — `MemberName::Returned { name, period }` shows the name only
+  for events in the current period; earlier events keep role and year.
+- **R6:** a period's start comes from role dates, not from when a role was granted, so a gap
+  before an already-booked role still counts as an end and a restart.
+- **R7:** the acceptance prefill hint (`existing_current`) is exact: true for a membership that
+  is active, or ended but still within its period with the name not erased.
+- **R8 (amended, Task 7 ruling):** `set_retention_months` first settles every non-erased
+  membership of the account that still holds a field, under the *old* setting, and only then
+  writes the new value and recalculates every stamped period. This closes a gap the plan's
+  original wording left: without the settle-first step, a longer new setting could revive a
+  period already run out under the old one.
+- **R9:** audit actions — `membership.profile_retained` {until}, `membership.profile_restored`
+  {}, `membership.retention_changed` {until} (actor: the member), and `membership.profile_cleared`
+  with cause `membership_ended` (period of none), `retention_ended` (period ran out) or
+  `retention_shortened` (a setting change). All are system actor except `retention_changed`.
+- **R10:** the login email's lapse follows the member's own `retention_months` rather than ADR-003
+  §6a's fixed three months — settled as M5 below.
+
+**Privacy text owed to #3426** (design spec §5): the notice and the DPA must say that a former
+member's name and contact address are kept hidden for their chosen period (3 months by default);
+that they are used only to recognise the member if they return; that other members see only role
+and year; and that the member can shorten their period to none at any time.
+
+**M5 (R10):** the account's login email lapses following the member's own `retention_months`
+(none, 3, 6, 12 or 24 months; at once for none), replacing ADR-003 §6a's fixed three months. This
+binds #3426, which builds the lapse; #3511 only owns the field.
+
+**M6 (Task 9):** a membership that ends, revoked or by its roles running out, leaves every group
+it was added to by hand, audited as the system with cause `membership_ended`. A returner starts
+with no groups; giving further access means giving a role, not restoring old group membership.
+
+**Open question for Erik:** `add_group_member` still accepts a membership whose roles simply ran
+out (only a revoked one is refused). The row is removed by the next sweep or return and grants
+nothing in the meantime, but under M6 an explicit `MembershipEnded` refusal may be wanted instead.
+
+**Bokmål source strings for the setting** (proposed; the screen card #3417 owns the final text):
+`retention.setting.label` = "Hvor lenge skal vi huske deg etter at du går ut?",
+`retention.none` = "Ikke i det hele tatt", `retention.months` = "{months} måneder",
+`retention.default` = "(standard)".

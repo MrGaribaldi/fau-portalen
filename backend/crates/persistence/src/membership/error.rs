@@ -123,6 +123,14 @@ pub enum MembershipError {
     AlreadyInGroup,
     #[error("the membership was not added to the group by hand")]
     NotInGroup,
+    /// The membership has ended because its roles ran out (none is still running or yet to
+    /// start), so adding it to a group would grant nothing, and the sweep would remove the
+    /// row (Erik's M6). The screen should offer an invitation to this group as a guest
+    /// instead: `issue_invitation` with `RoleChoice::New { capability: Guest, group_id:
+    /// Some(g), .. }`, or an existing guest role for the group (Erik, 29 September 2026).
+    /// A revoked membership is `MembershipRevoked` instead: an admin removed them.
+    #[error("the membership has ended; invite as a guest to the group instead")]
+    MembershipEndedInviteAsGuest,
     #[error("the group name is not a well-formed ciphertext")]
     GroupNameMalformed,
     #[error("organization unit not found")]

@@ -34,6 +34,7 @@ use super::authz::{
 };
 use super::error::MembershipError;
 use super::events::{notify, Change};
+use super::profile::membership_ended;
 use super::sql::{
     date_param, lock_tenant, membership_and_account_state, require_open, ts_param, write_audit,
     Audit, USABLE_ACCOUNT,
@@ -402,7 +403,11 @@ pub async fn archive_group(
 }
 
 /// Adds a member by hand: anyone with a usable membership, a guest or a member of a bound
-/// group's unit included (§3.1). Admin only; refused while frozen or archived.
+/// group's unit included (§3.1). Admin only; refused while frozen or archived. A revoked
+/// membership is `MembershipRevoked`; one whose roles ran out (ended, not revoked) is
+/// `MembershipEndedInviteAsGuest`, so the screen can offer a guest invitation to this
+/// group instead (Erik, 29 September 2026). A membership whose roles are all still to
+/// start is active and is added. Nothing is written or audited on a refusal.
 pub async fn add_group_member(
     pool: &PgPool,
     req: GroupMemberChange,
@@ -427,6 +432,18 @@ pub async fn add_group_member(
         Some((true, _)) => return Err(MembershipError::MembershipRevoked),
         Some((false, false)) => return Err(MembershipError::AccountDisabled),
         Some((false, true)) => {}
+    }
+    let ended: bool = sqlx::query_scalar(&format!(
+        "select {} from memberships m where m.tenant_id = $1 and m.id = $2",
+        membership_ended("$3")
+    ))
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(date_param(at.today()))
+    .fetch_one(&mut *tx)
+    .await?;
+    if ended {
+        return Err(MembershipError::MembershipEndedInviteAsGuest);
     }
     let already: bool = sqlx::query_scalar(
         "select exists (select 1 from group_members

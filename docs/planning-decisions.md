@@ -3211,3 +3211,34 @@ name stays after the membership ends" is overridden by D3 and needs updating in 
 - One shared `membership_ended` predicate is used everywhere.
 - Archived groups are neither directory sections nor export scopes.
 - #3426 must serialise erasure with acceptance.
+
+## #3502 execution: rulings the agent made — 29 September 2026
+
+#3502 (the member directory) is built on branch `directory-3502`, and not merged. That is 10
+tasks (including 3b, added for D3), a final whole-branch review and one fix wave. The full suite
+passes with 782 tests, and fmt and clippy are clean. The screen, routes and selection script wait
+for #3417.
+
+**One behaviour change for Erik to confirm:** when an admin grants a new role to a membership that
+has ended (roles ran out, not revoked), the old name and contact address are now cleared at once,
+in the same transaction, and audited as `membership.profile_cleared`. Without this, whether the
+old name came back depended on whether the daily sweep had already run. The returning member
+states their name again, following D3-7. Until they do, the directory shows "Navn ikke oppgitt".
+
+**Security and D3 gaps the reviews found and closed:**
+- `Email::parse` accepted a comma or semicolon in the domain, which could split the copy list.
+  Domain labels are now validated; internationalized domains such as blåbær.no still work.
+- A mail link printed every address in debug output. Redaction everywhere is now a bare
+  `[redacted]`, with no character count.
+- A member re-accepting an invitation had their contact address wiped. It is now kept, and
+  `prepare_acceptance` reports whether the membership is already current.
+- Membership ids that are not UUIDv7 are refused.
+- "Ended" is one shared predicate (`membership_ended`), used by acceptance, editing, history and
+  the sweep.
+- Archived groups are neither directory sections nor export scopes (D5).
+
+**Handed to later cards:**
+- **#3417:** name prefill for a returning member; members whose only role is upcoming; scheduling
+  the daily sweep.
+- **#3426:** make erasure exclusive with acceptance; decide whether erasure also revokes.
+- **#3503:** the name-resolution rule for guests; the history-label edge cases.

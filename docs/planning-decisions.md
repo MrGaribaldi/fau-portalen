@@ -3242,3 +3242,17 @@ states their name again, following D3-7. Until they do, the directory shows "Nav
   the daily sweep.
 - **#3426:** make erasure exclusive with acceptance; decide whether erasure also revokes.
 - **#3503:** the name-resolution rule for guests; the history-label edge cases.
+
+## Domain registered, email provider signed up, Hanko Pro — 29 September 2026
+
+- **fau-portalen.no is registered** and is the product's domain from now on. It replaces the
+  placeholder `fau-lab.bim.graphics` for ingress and cert-manager, and for the #3443 DNS
+  decisions: Domeneshop, HTTP-01 per hostname, no wildcard.
+- **Erik has signed up for Scaleway Transactional Email (TEM)**, the provisional provider on
+  #3410. It still has to be verified against #3410's checklist before production.
+- **Hanko is being upgraded to Pro** soon. ADR-003 decision 1 had planned the free tier to
+  10,000 MAU, so the Pro features should be checked against the MFA-proof requirement on #3414
+  and the pilot gate.
+- **#3488 was already fixed.** The etcd-s3-retention drop-in was applied on 10 September, and on
+  29 September S3 held about 170 hourly snapshots. Only the upstream issue remains, and Erik files
+  it.

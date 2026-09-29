@@ -1,8 +1,6 @@
 //! Granting and revoking roles and memberships, with the last-admin safeguard (spec 7).
 
-use fau_domain::directory::history::ended_on;
 use fau_domain::membership::period::Period;
-use fau_domain::membership::retention::{keep_until, RetentionMonths};
 use fau_domain::membership::rules::handover_period;
 use fau_domain::time::Moment;
 use serde_json::json;
@@ -13,8 +11,10 @@ use super::error::MembershipError;
 use super::events::{notify, Change};
 use super::groups::remove_from_all_groups;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
-use super::names::held_roles;
-use super::retention::{account_retention, reopen_profile};
+use super::retention::{
+    audit_profile_cleared, audit_profile_retained, clearing_cause, effective_keep_until,
+    reopen_profile,
+};
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
     membership_and_account_state, parse_date, require_admin, require_open, ts_param, write_audit,
@@ -241,19 +241,20 @@ pub async fn revoke_membership(
     if !leaving {
         require_admin(&mut tx, req.tenant_id, req.actor_membership_id, at.today()).await?;
     }
-    let target: Option<(bool, bool)> = sqlx::query_as(
+    let target: Option<(bool, bool, Option<String>)> = sqlx::query_as(
         "select revoked_at is not null,
-                (encrypted_display_name is not null or encrypted_contact_email is not null)
+                (encrypted_display_name is not null or encrypted_contact_email is not null),
+                to_char(profile_retained_until, 'YYYY-MM-DD')
            from memberships where tenant_id = $1 and id = $2 for update",
     )
     .bind(req.tenant_id)
     .bind(req.membership_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let has_fields = match target {
+    let (has_fields, stamped) = match target {
         None => return Err(MembershipError::UnknownMembership),
-        Some((true, _)) => return Err(MembershipError::MembershipRevoked),
-        Some((false, has_fields)) => has_fields,
+        Some((true, _, _)) => return Err(MembershipError::MembershipRevoked),
+        Some((false, has_fields, stamped)) => (has_fields, stamped),
     };
 
     let admins = AdminState::load(&mut tx, req.tenant_id).await?;
@@ -276,17 +277,24 @@ pub async fn revoke_membership(
     revoke_ended_admin_roles_with_open_window(&mut tx, req.tenant_id, req.membership_id, at)
         .await?;
     // #3511: the fields are kept, hidden, for the account's period from the day the
-    // membership ended (plan Ruling R2), or cleared now for a period of none. Written after
-    // the assignment cascade, so `held_roles` sees the spans it cut short. Migration 0009's
+    // membership ended (plan Ruling R2, `ended_on_for`), or cleared now for a period of
+    // none. An end the sweep already stamped (roles that ran out) keeps its stamp: no new
+    // date and no second `profile_retained` (final review I2). Written after the
+    // assignment cascade, so the end date sees the spans it cut short. Migration 0009's
     // *_only_while_current_or_retained checks refuse a revocation that keeps a field
     // without the date.
-    let today = at.today();
-    let months = account_retention(&mut tx, req.tenant_id, req.membership_id).await?;
-    let held = held_roles(&mut tx, req.tenant_id, &[req.membership_id])
+    let keep = if has_fields {
+        effective_keep_until(
+            &mut tx,
+            req.tenant_id,
+            req.membership_id,
+            stamped.as_deref(),
+            at.today(),
+        )
         .await?
-        .remove(&req.membership_id)
-        .unwrap_or_default();
-    let keep = keep_until(ended_on(&held, today), months, today).filter(|_| has_fields);
+    } else {
+        None
+    };
     sqlx::query(
         "update memberships
             set revoked_at = $3::timestamptz,
@@ -304,39 +312,15 @@ pub async fn revoke_membership(
     .execute(&mut *tx)
     .await?;
     match keep {
-        Some(until) => {
-            write_audit(
-                &mut tx,
-                at,
-                Audit::system(
-                    req.tenant_id,
-                    "membership.profile_retained",
-                    "membership",
-                    req.membership_id,
-                    json!({ "until": date_param(until) }),
-                ),
-            )
-            .await?
+        Some(until) if stamped.is_none() => {
+            audit_profile_retained(&mut tx, req.tenant_id, req.membership_id, at, until).await?
         }
+        Some(_) => {}
         None if has_fields => {
-            write_audit(
-                &mut tx,
-                at,
-                Audit::system(
-                    req.tenant_id,
-                    "membership.profile_cleared",
-                    "membership",
-                    req.membership_id,
-                    // Plan Ruling R9, as `settle_profile`: only a period of none is
-                    // `membership_ended`; otherwise the period was already over.
-                    json!({ "cause": if months == RetentionMonths::None {
-                        "membership_ended"
-                    } else {
-                        "retention_ended"
-                    } }),
-                ),
-            )
-            .await?
+            let cause =
+                clearing_cause(&mut tx, req.tenant_id, req.membership_id, stamped.is_some())
+                    .await?;
+            audit_profile_cleared(&mut tx, req.tenant_id, req.membership_id, at, cause).await?
         }
         None => {}
     }

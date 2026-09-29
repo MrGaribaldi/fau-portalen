@@ -3,7 +3,7 @@
 //! the sweep clears them after; others see role and year throughout.
 
 mod common;
-use common::groups::{seed_group, seed_group_member};
+use common::groups::{live_assignment, revoke, seed_group, seed_group_member};
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
@@ -788,6 +788,100 @@ async fn an_unstamped_natural_end_within_its_old_period_is_stamped_then_shortene
             r#"{"cause": "retention_shortened"}"#.to_owned()
         )
     );
+}
+
+fn booked() -> Period {
+    period(day(2026, 11, 1), day(2027, 11, 1))
+}
+
+fn count_of(audits: &[(String, String)], action: &str) -> usize {
+    audits.iter().filter(|(a, _)| a == action).count()
+}
+
+/// Final review I2: a membership revoked before its first role started held no role, so
+/// its end is the day it was revoked, not whatever day the period is next recalculated.
+/// A setting call with the same value a month later moves nothing and audits nothing.
+///
+/// Mutation check: fall back to `today` for a membership that held no role (the old
+/// `ended_on(&[], today)`) and the date moves to 2027-02-01 with a `retention_changed`.
+#[tokio::test]
+async fn a_membership_that_held_no_role_is_not_extended_by_a_recalculation() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "early@example.test", booked()).await;
+    leave(&pool, &a, m, "2026-10-01T10:00:00Z").await;
+    assert_eq!(state(&pool, m).await.2.as_deref(), Some("2027-01-01"));
+    let acc = account_of(&pool, m).await;
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::Three,
+        at("2026-11-01T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state(&pool, m).await.2.as_deref(),
+        Some("2027-01-01"),
+        "unchanged"
+    );
+    assert_eq!(
+        count_of(&audits(&pool, m).await, "membership.retention_changed"),
+        0
+    );
+}
+
+/// Final review I2: revoking a membership whose end the sweep already stamped keeps the
+/// stamp and writes no second `profile_retained`. Covers a natural end, and a membership
+/// whose only role was revoked before it started (no role held: its end is that role's
+/// revocation day).
+///
+/// Mutation check: re-stamp in `revoke_membership` instead of keeping the stamp and both
+/// get a second `profile_retained`; fall back to `today` for no role held and the sweep
+/// stamps the second one 2027-01-15.
+#[tokio::test]
+async fn revoking_a_stamped_natural_end_keeps_the_stamp() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let ran_out = join(
+        &pool,
+        &a,
+        "ranout@example.test",
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+    )
+    .await;
+    let never_started = join(&pool, &a, "never@example.test", booked()).await;
+    revoke(
+        &pool,
+        &a,
+        live_assignment(&pool, never_started).await,
+        at("2026-10-01T10:00:00Z"),
+    )
+    .await;
+    clear_ended_profiles(&pool, at("2026-10-15T10:00:00Z"))
+        .await
+        .unwrap();
+    for m in [ran_out, never_started] {
+        assert_eq!(
+            state(&pool, m).await.2.as_deref(),
+            Some("2027-01-01"),
+            "stamped from the day it ended"
+        );
+    }
+    for m in [ran_out, never_started] {
+        leave(&pool, &a, m, "2026-10-20T10:00:00Z").await;
+        assert_eq!(
+            state(&pool, m).await,
+            (true, false, Some("2027-01-01".into()))
+        );
+        assert_eq!(
+            count_of(&audits(&pool, m).await, "membership.profile_retained"),
+            1,
+            "one stamp"
+        );
+    }
 }
 
 #[tokio::test]

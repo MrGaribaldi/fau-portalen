@@ -5,7 +5,7 @@
 //!   docs/member-retention-design.md, Erik's M1-M3 of 29 September 2026). When a
 //!   membership ends (`membership_ended`: revoked, or no role assignment still running or
 //!   yet to start) its name and address stay on the row until `profile_retained_until`:
-//!   the day it ended (`ended_on`, plan Ruling R2) plus the account's `retention_months`,
+//!   the day it ended (`ended_on_for`, plan Ruling R2) plus the account's `retention_months`,
 //!   exclusive. A period of none clears at once, as under D3. Nobody else sees a retained
 //!   name: `member_names` and the directory decide "ended" at read time, and history shows
 //!   the membership as its role and year.
@@ -26,7 +26,7 @@
 
 use fau_domain::directory::history::ended_on;
 use fau_domain::membership::retention::{keep_until, RetentionMonths};
-use fau_domain::time::Moment;
+use fau_domain::time::{oslo_today, Moment};
 use jiff::civil::Date;
 use serde_json::json;
 use sqlx::{PgConnection, PgPool};
@@ -36,7 +36,7 @@ use super::error::MembershipError;
 use super::groups::remove_from_all_groups;
 use super::names::held_roles;
 use super::profile::membership_ended;
-use super::sql::{date_param, lock_tenant, parse_date, ts_param, write_audit, Audit};
+use super::sql::{date_param, from_micros, lock_tenant, parse_date, ts_param, write_audit, Audit};
 
 /// Where a membership's name and address stand after [`settle_profile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +69,46 @@ pub(crate) async fn account_retention(
     RetentionMonths::from_months(months).ok_or_else(MembershipError::decode)
 }
 
+/// The day an ended membership ended (plan Ruling R2; final review I2), the one end date
+/// every retention path uses: the latest day any of its roles stopped being held. A
+/// membership that held no role at all -- revoked, or its only roles revoked, before any
+/// started -- ended on the Oslo date of `memberships.revoked_at`, or else of its latest
+/// assignment revocation. Never later than `today`; `today` only when none of those exist.
+/// A fact of the past, so recomputing it never moves a period.
+pub(crate) async fn ended_on_for(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    today: Date,
+) -> Result<Date, MembershipError> {
+    let held = held_roles(conn, tenant_id, &[membership_id])
+        .await?
+        .remove(&membership_id)
+        .unwrap_or_default();
+    if !held.is_empty() {
+        return Ok(ended_on(&held, today));
+    }
+    let revoked_us: Option<i64> = sqlx::query_scalar(
+        "select (extract(epoch from coalesce(
+                    m.revoked_at,
+                    (select max(ra.revoked_at) from role_assignments ra
+                      where ra.tenant_id = m.tenant_id and ra.membership_id = m.id)
+                )) * 1000000)::bigint
+           from memberships m where m.tenant_id = $1 and m.id = $2",
+    )
+    .bind(tenant_id)
+    .bind(membership_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(MembershipError::UnknownMembership)?;
+    Ok(match revoked_us {
+        Some(us) => oslo_today(from_micros(us)?).min(today),
+        None => today,
+    })
+}
+
 /// The date an ended membership's fields go: the stamped one, or, for an end not yet
-/// noticed, `keep_until` from the day it ended (plan Ruling R2). `None`: clear now.
+/// noticed, `keep_until` from the day it ended ([`ended_on_for`]). `None`: clear now.
 pub(crate) async fn effective_keep_until(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -83,11 +121,28 @@ pub(crate) async fn effective_keep_until(
         return Ok((today < until).then_some(until));
     }
     let months = account_retention(conn, tenant_id, membership_id).await?;
-    let held = held_roles(conn, tenant_id, &[membership_id])
-        .await?
-        .remove(&membership_id)
-        .unwrap_or_default();
-    Ok(keep_until(ended_on(&held, today), months, today))
+    let ended = ended_on_for(conn, tenant_id, membership_id, today).await?;
+    Ok(keep_until(ended, months, today))
+}
+
+/// Why an ended membership's fields are cleared now (plan Ruling R9): only an unstamped
+/// end under a period of none is `membership_ended`; a stamped period, or any other
+/// setting, means the period was already over, `retention_ended`.
+pub(crate) async fn clearing_cause(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    stamped: bool,
+) -> Result<&'static str, MembershipError> {
+    Ok(
+        if stamped
+            || account_retention(conn, tenant_id, membership_id).await? != RetentionMonths::None
+        {
+            "retention_ended"
+        } else {
+            "membership_ended"
+        },
+    )
 }
 
 /// Clears both fields and the date, audited with `cause`. The caller holds the lock.
@@ -108,6 +163,17 @@ pub(crate) async fn clear_profile(
     .bind(membership_id)
     .execute(&mut *conn)
     .await?;
+    audit_profile_cleared(conn, tenant_id, membership_id, at, cause).await
+}
+
+/// `membership.profile_cleared` {cause}, as the system (plan Ruling R9).
+pub(crate) async fn audit_profile_cleared(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    at: Moment,
+    cause: &'static str,
+) -> Result<(), MembershipError> {
     write_audit(
         conn,
         at,
@@ -117,6 +183,28 @@ pub(crate) async fn clear_profile(
             "membership",
             membership_id,
             json!({ "cause": cause }),
+        ),
+    )
+    .await
+}
+
+/// `membership.profile_retained` {until}, as the system, when an end is first stamped.
+pub(crate) async fn audit_profile_retained(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    at: Moment,
+    until: Date,
+) -> Result<(), MembershipError> {
+    write_audit(
+        conn,
+        at,
+        Audit::system(
+            tenant_id,
+            "membership.profile_retained",
+            "membership",
+            membership_id,
+            json!({ "until": date_param(until) }),
         ),
     )
     .await
@@ -174,28 +262,11 @@ pub(crate) async fn settle_profile(
             .bind(date_param(until))
             .execute(&mut *conn)
             .await?;
-            write_audit(
-                conn,
-                at,
-                Audit::system(
-                    tenant_id,
-                    "membership.profile_retained",
-                    "membership",
-                    membership_id,
-                    json!({ "until": date_param(until) }),
-                ),
-            )
-            .await?;
+            audit_profile_retained(conn, tenant_id, membership_id, at, until).await?;
             Ok(Settled::Retained)
         }
         (None, stamped) => {
-            let cause = if stamped
-                || account_retention(conn, tenant_id, membership_id).await? != RetentionMonths::None
-            {
-                "retention_ended"
-            } else {
-                "membership_ended"
-            };
+            let cause = clearing_cause(conn, tenant_id, membership_id, stamped).await?;
             clear_profile(conn, tenant_id, membership_id, at, cause).await?;
             Ok(Settled::Cleared)
         }
@@ -430,13 +501,10 @@ pub async fn set_retention_months(
         .fetch_all(&mut *tx)
         .await?;
         for (id, stamped) in rows {
-            // Once a membership has ended, no role span changes, so `ended_on` recomputed
-            // here from held roles is the same day as at stamping.
-            let held = held_roles(&mut tx, tenant_id, &[id])
-                .await?
-                .remove(&id)
-                .unwrap_or_default();
-            match keep_until(ended_on(&held, today), months, today) {
+            // Once a membership has ended, its end date is a fact of the past, so
+            // `ended_on_for` recomputed here is the same day as at stamping.
+            let ended = ended_on_for(&mut tx, tenant_id, id, today).await?;
+            match keep_until(ended, months, today) {
                 None => clear_profile(&mut tx, tenant_id, id, at, "retention_shortened").await?,
                 Some(until) if date_param(until) != stamped => {
                     sqlx::query(

@@ -113,7 +113,8 @@ pub fn role_label(held: &[HeldRole], on: Date) -> Option<RoleLabel> {
 
 /// The day a membership ended (#3511, plan Ruling R2): the latest day any of its roles
 /// stopped being held, never later than `today`. A membership revoked long after its roles
-/// ran out ended when they ran out. `today` when it held no role at all.
+/// ran out ended when they ran out. `today` when it held no role at all; persistence's
+/// `ended_on_for` falls back to the revocation date first (final review I2).
 pub fn ended_on(held: &[HeldRole], today: Date) -> Date {
     held.iter()
         .map(|r| r.until)

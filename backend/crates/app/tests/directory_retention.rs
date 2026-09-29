@@ -232,6 +232,7 @@ async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_
     );
     // #3511: the short role ran out and the next one has not started, so this membership
     // has an earlier period too -- `Returned`, not `Named` (M1).
+    // This is plan Ruling R6's gap case (nothing running, a later role booked), not a sitting member.
     assert_eq!(
         name(&pool, &a, renewed, "2026-10-01T10:00:00Z").await,
         MemberName::Returned {

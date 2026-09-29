@@ -144,22 +144,32 @@ impl ActivePeriod {
 
 /// Splits an active membership's roles at its current period (plan Rulings R5, R6).
 /// Periods are runs of held spans that touch or overlap; a gap of a day or more starts a
-/// new one. The current period is the last run, counted from today if it is still to
-/// start.
+/// new one. The current period is the run that contains today, and `earlier` holds the
+/// roles that ended before it began. When today falls in a gap -- nothing running, a later
+/// run booked -- the current period counts from today and `earlier` holds every role that
+/// ended before today (R6's cost: the gap starts a new period).
 pub fn active_period(held: &[HeldRole], today: Date) -> ActivePeriod {
     let mut spans: Vec<(Date, Date)> = held.iter().map(|r| (r.from, r.until)).collect();
     spans.sort();
-    let mut current: Option<(Date, Date)> = None;
+    let mut runs: Vec<(Date, Date)> = Vec::new();
     for (from, until) in spans {
-        current = match current {
-            Some((f, u)) if from <= u => Some((f, u.max(until))),
-            _ => Some((from, until)),
-        };
+        match runs.last_mut() {
+            Some((_, u)) if from <= *u => *u = (*u).max(until),
+            _ => runs.push((from, until)),
+        }
     }
-    let start = current.map_or(today, |(from, _)| from);
-    ActivePeriod {
-        since: start.min(today),
-        earlier: held.iter().filter(|r| r.until < start).cloned().collect(),
+    match runs
+        .iter()
+        .find(|(from, until)| *from <= today && today < *until)
+    {
+        Some(&(start, _)) => ActivePeriod {
+            since: start,
+            earlier: held.iter().filter(|r| r.until < start).cloned().collect(),
+        },
+        None => ActivePeriod {
+            since: today,
+            earlier: held.iter().filter(|r| r.until <= today).cloned().collect(),
+        },
     }
 }
 
@@ -404,6 +414,32 @@ mod tests {
         let p = active_period(&gap, date(2026, 1, 1));
         assert_eq!(p.since, date(2025, 6, 2));
         assert_eq!(p.earlier.len(), 1);
+    }
+
+    #[test]
+    fn a_running_role_plus_a_booked_role_after_a_gap_has_nothing_earlier() {
+        // Kasserer is running today; Leder is booked after a gap. The current period is the
+        // run that contains today, not the booked one, so the name shows all through it.
+        // Mutation check: take the last run as current and `since` becomes today, with
+        // Kasserer counted as earlier.
+        let h = [
+            held(
+                "Kasserer",
+                CapabilityClass::Member,
+                date(2025, 9, 1),
+                date(2026, 9, 1),
+            ),
+            held(
+                "Leder",
+                CapabilityClass::Admin,
+                date(2026, 10, 15),
+                date(2027, 10, 15),
+            ),
+        ];
+        let p = active_period(&h, date(2026, 3, 1));
+        assert_eq!(p.since, date(2025, 9, 1), "the running run's start");
+        assert!(p.earlier.is_empty(), "nothing earlier");
+        assert_eq!(p.label_on(date(2025, 10, 1)), None);
     }
 
     #[test]

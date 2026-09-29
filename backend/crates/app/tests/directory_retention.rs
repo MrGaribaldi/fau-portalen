@@ -454,7 +454,7 @@ async fn member_names_refuses_a_viewer_whose_own_standing_has_lapsed() {
     let year = period(day(2026, 9, 1), day(2027, 9, 1));
 
     // Revoked via `revoke_membership` (leaving), which revokes both the membership row
-    // and the assignment itself -- deliberately redundant (final review M6's pattern):
+    // and the assignment itself -- deliberately redundant (Task 9's pattern, `access.rs`):
     // either alone still blocks access through the other. So no single-line mutation
     // defeats this case; it takes both at once: drop `standing.membership_active` from
     // `evaluate_access`'s guard *and* `!self.revoked` from `AssignmentView::valid_on`

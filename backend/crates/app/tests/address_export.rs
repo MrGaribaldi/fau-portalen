@@ -117,6 +117,14 @@ async fn a_selection_outside_what_the_viewer_sees_is_refused_and_writes_nothing(
             vec![],
             MembershipError::EmptySelection,
         ),
+        // Final review M5: input validation comes before authority, so a viewer with no
+        // standing and an empty selection learns only that the selection is empty.
+        (
+            "none_in",
+            ExportScope::All,
+            vec![],
+            MembershipError::EmptySelection,
+        ),
         (
             "none_in",
             ExportScope::All,
@@ -214,6 +222,11 @@ async fn a_selection_outside_what_the_viewer_sees_is_refused_and_writes_nothing(
         .await,
         Err(MembershipError::NotAuthorized)
     );
+    assert_eq!(
+        exported(&pool).await,
+        0,
+        "the crossed-tenant call wrote nothing"
+    );
 }
 
 #[tokio::test]
@@ -240,6 +253,45 @@ async fn a_frozen_fau_still_hands_over_addresses() {
     .unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(exported(&pool).await, 1);
+    // Final review M5: the FAU-wide scope is audited as "fau".
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&last_params(&pool).await).unwrap(),
+        serde_json::json!({
+            "purpose": "mailto", "recipient_count": 1, "scope": "fau", "group_id": null
+        })
+    );
+}
+
+/// Final review M5: the positive control for a guest. `guest_in` exports from `closed`, a
+/// group they are in, and gets the one member they picked, audited with the group's id.
+#[tokio::test]
+async fn a_guest_exports_from_their_own_group() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+    let member = w.membership("member_in");
+    let got = export_addresses(
+        &pool,
+        w.viewer("guest_in"),
+        export(ExportPurpose::Copy, ExportScope::Group(w.closed), &[member]),
+        at(T0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        got,
+        [ExportedRecipient {
+            membership_id: member,
+            address: DirectoryAddress::Login(email("member-in@example.test")),
+        }]
+    );
+    assert_eq!(exported(&pool).await, 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&last_params(&pool).await).unwrap(),
+        serde_json::json!({
+            "purpose": "copy", "recipient_count": 1, "scope": "group", "group_id": w.closed
+        })
+    );
 }
 
 /// Q4 (controller ruling): a guest reaching for a group outside their own groups is

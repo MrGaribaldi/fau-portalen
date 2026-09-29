@@ -619,4 +619,22 @@ async fn directory_entries_in_the_matrix() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+
+    // Final review M6: a person in two sections carries both group ids, whoever reads them,
+    // and the FAU-wide section adds none. `admin_in` is in `open` and `closed`.
+    let mut want = vec![w.open, w.closed];
+    want.sort_unstable();
+    for viewer in ["admin_in", "member_in", "guest_in"] {
+        let read = member_directory(&pool, w.viewer(viewer), at(T0))
+            .await
+            .unwrap();
+        let entry = read
+            .people
+            .iter()
+            .find(|p| p.membership_id == w.membership("admin_in"))
+            .unwrap();
+        let mut got = entry.group_ids.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "admin_in's group_ids as {viewer} sees them");
+    }
 }

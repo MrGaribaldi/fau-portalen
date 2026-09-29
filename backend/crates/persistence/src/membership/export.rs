@@ -60,6 +60,10 @@ pub struct ExportedRecipient {
 /// itself a disclosure. Each person comes back once, in first-selected order; the session
 /// decrypts contact addresses and builds the link with `fau_domain::directory::address`.
 ///
+/// `recipient_count` counts **people**, each once. It can exceed the number of distinct
+/// addresses in the link or the copied text, since two people may share an address and
+/// `Recipients::new` keeps it once (final review M4).
+///
 /// Refusals, in this order, so none reveals more than the one before it:
 /// 1. `EmptySelection`;
 /// 2. `NotAuthorized`: no standing, or a guest asking for the FAU-wide section;
@@ -92,7 +96,8 @@ pub async fn export_addresses(
         ExportScope::Group(_) => {
             scope_members(&read, req.scope).ok_or(MembershipError::UnknownGroup)?
         }
-        ExportScope::All => scope_members(&read, req.scope).unwrap_or_default(),
+        ExportScope::All => scope_members(&read, req.scope)
+            .expect("scope_members(All) always lists every person the viewer sees"),
     };
     let mut seen = HashSet::new();
     let mut chosen = Vec::new();

@@ -4,12 +4,16 @@
 //! **What a viewer sees** (§4.4, §3.2, §3.3):
 //! - the FAU-wide section, every current member and admin, for members and admins only --
 //!   an FAU-wide audience never includes guests, as viewers or as entries;
-//! - one section per group the viewer may read, through the same facts and the same rule as
-//!   `list_groups` (`readable_groups`), listing its current members as `list_group_members`
-//!   does (`group_members_sql`), guests included, **except an archived group** (controller
-//!   ruling Q6, spec §4.1: the directory shows the present). An archived group's content
-//!   stays readable through the group reads (`get_group`, `list_group_members`) -- archiving
-//!   only removes it as a directory section;
+//! - one section per group the viewer may read, built from the same facts and the same rule
+//!   as `list_groups` (`readable_groups`) and listing its current members as
+//!   `list_group_members` does (`group_members_sql`), guests included. The sections are
+//!   **not** identical to those reads, though: two things are left out (final review M6).
+//!   - **An archived group** is not a section (controller ruling Q6, spec §4.1: the
+//!     directory shows the present). Its content stays readable through the group reads
+//!     (`get_group`, `list_group_members`) -- archiving only removes it as a directory
+//!     section.
+//!   - **A person whose name an Article 17 erasure removed** is in no section, although
+//!     `list_group_members` still lists them as a member of their groups;
 //! - so a guest sees exactly the members of their own (non-archived) groups, and members
 //!   see a guest only inside a group they can read.
 //!
@@ -128,6 +132,10 @@ pub(crate) async fn load(
     for (id, is_viewer, name, contact, login, is_guest) in rows {
         let address = match contact {
             Some(ct) => DirectoryAddress::Contact(Ciphertext::from_stored(ct)),
+            // One login address failing `Email::parse` fails the whole read (`decode()`),
+            // not just that entry (final review M2). Accepted because no stored login
+            // address predates the Q8 tightening of `Email::parse`; revisit if one ever
+            // could, for example after importing accounts from elsewhere.
             None => DirectoryAddress::Login(
                 Email::parse(&login).map_err(|_| MembershipError::decode())?,
             ),

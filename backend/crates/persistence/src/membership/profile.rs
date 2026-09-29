@@ -97,7 +97,8 @@ impl MemberProfile {
 }
 
 /// Writes the profile onto a membership that has just been created, reopened, or was
-/// already current -- `already_current`, from `ensure_membership`'s third return value.
+/// already current or retained -- `already_current`, from `ensure_membership`'s third
+/// return value.
 ///
 /// The display name always takes the accepted profile's value: an acceptance always states
 /// one (`check` requires it), and it is the name that applies from now on.
@@ -106,9 +107,11 @@ impl MemberProfile {
 /// carries none: an already-active, already-named member reached by a second invitation --
 /// a handover to a sitting member, or recovery -- must not have their stored address
 /// silently wiped just because that invitation's acceptance carried no address of its own
-/// (fix round 1, Q10). A freshly created row, or one just reopened from revoked, is never
-/// `already_current`, and has no address to keep either way (D3 cleared it on revocation),
-/// so there the profile's value -- `None` or not -- is written as given.
+/// (fix round 1, Q10). The same holds for a former member returning within their chosen
+/// period (#3511 §3): their retained address stays unless the new profile states one. A
+/// freshly created row, or one whose expired profile was just cleared, is never
+/// `already_current`, and has no address to keep either way, so there the profile's value
+/// -- `None` or not -- is written as given.
 pub(crate) async fn write_profile(
     conn: &mut PgConnection,
     tenant_id: Uuid,

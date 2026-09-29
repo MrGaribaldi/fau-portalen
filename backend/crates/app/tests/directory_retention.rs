@@ -654,14 +654,16 @@ async fn grant(pool: &PgPool, fau: &Fau, m: Uuid, p: Period, at_: &str) {
 }
 
 /// Final review I1 (controller ruling Q13): a membership whose roles simply ran out is not
-/// revoked, so `grant_role` may reach it before the daily sweep has. Under D3 it holds
-/// neither field any more, so the grant clears both in its own transaction, audited the
-/// way the sweep audits, and the returning member states their name again.
+/// revoked, so `grant_role` may reach it before the daily sweep has. With a period of none
+/// (#3511) it holds neither field any more, so the grant clears both in its own
+/// transaction, audited the way the sweep audits, and the returning member states their
+/// name again. A retained profile is restored instead (`member_retention.rs`).
 ///
-/// Mutation check: drop the clearing from `grant_role` and the old name and address
-/// become valid again on the new role (shown RED in the final fix report).
+/// Mutation check: drop the `reopen_profile` call from `grant_role` and the old name and
+/// address become valid again on the new role.
 #[tokio::test]
-async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not() {
+async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not_with_a_period_of_none(
+) {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let a = active_fau(&pool, "admin-a@example.test", at(T0)).await;
@@ -674,6 +676,7 @@ async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not() 
     .await
     .membership_id;
     with_contact(&pool, &a, m, 1).await;
+    set_months_by_sql(&pool, "tilbake@example.test", 0).await;
     let later = "2026-10-05T10:00:00Z";
     assert_eq!(
         fields(&pool, m).await,

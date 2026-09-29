@@ -881,7 +881,7 @@ pub async fn accept_invitation(
         tenant_id,
         account_id,
         req.profile.membership_id,
-        at.today(),
+        at,
     )
     .await?;
     write_profile(&mut tx, tenant_id, &req.profile, already_current).await?;
@@ -963,8 +963,8 @@ pub async fn accept_invitation(
 /// never says which part failed.
 ///
 /// `at` supplies the date the shared "has this membership ended?" predicate
-/// (`profile::membership_ended`, D3) is read against: rule-deciding time always comes from
-/// the caller, never the database clock.
+/// (`profile::membership_ended`, D3) and the retention period are read against:
+/// rule-deciding time always comes from the caller, never the database clock.
 pub async fn prepare_acceptance(
     pool: &PgPool,
     token: &str,
@@ -984,35 +984,57 @@ pub async fn prepare_acceptance(
     if recipient != acceptor.email().as_str() {
         return Err(MembershipError::UnknownInvitation);
     }
-    // Whether the row is current -- has not ended (`profile::membership_ended`, D3 --
-    // shared with `ensure_membership` and with editing) and its name was not erased -- is
-    // what tells the caller "this is an already-current member accepting another
-    // invitation" (a handover to a sitting member, or recovery) -- so it can prefill, and
-    // so `accept_invitation`'s `write_profile` knows to keep a stored contact address the
-    // new profile leaves unstated (fix round 1, Q10). Found-but-not-current (ended, ran
-    // out ahead of the sweep, or erased) still names the row: acceptance reopens it (an
-    // erasure is refused later, by `ensure_membership`'s own `MembershipErased` check).
+    // Whether the row is current or retained is what tells the caller "this person's
+    // profile is still here" (#3511 §3, plan Ruling R7): an active member accepting
+    // another invitation (a handover to a sitting member, or recovery), or a former member
+    // returning within their chosen period. The caller may prefill, and
+    // `accept_invitation`'s `write_profile` keeps a stored contact address the new profile
+    // leaves unstated (fix round 1, Q10). It is computed exactly as `settle_profile` will
+    // compute it under the lock: a row that has not ended (`profile::membership_ended`,
+    // D3), or one that has ended but still holds a name and is within its period -- the
+    // stamped `profile_retained_until`, or, for a natural end the sweep has not yet
+    // noticed, the period computed from the day it ended (`effective_keep_until`).
+    // Found-but-not-current (expired, erased) still names the row: acceptance reopens it,
+    // clearing an expired profile first (an erasure is refused later, by
+    // `ensure_membership`'s own `MembershipErased` check).
     //
-    // Fix round 1, Q11 (minor): without `m.name_erased_at is null`, an unrevoked row
-    // whose name was erased -- or, before migration 0008, one created before names
-    // existed at all -- would report `existing_current = true` with no name to prefill.
+    // Fix round 1, Q11 (minor): without the erasure check, an unrevoked row whose name was
+    // erased -- or, before migration 0008, one created before names existed at all --
+    // would report `existing_current = true` with no name to prefill.
     let sql = format!(
-        "select m.id, (not ({ended}) and m.name_erased_at is null)
+        "select m.id, m.name_erased_at is not null, {ended},
+                m.encrypted_display_name is not null,
+                to_char(m.profile_retained_until, 'YYYY-MM-DD')
            from memberships m join accounts a on a.id = m.account_id
           where m.tenant_id = $1 and a.email = $2",
         ended = super::profile::membership_ended("$3")
     );
-    let existing: Option<(Uuid, bool)> = sqlx::query_as(&sql)
+    let existing: Option<(Uuid, bool, bool, bool, Option<String>)> = sqlx::query_as(&sql)
         .bind(tenant_id)
         .bind(acceptor.email().as_str())
         .bind(date_param(at.today()))
         .fetch_optional(&mut *tx)
         .await?;
-    tx.commit().await?;
-    let (membership_id, existing_current) = match existing {
-        Some((id, current)) => (id, current),
+    let target = match existing {
         None => (Uuid::now_v7(), false),
+        Some((id, erased, ended, named, stamped)) => {
+            let current = !erased
+                && (!ended
+                    || (named
+                        && super::retention::effective_keep_until(
+                            &mut tx,
+                            tenant_id,
+                            id,
+                            stamped.as_deref(),
+                            at.today(),
+                        )
+                        .await?
+                        .is_some()));
+            (id, current)
+        }
     };
+    tx.commit().await?;
+    let (membership_id, existing_current) = target;
     Ok(AcceptanceTarget {
         tenant_id,
         membership_id,
@@ -1025,12 +1047,14 @@ pub async fn prepare_acceptance(
 pub struct AcceptanceTarget {
     pub tenant_id: Uuid,
     pub membership_id: Uuid,
-    /// Whether this is a current membership whose name the caller may prefill: it exists,
-    /// has not ended (`profile::membership_ended`, D3) and its name was not erased -- an
-    /// active member reached by a second invitation (a handover to a sitting member, or
-    /// recovery). The caller may prefill an acceptance form with it rather than asking
-    /// again, and knows `write_profile` will keep the stored contact address if the new
-    /// profile leaves it unstated (fix round 1, Q10).
+    /// Whether this membership's profile is current or retained (#3511 §3, plan Ruling
+    /// R7), so the caller may prefill its name: it exists, its name was not erased, and it
+    /// has not ended (`profile::membership_ended`, D3) -- an active member reached by a
+    /// second invitation (a handover to a sitting member, or recovery) -- or it has ended
+    /// but its name is still within the member's chosen period -- a former member
+    /// returning. The caller may prefill an acceptance form rather than asking again, and
+    /// knows `write_profile` will keep the stored contact address if the new profile
+    /// leaves it unstated (fix round 1, Q10).
     pub existing_current: bool,
 }
 

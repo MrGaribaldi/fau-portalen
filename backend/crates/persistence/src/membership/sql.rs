@@ -24,6 +24,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::error::MembershipError;
+use super::retention::Settled;
 
 /// The two conditions [`USABLE_ACCOUNT`] conjoins, named separately for callers that
 /// need them apart -- `access::effective_access` reads "the membership is not revoked"
@@ -251,58 +252,53 @@ pub(crate) async fn upsert_verified_account(
 /// Finds or creates the account's membership in the tenant, as `expected_id`. A revoked
 /// membership is reopened rather than duplicated (one membership per account per FAU,
 /// #3412); the revocation stays in the audit log. Returns the id, whether it already
-/// existed, and whether it was already current -- not revoked -- before this call.
+/// existed, and whether it holds a current or retained profile.
 ///
 /// `expected_id` is the id the caller encrypted the member's profile for (#3502): the
 /// existing membership's id, or a fresh one that becomes the new row's. An existing
 /// membership under any other id is `AcceptanceTargetChanged`, so a profile can never land
 /// on a row its associated data does not name; an erased one is `MembershipErased`.
 ///
-/// The third value, `already_current`, is true exactly when an existing row had not
-/// ended (`profile::membership_ended`, D3): an active member accepting a second
-/// invitation (a handover to a sitting member, or recovery). `write_profile` uses it to
-/// decide whether to keep a stored contact address the caller's profile leaves unstated
-/// (fix round 1, Q10) -- a freshly created or freshly reopened row is never
-/// `already_current`, and has no address to keep either way, since D3 clears both fields
-/// once a membership ends. A row whose roles simply ran out, re-invited before the sweep
-/// reaches it, is `already_current = false` too: it holds no address to keep (controller
-/// ruling, Task 5 review).
+/// An existing row is reopened through `retention::reopen_profile` (#3511 §3, plan Ruling
+/// R4): restored if its profile is still within the member's chosen period, cleared first
+/// if the period is over.
+///
+/// The third value, `already_current`, is true exactly when the existing row's profile is
+/// current (an active member accepting a second invitation: a handover to a sitting
+/// member, or recovery) or retained (a former member returning within their period).
+/// `write_profile` uses it to keep a stored contact address the caller's profile leaves
+/// unstated (fix round 1, Q10; spec §3). A freshly created row, one whose expired profile
+/// was just cleared, or one with no field at all is `already_current = false`: it has no
+/// address to keep.
 pub(crate) async fn ensure_membership(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     account_id: Uuid,
     expected_id: Uuid,
-    today: Date,
+    at: Moment,
 ) -> Result<(Uuid, bool, bool), MembershipError> {
-    let sql = format!(
-        "select m.id, m.revoked_at is not null, m.name_erased_at is not null, {}
+    let existing: Option<(Uuid, bool)> = sqlx::query_as(
+        "select m.id, m.name_erased_at is not null
            from memberships m
           where m.tenant_id = $1 and m.account_id = $2 for update",
-        super::profile::membership_ended("$3")
-    );
-    let existing: Option<(Uuid, bool, bool, bool)> = sqlx::query_as(&sql)
-        .bind(tenant_id)
-        .bind(account_id)
-        .bind(date_param(today))
-        .fetch_optional(&mut *conn)
-        .await?;
-    if let Some((id, was_revoked, erased, ended)) = existing {
+    )
+    .bind(tenant_id)
+    .bind(account_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((id, erased)) = existing {
         if id != expected_id {
             return Err(MembershipError::AcceptanceTargetChanged);
         }
         if erased {
             return Err(MembershipError::MembershipErased);
         }
-        if was_revoked {
-            sqlx::query(
-                "update memberships set revoked_at = null where tenant_id = $1 and id = $2",
-            )
-            .bind(tenant_id)
-            .bind(id)
-            .execute(&mut *conn)
-            .await?;
-        }
-        return Ok((id, true, !ended));
+        let settled = super::retention::reopen_profile(conn, tenant_id, id, at).await?;
+        return Ok((
+            id,
+            true,
+            matches!(settled, Settled::Active | Settled::Retained),
+        ));
     }
     sqlx::query("insert into memberships (tenant_id, id, account_id) values ($1, $2, $3)")
         .bind(tenant_id)

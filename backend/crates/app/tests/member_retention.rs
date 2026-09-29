@@ -3,11 +3,12 @@
 //! the sweep clears them after; others see role and year throughout.
 
 mod common;
+use common::groups::seed_group;
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
 use fau_domain::membership::period::Period;
-use fau_domain::membership::vocabulary::CapabilityClass;
+use fau_domain::membership::vocabulary::{CapabilityClass, RoleName, Visibility};
 use fau_persistence::membership::*;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -246,6 +247,7 @@ async fn while_retained_others_see_only_role_and_year() {
     let a = active_fau(&pool, "admin@example.test", at(T0)).await;
     let m = join(&pool, &a, "kept@example.test", year()).await;
     leave(&pool, &a, m, "2026-10-01T10:00:00Z").await;
+    assert_eq!(state(&pool, m).await.2.as_deref(), Some("2027-01-01"));
     let viewer = Viewer {
         tenant_id: a.tenant_id,
         membership_id: a.admin_membership_id,
@@ -348,4 +350,202 @@ async fn a_revocation_after_the_period_is_over_clears_with_retention_ended() {
             r#"{"cause": "retention_ended"}"#.to_owned()
         )]
     );
+}
+
+async fn reinvite(
+    pool: &PgPool,
+    fau: &Fau,
+    address: &str,
+    role: RoleChoice,
+    p: Period,
+    at_: &str,
+) -> (bool, Uuid) {
+    let issued = issue_invitation(
+        pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            recipient: email(address),
+            roles: vec![OfferedRole { role, period: p }],
+            handover_grant_id: None,
+            message: None,
+        },
+        at(at_),
+    )
+    .await
+    .unwrap();
+    let token = issued.token.expose().to_owned();
+    let target = prepare_acceptance(pool, &token, &verified(address), at(at_))
+        .await
+        .unwrap();
+    let accepted = accept_invitation(
+        pool,
+        AcceptInvitation {
+            token,
+            acceptor: verified(address),
+            admin_end_override: None,
+            // A returner states a name again; the address is left unstated.
+            profile: MemberProfile {
+                membership_id: target.membership_id,
+                encrypted_display_name: envelope(9),
+                encrypted_contact_email: None,
+            },
+        },
+        at(at_),
+    )
+    .await
+    .unwrap();
+    (target.existing_current, accepted.membership_id)
+}
+
+async fn contact(pool: &PgPool, m: Uuid) -> Option<Vec<u8>> {
+    sqlx::query_scalar("select encrypted_contact_email from memberships where id = $1")
+        .bind(m)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Spec §6 "a return within the period": the same row, recognised (`existing_current`),
+/// the retained address kept, the date cleared, `profile_restored` audited. Returning as
+/// a guest, the person sees only their own group (spec §6 "a guest who returns").
+///
+/// Mutation checks: drop the `settle` in `reopen_profile` and an expired return keeps the
+/// old address (the next test); drop the `profile_retained_until = null` and 0009's
+/// checks are fine but the returner stays stamped ("no longer retained" below). Report
+/// the retained row as not current in `prepare_acceptance` or `ensure_membership` and
+/// `recognised` fails.
+#[tokio::test]
+async fn a_guest_returning_within_the_period_is_recognised_and_sees_only_their_group() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "back@example.test", year()).await;
+    with_contact(&pool, &a, m, 1).await;
+    leave(&pool, &a, m, "2026-10-01T10:00:00Z").await;
+
+    let group = seed_group(&pool, &a, Visibility::Open).await;
+    // A second open group the guest must not reach, so "only their own" can fail.
+    let _other = seed_group(&pool, &a, Visibility::Open).await;
+    let guest = RoleChoice::New {
+        name: RoleName::parse("Gjest").unwrap(),
+        capability: CapabilityClass::Guest,
+        group_id: Some(group),
+    };
+    let (recognised, again) = reinvite(
+        &pool,
+        &a,
+        "back@example.test",
+        guest,
+        period(day(2026, 11, 1), day(2027, 2, 1)),
+        "2026-11-01T10:00:00Z",
+    )
+    .await;
+    assert!(recognised, "within the period: existing_current");
+    assert_eq!(again, m, "the same row");
+    assert_eq!(
+        contact(&pool, m).await,
+        Some(envelope(1).as_bytes().to_vec()),
+        "address kept"
+    );
+    assert_eq!(state(&pool, m).await.2, None, "no longer retained");
+    assert!(audits(&pool, m)
+        .await
+        .iter()
+        .any(|(a, _)| a == "membership.profile_restored"));
+    // The sweep after the old period's end leaves an active returner alone.
+    clear_ended_profiles(&pool, at("2027-01-05T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(state(&pool, m).await, (true, true, None));
+    // A guest reaches only their own group.
+    let viewer = Viewer {
+        tenant_id: a.tenant_id,
+        membership_id: m,
+    };
+    let groups = list_groups(&pool, viewer, at("2026-11-02T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(
+        groups.iter().map(|g| g.group_id).collect::<Vec<_>>(),
+        [group]
+    );
+}
+
+/// Spec §6 "a return after the period": expired first, so nothing comes back and the
+/// person is not `existing_current`.
+#[tokio::test]
+async fn returning_after_the_period_is_a_fresh_start() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "late@example.test", year()).await;
+    with_contact(&pool, &a, m, 1).await;
+    leave(&pool, &a, m, "2026-10-01T10:00:00Z").await;
+    // No sweep has run since the period ended on 2027-01-01.
+    let (recognised, again) = reinvite(
+        &pool,
+        &a,
+        "late@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2027, 2, 1), day(2028, 2, 1)),
+        "2027-02-01T10:00:00Z",
+    )
+    .await;
+    assert!(!recognised);
+    assert_eq!(again, m);
+    assert_eq!(contact(&pool, m).await, None, "the expired address is gone");
+    assert!(audits(&pool, m)
+        .await
+        .iter()
+        .any(|(a, p)| a == "membership.profile_cleared" && p.contains("retention_ended")));
+}
+
+/// `grant_role` to a membership whose roles ran out: restore if retained, clear if expired
+/// (spec §3, replacing #3502's clear_if_ended).
+#[tokio::test]
+async fn a_grant_restores_a_retained_profile_and_clears_an_expired_one() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let short = period(day(2026, 9, 1), day(2026, 10, 1));
+    let kept = join(&pool, &a, "kept@example.test", short).await;
+    let gone = join(&pool, &a, "gone@example.test", short).await;
+    for m in [kept, gone] {
+        with_contact(&pool, &a, m, 1).await;
+    }
+    let grant_at = |m: Uuid, at_: &'static str, p: Period| {
+        let pool = pool.clone();
+        let tenant_id = a.tenant_id;
+        let admin = a.admin_membership_id;
+        async move {
+            grant_role(
+                &pool,
+                GrantRole {
+                    tenant_id,
+                    actor_membership_id: admin,
+                    membership_id: m,
+                    role: new_role("Nytt verv", CapabilityClass::Member),
+                    period: p,
+                },
+                at(at_),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    grant_at(
+        kept,
+        "2026-11-01T10:00:00Z",
+        period(day(2026, 11, 1), day(2027, 11, 1)),
+    )
+    .await;
+    assert_eq!(state(&pool, kept).await, (true, true, None));
+    grant_at(
+        gone,
+        "2027-02-01T10:00:00Z",
+        period(day(2027, 2, 1), day(2028, 2, 1)),
+    )
+    .await;
+    assert_eq!(state(&pool, gone).await, (false, false, None));
 }

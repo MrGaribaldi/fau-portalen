@@ -56,6 +56,15 @@ async fn fields(pool: &PgPool, membership: Uuid) -> (Option<Vec<u8>>, Option<Vec
     .unwrap()
 }
 
+async fn set_months_by_sql(pool: &PgPool, address: &str, months: i32) {
+    sqlx::query("update accounts set retention_months = $2 where email = $1")
+        .bind(address)
+        .bind(months)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 async fn pending_invitations(pool: &PgPool, recipient: &str) -> i64 {
     sqlx::query_scalar(
         "select count(*) from invitations where recipient_email = $1 and accepted_at is null",
@@ -231,8 +240,8 @@ async fn a_non_uuidv7_membership_id_is_refused_before_anything_is_written() {
     }
 }
 
-// Task 5: passes a revoked member through re-acceptance; under #3511 the revocation keeps
-// the name for the default period, so this fails until Task 5 settles re-acceptance.
+/// With a period of none (#3511), so revocation clears at once as under D3; a retained
+/// returner is covered in `member_retention.rs`.
 #[tokio::test]
 async fn a_profile_for_another_membership_is_refused() {
     let db = TestDb::migrated().await;
@@ -248,6 +257,7 @@ async fn a_profile_for_another_membership_is_refused() {
         t0,
     )
     .await;
+    set_months_by_sql(&pool, "kari@example.test", 0).await;
     revoke_membership(
         &pool,
         RevokeMembership {
@@ -632,16 +642,11 @@ async fn an_already_current_membership_stating_a_fresh_address_has_it_replace_th
     );
 }
 
-/// Controller ruling, Task 5 review: a membership whose roles simply ran out -- not
-/// revoked, but the retention sweep hasn't reached it yet -- is `already_current = false`
-/// too, the same as a revoked one. Re-invited the same day, before the sweep, it holds no
-/// address to keep.
-///
-/// Mutation check: revert `ensure_membership`'s third return value to `!was_revoked`
-/// (dropping the shared `membership_ended` check), and this fails: the stale address (2)
-/// survives the second acceptance instead of being dropped.
-#[tokio::test]
-async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_drops_its_address() {
+/// Kari joins with a role ending 2026-10-01 and a stored address (2), her account is set
+/// to `months` (or left at the default), and the same day her role runs out, ahead of any
+/// sweep, she is invited back and accepts stating a name (3) and no address. Returns the
+/// second `prepare_acceptance`'s `existing_current` and her fields afterwards.
+async fn ran_out_and_reinvited(months: Option<i32>) -> (bool, (Option<Vec<u8>>, Option<Vec<u8>>)) {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
@@ -684,6 +689,9 @@ async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_dro
     .await
     .unwrap()
     .membership_id;
+    if let Some(months) = months {
+        set_months_by_sql(&pool, "kari@example.test", months).await;
+    }
 
     // Her only role ends 2026-10-01. The same day, ahead of any sweep, she is invited
     // back to a fresh role.
@@ -711,10 +719,6 @@ async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_dro
             .await
             .unwrap();
     assert_eq!(target_again.membership_id, kari, "the same row is reused");
-    assert!(
-        !target_again.existing_current,
-        "roles had run out, ahead of the sweep"
-    );
 
     accept_invitation(
         &pool,
@@ -732,10 +736,48 @@ async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_dro
     )
     .await
     .unwrap();
+    (target_again.existing_current, fields(&pool, kari).await)
+}
+
+/// Controller ruling, Task 5 review, with a period of none (#3511): a membership whose
+/// roles simply ran out -- not revoked, but the retention sweep hasn't reached it yet --
+/// is `already_current = false` too, the same as a revoked one. Re-invited the same day,
+/// before the sweep, it holds no address to keep.
+///
+/// Mutation check: drop the `settle_profile` call from `retention::reopen_profile`, and
+/// this fails: the stale address (2) survives the second acceptance instead of being
+/// dropped. (Making `ensure_membership`'s third value `true` for every existing row is an
+/// equivalent mutant now: an expired profile is cleared before `write_profile` runs, so
+/// there is no address left to keep.)
+#[tokio::test]
+async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_drops_its_address_with_a_period_of_none(
+) {
+    let (existing_current, fields) = ran_out_and_reinvited(Some(0)).await;
+    assert!(!existing_current, "roles had run out, ahead of the sweep");
     assert_eq!(
-        fields(&pool, kari).await,
+        fields,
         (Some(envelope(3).as_bytes().to_vec()), None),
         "an ended membership's old address is not kept, even though the row was never revoked"
+    );
+}
+
+/// The default-period twin (#3511 §3): the same return is within the period, so it is
+/// `existing_current` and the retained address stays.
+///
+/// Mutation check: make `ensure_membership`'s third return value `Settled::Active` only,
+/// and the address (2) is dropped.
+#[tokio::test]
+async fn a_membership_whose_roles_ran_out_is_existing_current_and_keeps_its_address_within_the_period(
+) {
+    let (existing_current, fields) = ran_out_and_reinvited(None).await;
+    assert!(existing_current, "ended, but within the default period");
+    assert_eq!(
+        fields,
+        (
+            Some(envelope(3).as_bytes().to_vec()),
+            Some(envelope(2).as_bytes().to_vec())
+        ),
+        "the retained address is kept"
     );
 }
 

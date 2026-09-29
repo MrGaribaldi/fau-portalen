@@ -198,6 +198,43 @@ pub(crate) async fn settle_profile(
     }
 }
 
+/// A returner (#3511 §3, plan Ruling R4): settles the profile -- an expired period is
+/// cleared, a retained one kept -- then makes the row current again in one statement
+/// (`revoked_at` and `profile_retained_until` null together, as migration 0009's checks
+/// require), and audits `membership.profile_restored` when something was retained. The
+/// caller holds the tenant lock and adds the role in the same transaction.
+pub(crate) async fn reopen_profile(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    membership_id: Uuid,
+    at: Moment,
+) -> Result<Settled, MembershipError> {
+    let settled = settle_profile(conn, tenant_id, membership_id, at).await?;
+    sqlx::query(
+        "update memberships set revoked_at = null, profile_retained_until = null
+          where tenant_id = $1 and id = $2",
+    )
+    .bind(tenant_id)
+    .bind(membership_id)
+    .execute(&mut *conn)
+    .await?;
+    if settled == Settled::Retained {
+        write_audit(
+            conn,
+            at,
+            Audit::system(
+                tenant_id,
+                "membership.profile_restored",
+                "membership",
+                membership_id,
+                json!({}),
+            ),
+        )
+        .await?;
+    }
+    Ok(settled)
+}
+
 /// The daily sweep (#3511): settles every ended membership that still holds a field and
 /// whose period is not known to be running: an end not yet noticed is stamped, and an
 /// expired period is cleared. Per FAU, under that FAU's lock, each row re-decided under

@@ -14,8 +14,7 @@ use super::events::{notify, Change};
 use super::groups::remove_from_all_groups;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
 use super::names::held_roles;
-use super::profile::membership_ended;
-use super::retention::account_retention;
+use super::retention::{account_retention, reopen_profile};
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
     membership_and_account_state, parse_date, require_admin, require_open, ts_param, write_audit,
@@ -66,7 +65,8 @@ pub async fn grant_role(
     )
     .await?;
     let (role_id, capability, period) = resolved[0];
-    clear_if_ended(&mut tx, req.tenant_id, req.membership_id, at).await?;
+    // Restore if retained, clear if expired (#3511 §3, Ruling R4).
+    reopen_profile(&mut tx, req.tenant_id, req.membership_id, at).await?;
     let assignment_id = insert_assignment(
         &mut tx,
         req.tenant_id,
@@ -97,49 +97,6 @@ pub async fn grant_role(
     .await?;
     tx.commit().await?;
     Ok(assignment_id)
-}
-
-/// Under D3 an ended membership holds neither a name nor a contact address, but one whose
-/// roles simply ran out is not revoked, so the daily sweep (`clear_ended_profiles`) may not
-/// have reached it yet. A new role must not make the old fields valid again, so before the
-/// assignment is inserted, and under the tenant lock the caller holds, this clears both
-/// when the membership has ended today, audited exactly as the sweep audits it (final
-/// review I1, controller ruling Q13). The returning member states their name again.
-async fn clear_if_ended(
-    conn: &mut PgConnection,
-    tenant_id: Uuid,
-    membership_id: Uuid,
-    at: Moment,
-) -> Result<(), MembershipError> {
-    let cleared: Option<Uuid> = sqlx::query_scalar(&format!(
-        "update memberships m
-            set encrypted_display_name = null, encrypted_contact_email = null
-          where m.tenant_id = $1 and m.id = $2
-            and (m.encrypted_display_name is not null or m.encrypted_contact_email is not null)
-            and {}
-         returning m.id",
-        membership_ended("$3")
-    ))
-    .bind(tenant_id)
-    .bind(membership_id)
-    .bind(date_param(at.today()))
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some(id) = cleared {
-        write_audit(
-            conn,
-            at,
-            Audit::system(
-                tenant_id,
-                "membership.profile_cleared",
-                "membership",
-                id,
-                json!({ "cause": "membership_ended" }),
-            ),
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

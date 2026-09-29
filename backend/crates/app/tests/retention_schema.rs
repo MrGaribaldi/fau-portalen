@@ -165,10 +165,19 @@ async fn a_retention_date_needs_something_to_retain_and_an_erasure_clears_it() {
     )
     .await
     .unwrap();
-    let err = exec(
+    // An erasure takes the date with the fields (the trigger, final review I3), and an
+    // erased row cannot be stamped again.
+    exec(
         &pool,
         "update memberships set name_erased_at = now(),
                 encrypted_display_name = null, encrypted_contact_email = null where id = $1",
+        m,
+    )
+    .await
+    .unwrap();
+    let err = exec(
+        &pool,
+        "update memberships set profile_retained_until = '2027-01-01' where id = $1",
         m,
     )
     .await
@@ -178,6 +187,56 @@ async fn a_retention_date_needs_something_to_retain_and_an_erasure_clears_it() {
         constraint_name(&err).as_deref(),
         Some("memberships_erasure_clears_retention" | "memberships_retention_needs_a_field")
     ));
+}
+
+/// Final review I3: a binary from before 0009 clears the two fields -- in its sweep, its
+/// erasure and its `clear_if_ended` -- without knowing `profile_retained_until`. The
+/// `memberships_retention_follows_fields` trigger nulls the date with them, so old code on
+/// a stamped row is accepted, as the runtime role, and leaves no date behind.
+///
+/// Mutation check: drop the trigger from 0009 and both updates are refused by
+/// `memberships_retention_needs_a_field`.
+#[tokio::test]
+async fn old_code_clearing_a_stamped_row_takes_the_date_with_it() {
+    let db = TestDb::migrated().await;
+    let admin = db.admin_pool();
+    let app = db.app_pool().await;
+    for erase in [false, true] {
+        let (_, m) = seed(&admin).await;
+        set(&admin, m, "encrypted_display_name", Some(envelope(1, 60)))
+            .await
+            .unwrap();
+        set(&admin, m, "encrypted_contact_email", Some(envelope(1, 60)))
+            .await
+            .unwrap();
+        exec(
+            &admin,
+            "update memberships set revoked_at = now(), profile_retained_until = '2027-01-01'
+              where id = $1",
+            m,
+        )
+        .await
+        .unwrap();
+        let old_code = if erase {
+            "update memberships set name_erased_at = now(),
+                    encrypted_display_name = null, encrypted_contact_email = null
+              where id = $1"
+        } else {
+            "update memberships set encrypted_display_name = null, encrypted_contact_email = null
+              where id = $1"
+        };
+        exec(&app, old_code, m)
+            .await
+            .unwrap_or_else(|e| panic!("erase = {erase}: {e}"));
+        let date: Option<String> = sqlx::query_scalar(
+            "select to_char(profile_retained_until, 'YYYY-MM-DD') from memberships where id = $1",
+        )
+        .bind(m)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(date, None, "erase = {erase}");
+    }
 }
 
 #[tokio::test]

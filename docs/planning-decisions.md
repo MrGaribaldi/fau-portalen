@@ -3328,13 +3328,11 @@ member's name and contact address are kept hidden for their chosen period (3 mon
 that they are used only to recognise the member if they return; that other members see only role
 and year; and that the member can shorten their period to none at any time.
 
-**M5 (R10):** the account's login email lapses following the member's own `retention_months`
-(none, 3, 6, 12 or 24 months; at once for none), replacing ADR-003 §6a's fixed three months. This
-binds #3426, which builds the lapse; #3511 only owns the field.
+**M5:** the account lapse follows `retention_months` (entry above); binds #3426.
 
-**M6 (Task 9):** a membership that ends, revoked or by its roles running out, leaves every group
-it was added to by hand, audited as the system with cause `membership_ended`. A returner starts
-with no groups; giving further access means giving a role, not restoring old group membership.
+**M6:** group memberships end with the membership, however it ends (entry above); ended
+memberships are removed by the sweep or on return, audited as the system with cause
+`membership_ended`.
 
 **Open question for Erik:** `add_group_member` still accepts a membership whose roles simply ran
 out (only a revoked one is refused). The row is removed by the next sweep or return and grants

@@ -2,6 +2,7 @@
 //! `tests/dependency_boundary.rs` enforces that against this crate's own manifest.
 
 pub mod authz;
+pub mod directory;
 pub mod email;
 pub mod error_code;
 pub mod membership;

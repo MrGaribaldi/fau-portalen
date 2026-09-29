@@ -169,6 +169,31 @@ impl GroupName {
     }
 }
 
+/// What a member goes by in one FAU ("Kari Nordmann"), captured when they accept an
+/// invitation (groups design §4.1). Per membership, so one person can go by different names
+/// in two FAU-er. Content, so it is encrypted before it reaches persistence, and `Debug` is
+/// redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DisplayName(String);
+
+impl DisplayName {
+    pub const MAX_CHARS: usize = 100;
+
+    pub fn parse(raw: &str) -> Result<Self, NameError> {
+        validate_name(raw, Self::MAX_CHARS).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DisplayName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DisplayName([redacted])")
+    }
+}
+
 impl fmt::Debug for GroupName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("GroupName([redacted])")
@@ -274,6 +299,10 @@ mod tests {
         assert!(!format!("{:?}", Some(&role)).contains("Kari"));
         assert!(!format!("{fau:#?}").contains("Nordre"));
 
+        let person = DisplayName::parse("Kari Nordmann").unwrap();
+        assert_eq!(format!("{person:?}"), "DisplayName([redacted])");
+        assert!(!format!("{:?}", Some(&person)).contains("Kari"));
+
         let group = GroupName::parse("Oppfølging av sak med rektor").unwrap();
         assert_eq!(format!("{group:?}"), "GroupName([redacted])");
         assert!(!format!("{:?}", Some(&group)).contains("rektor"));
@@ -295,6 +324,18 @@ mod tests {
             "Nordre Skole FAU"
         );
         assert_eq!(FauName::parse(&"x".repeat(201)), Err(NameError::TooLong));
+
+        assert_eq!(DisplayName::parse(" Kari ").unwrap().as_str(), "Kari");
+        assert!(DisplayName::parse(&"å".repeat(100)).is_ok());
+        assert_eq!(
+            DisplayName::parse(&"å".repeat(101)),
+            Err(NameError::TooLong)
+        );
+        assert_eq!(DisplayName::parse(""), Err(NameError::Empty));
+        assert_eq!(
+            DisplayName::parse("Kari\tN"),
+            Err(NameError::ControlCharacter)
+        );
 
         assert_eq!(GroupName::parse(" Dugnad ").unwrap().as_str(), "Dugnad");
         assert!(GroupName::parse(&"ø".repeat(100)).is_ok());

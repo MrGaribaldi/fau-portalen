@@ -3059,3 +3059,214 @@ The deferred items are filed on #3417, #3419 and #3503.
   memory exhausting Docker's 64 MB `/dev/shm`. The container was recreated on the same data
   volume, and verbose connection logging is still on. If a full-parallelism
   `cargo test --workspace` run no longer crashes it, the hypothesis holds.
+
+## #3502 started; dev database crash fixed — 28 September 2026
+
+- Erik asked the agent to start **#3502, the member directory**, after the database check and the
+  branch cleanup. He has little time to review today. It is planned from the accepted #3500 design
+  (docs/groups-directory-chat-calendar-design.md §4) and executed on branch `directory-3502`, the
+  same way #3501 was. Merging and pushing stay Erik's.
+- **The dev Postgres crash is fixed, with high confidence.** With `shm_size: 256m`, three
+  default-parallelism runs passed 701/701 with no crash. A 4× stress test followed, with four
+  concurrent workspace runs. It hit the connection cap (98 of 100 connections, 41 refused
+  cleanly) and caused no backend crash or restart. Before the change, a single run could crash
+  it. `--test-threads=4` is no longer needed. The one formal causal test left would be reverting
+  to 64 MB.
+
+## Erik's answers from the decision board — 28 September 2026
+
+Answered in one pass from the decision board (D1–D21). Recorded as given, with the agent's
+reading where a note needed interpreting; readings marked *(reading)* await Erik's confirmation.
+
+**#3501**
+- **D1:** confirmed that archived groups can be closed and never reopened. Erik's note: "we do need
+  to be able to un-archive and open them if they start paying us again, if they haven't been
+  closed for so long we have deleted them".
+  *(reading)* This concerns reactivating an **archived FAU** (#3509): paying restores the FAU and
+  its content until the keys are destroyed. It is recorded as a #3509 requirement. If Erik meant
+  un-archiving individual groups too, that becomes a follow-up to #3501's one-way group archive.
+- **D2:** Erik's intent is that admins of a **pending** FAU (one being set up) must be able to
+  handle join requests. A **break-glass admin** must be able to resolve requests, so that a
+  closed FAU can take new members and be reopened.
+  This reverses execution ruling P4 for pending and closed FAUs, and adds a break-glass request
+  resolver. It becomes a follow-up card; the question was only whether an admin could read the
+  message text attached to a request.
+
+**#3502**
+- **D3:** a display name is valid only while the membership is active. When it ends, the name is
+  replaced by **role and year** (for example "Leder 2025–2026"), "which helps keep things GDPR
+  valid". This overrides spec §4.2 ("the name stays after the membership ends") and plan rulings
+  R7–R9. The name is cleared when the membership ends, like the contact email, so there is no name
+  history to keep. #3502's remaining tasks are amended before Task 4.
+- **D4:** Sámi collation data is added when a Sámi locale is added.
+- **D5:** confirmed that archived groups are left out of the directory.
+
+**Security, before real data (#3507, #3432)**
+- **D6:** adopt **per-data-key recovery copies**, sealed to an offline recovery public key.
+- **D7:** the offline recovery private key is held by Erik, in Proton Pass, as a separate item
+  from the unseal key.
+- **D8:** the finalizer runs **on Erik's own machine, by hand, for now**, with a notification when
+  a run is due. A small VM takes over later. The reason given: during the pilot, FAU-er may come,
+  go and return, and returning should be easy.
+- **D9:** old copies may keep deleted keys for **90 days**, so that they always outlast the
+  two-month summer holiday.
+- **D10:** access-request and invitation messages are accepted as not recoverable after an
+  OpenBao loss.
+- **D11:** nobody else can unseal for now. The outage risk is accepted until the pilot.
+- **D12:** the pilot gate adds cache-aware revocation (#3417), MFA proof (#3414) and live audit
+  alerts (#3442), alongside the replica (#3507).
+
+**#3509 archive**
+- **D13:** the design is accepted.
+- **D14:** the 365 days count from the soft delete (the lock).
+- **D15:** the retention basis goes to legal (#3426).
+
+**Older questions**
+- **D16 (#3433):** **full DOCX import is in the MVP**, to help new FAU-er onboard and stay.
+  Private comments (#3491) are not needed, but nice to have if they are easy.
+  *(reading)* On controlled publication (#3492), Erik's note calls it "the easy import", which
+  reads as a mix-up with import. Whether publication itself is in the MVP is still to confirm.
+- **D17 (#3447):** confirmed that mammoth is the default DOCX converter and that PDFs stay
+  attachments with text extraction. The storage format was answered by #3490. Tiptap's own DOCX
+  import is not used.
+- **D18 (#3488):** authorized: the etcd-s3-retention drop-in on master, applied at a quiet moment
+  after the plan is shown, plus the upstream request to add the setting to infra-tools' template.
+- **D19 (#3496, #3497):** Erik files both upstream issues himself.
+- **D20 (#3486):** the destructive probe is not run, and the question is closed.
+- **D21 (#3413):** the end-to-end review is closed.
+
+## Erik's clarifications on D1, D16 and D18 — 28 September 2026
+
+- **D1:** "un-archive when they start paying again" means the **FAU** (#3509 reactivation). A group
+  that has been archived is not reopened; it can be **recreated** instead. #3501's one-way group
+  archive stands.
+- **D16:** **controlled publication is in the MVP**: public documents such as meeting minutes
+  (#3492). The import side supports reading HTML in, and full DOCX import is also in the MVP (D16).
+  Erik's framing: the project has grown beyond the one-week test, and is building **a full MVP for
+  testing with actual FAU-er**.
+- **D18:** the etcd retention drop-in can be applied whenever it suits, because nothing uses the
+  cluster yet. The change is still planned and inspected before it is applied.
+
+## #3502 built: the member directory, rulings for Erik's review — 28 September 2026
+
+Built from the accepted #3500 design (§4) on branch `directory-3502`. The plan's rulings are in
+docs/superpowers/plans/2026-09-28-member-directory-3502.md, and these are the ones that change
+behaviour or bind later work. All are open to challenge:
+
+- **No screen yet.** #3502 builds the schema, the domain rules and the persistence functions.
+  The htmx screen, its routes and the TypeScript selection module wait for #3417's sessions.
+- **Names and contact addresses are record-key envelopes on `memberships`** (migration 0008),
+  bound to the membership id. Acceptance is therefore two calls: `prepare_acceptance` names the
+  FAU and the membership, the session encrypts, and `accept_invitation` stores. A mismatch is
+  refused, never stored. The registrant's name is captured at activation the same way.
+- **A name is valid only while the membership is active (Erik's D3, 28 September).** When the
+  membership ends (it is revoked, or no role is running or still to come), the name is cleared
+  like the contact address. Revocation clears both in the same statement, and two database
+  checks enforce it. A daily sweep clears a membership whose roles ran out, at once and without
+  the account's three-month grace. There is therefore no name history.
+- **History shows an ended membership as its role and year** ("Leder 2025–2026"), computed from
+  the role assignments when history is rendered, never stored. The role is the one held on the
+  day of the event: admin class first, then the earliest start. After every role has ended, it
+  is the last role that ended. It is one role, without unit or cohort. The years are the
+  calendar years the assignment was actually held. The catalogue strings are proposals:
+  "{role} {year}" and "{role} {firstYear}–{lastYear}".
+- **Who edits.** A member edits their own name, and an admin corrects the name of anyone still
+  active. An ended membership takes no name (`MembershipEnded`). Only the member sets their
+  contact address.
+- **Article 17 erasure** is a storage step for #3426: both fields go, the person is not listed,
+  history shows "Tidligere medlem" (not even role and year, since a single-holder role with its
+  year identifies the person), and the old membership cannot be rejoined.
+- **What the directory shows.** The FAU-wide section, for members and admins only, never lists
+  a guest. Beyond it, each group the viewer may read, through the same rule and SQL as the group
+  reads. Only people with standing today are listed. A group the viewer cannot read never
+  appears as part of a person.
+- **Collation is ICU4X** (`icu_collator` 2.3), already mostly in the dependency tree. Bokmål and
+  Nynorsk are tailored. Sámi falls back to the root order until ICU4X data is generated for it,
+  which D4 places at the time a Sámi locale is added.
+- **Links and copying.** The `mailto:` link joins addresses with a bare `,` (RFC 6068), and the
+  copy text with `, `, with `; ` ready for Outlook. Bcc is the default above 10 distinct
+  addresses. The length guard allows 1,800 characters and refuses 1,801.
+- **Every export is server-side and audited:** the purpose, the count of people and the scope
+  (all, the FAU-wide section, or one group). No addresses and no member ids. Allowed while
+  frozen.
+
+**Open questions for Erik:** none from this card. D3 closed the name-history question, and D4
+closed the Sámi one.
+
+**Spec against code:** ADR-003 §6 still lists member names as plaintext. The accepted #3500
+spec and the key-service design encrypt them, and the later documents win. Spec §4.2's "the
+name stays after the membership ends" is overridden by D3 and needs updating in the spec. Spec
+§4.3's "`, ` per RFC 6068" is split: `,` in the link and `, ` in the copy text.
+
+**Execution notes, beyond the plan's own rulings above:**
+
+- Erik's D3: names only while active; after that, role and year, or "Tidligere medlem" on
+  erasure. Spec §4.2 was amended to match.
+- D4 and D5 were confirmed.
+- `Email::parse` now validates domain labels, so a comma or semicolon can't split an address.
+- Redacted `Debug` is a bare "[redacted]", without a character count.
+- Re-accepting keeps a stored contact address, and `prepare_acceptance` reports
+  `existing_current`.
+- Non-UUIDv7 membership ids are refused.
+- One shared `membership_ended` predicate is used everywhere.
+- Archived groups are neither directory sections nor export scopes.
+- #3426 must serialise erasure with acceptance.
+
+## #3502 execution: rulings the agent made — 29 September 2026
+
+#3502 (the member directory) is built on branch `directory-3502`, and not merged. That is 10
+tasks (including 3b, added for D3), a final whole-branch review and one fix wave. The full suite
+passes with 782 tests, and fmt and clippy are clean. The screen, routes and selection script wait
+for #3417.
+
+**One behaviour change for Erik to confirm:** when an admin grants a new role to a membership that
+has ended (roles ran out, not revoked), the old name and contact address are now cleared at once,
+in the same transaction, and audited as `membership.profile_cleared`. Without this, whether the
+old name came back depended on whether the daily sweep had already run. The returning member
+states their name again, following D3-7. Until they do, the directory shows "Navn ikke oppgitt".
+
+**Security and D3 gaps the reviews found and closed:**
+- `Email::parse` accepted a comma or semicolon in the domain, which could split the copy list.
+  Domain labels are now validated; internationalized domains such as blåbær.no still work.
+- A mail link printed every address in debug output. Redaction everywhere is now a bare
+  `[redacted]`, with no character count.
+- A member re-accepting an invitation had their contact address wiped. It is now kept, and
+  `prepare_acceptance` reports whether the membership is already current.
+- Membership ids that are not UUIDv7 are refused.
+- "Ended" is one shared predicate (`membership_ended`), used by acceptance, editing, history and
+  the sweep.
+- Archived groups are neither directory sections nor export scopes (D5).
+
+**Handed to later cards:**
+- **#3417:** name prefill for a returning member; members whose only role is upcoming; scheduling
+  the daily sweep.
+- **#3426:** make erasure exclusive with acceptance; decide whether erasure also revokes.
+- **#3503:** the name-resolution rule for guests; the history-label edge cases.
+
+## Domain registered, email provider signed up, Hanko Pro — 29 September 2026
+
+- **fau-portalen.no is registered** and is the product's domain from now on. It replaces the
+  placeholder `fau-lab.bim.graphics` for ingress and cert-manager, and for the #3443 DNS
+  decisions: Domeneshop, HTTP-01 per hostname, no wildcard.
+- **Erik has signed up for Scaleway Transactional Email (TEM)**, the provisional provider on
+  #3410. It still has to be verified against #3410's checklist before production.
+- **Hanko is being upgraded to Pro** soon. ADR-003 decision 1 had planned the free tier to
+  10,000 MAU, so the Pro features should be checked against the MFA-proof requirement on #3414
+  and the pilot gate.
+- **#3488 was already fixed.** The etcd-s3-retention drop-in was applied on 10 September, and on
+  29 September S3 held about 170 hourly snapshots. Only the upstream issue remains, and Erik files
+  it.
+
+## Remembering a former member for a chosen period — 29 September 2026
+
+Erik asked for a way to keep a former member's display name for a few months, so that someone who
+comes back (for example as a guest, to continue some work) is recognised, while the FAU shows
+only role and year. The period is set by the user. His answers:
+- **M1:** others see role and year on old contributions, even after the person returns.
+- **M2:** 3 months by default; the user chooses none, 3, 6, 12 or 24.
+- **M3:** remembered per FAU, under that FAU's record key.
+- **M4:** built as a follow-up card after #3502 merges, with migration 0009.
+
+This amends D3: the name is hidden when the membership ends, and destroyed when the period ends
+or on erasure. Design in docs/member-retention-design.md. The new retention statement goes to
+#3426.

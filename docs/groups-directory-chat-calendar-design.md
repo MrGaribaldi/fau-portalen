@@ -116,11 +116,20 @@ because the directory shows the present.
 
 ### 4.2 Retention
 
-- The contact email disappears when the membership ends.
-- **The name stays after the membership ends,** because prosjektgrunnlag §8 requires history to
-  show "the names that applied at the time". This is a new retention statement and must be
-  written into the privacy notice and the DPA.
-- An Article 17 erasure replaces the name everywhere with "Tidligere medlem".
+Amended 28 September 2026 by Erik's decision D3 (docs/planning-decisions.md), which replaces the
+earlier rule that the name stays after the membership ends.
+
+- **A display name exists only while the membership is active.** When the membership ends, both
+  the display name and the contact email are cleared, and the database enforces this on
+  revocation. The definition of "ended" is in the #3502 plan: revoked, or no running or upcoming
+  role.
+- **History shows an ended membership as role and year**, for example "Leder 2025–2026", never
+  as a name. The label is computed at read time from the role assignments. Erik's reason: it
+  keeps the history GDPR-valid. This is what satisfies prosjektgrunnlag §8's "the names that
+  applied at the time" for former members, and it must be written into the privacy notice and
+  the DPA (#3426).
+- An Article 17 erasure shows "Tidligere medlem", never role and year, because a single-holder
+  role with its year would still identify the person.
 - Crypto-shredding the FAU removes everything.
 
 ### 4.3 Screen
@@ -368,7 +377,7 @@ Each piece's plan expands these; they are listed here so none is lost.
 - **Directory:**
   - the mailto length guard at the boundary;
   - a person selected through two groups appears once;
-  - the name survives the end of a membership while the contact email disappears;
+  - both the name and the contact email are cleared when a membership ends, and history shows the ended membership as role and year (D3, §4.2);
   - erasure replaces the name;
   - an audit entry records the count and never the addresses.
 - **Chat:**

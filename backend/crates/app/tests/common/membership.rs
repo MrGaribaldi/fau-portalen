@@ -1,14 +1,16 @@
 //! Builders for the membership integration tests. Every fixture goes through the
 //! persistence functions themselves, so a fixture that works is evidence too.
 
+use fau_crypto::Ciphertext;
 use fau_domain::email::{Email, VerifiedEmail};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::rules::default_admin_end;
 use fau_domain::membership::vocabulary::{CapabilityClass, FauName, RoleName};
 use fau_domain::time::Moment;
 use fau_persistence::membership::{
-    accept_invitation, activate_tenant, create_pending_tenant, issue_invitation, AcceptInvitation,
-    Accepted, Activation, IssueInvitation, OfferedRole, PendingSignup, RoleChoice,
+    accept_invitation, activate_tenant, create_pending_tenant, issue_invitation,
+    prepare_acceptance, AcceptInvitation, Accepted, Activation, IssueInvitation, MemberProfile,
+    OfferedRole, PendingSignup, RoleChoice,
 };
 use jiff::civil::Date;
 use sqlx::PgPool;
@@ -66,6 +68,37 @@ pub fn signup(school_id: Uuid, registrant: &str, leader: &str, at: Moment) -> Pe
     }
 }
 
+/// Shaped like fau-crypto's envelope (version byte 1, then 41 bytes), so migration 0008's
+/// checks accept it. Never decrypted: tests that decrypt use real keys (key_chain.rs).
+pub fn placeholder_envelope() -> Ciphertext {
+    let mut v = vec![1u8];
+    v.extend_from_slice(&[0u8; 41]);
+    Ciphertext::from_stored(v)
+}
+
+/// A profile for a membership that does not exist yet: any fresh id becomes the new row's.
+/// Enough for an activation, and for an acceptance by someone not yet in the FAU.
+pub fn fresh_profile() -> MemberProfile {
+    MemberProfile {
+        membership_id: Uuid::now_v7(),
+        encrypted_display_name: placeholder_envelope(),
+        encrypted_contact_email: None,
+    }
+}
+
+/// The profile an acceptance of `token` by `acceptor` needs: for `prepare_acceptance`'s
+/// membership, so a re-invited former member works too. A token `prepare_acceptance`
+/// refuses gets a fresh profile, so a test of the refusal still reaches `accept_invitation`.
+pub async fn profile_for(pool: &PgPool, token: &str, acceptor: &str, at: Moment) -> MemberProfile {
+    match prepare_acceptance(pool, token, &verified(acceptor), at).await {
+        Ok(target) => MemberProfile {
+            membership_id: target.membership_id,
+            ..fresh_profile()
+        },
+        Err(_) => fresh_profile(),
+    }
+}
+
 /// An active FAU whose registrant is its only admin.
 pub struct Fau {
     pub tenant_id: Uuid,
@@ -87,6 +120,7 @@ pub async fn active_fau(pool: &PgPool, registrant: &str, at: Moment) -> Fau {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified(registrant),
+            profile: fresh_profile(),
         },
         at,
     )
@@ -132,12 +166,15 @@ pub async fn add_member(
     )
     .await
     .expect("issue");
+    let token = issued.token.expose().to_owned();
+    let profile = profile_for(pool, &token, address, at).await;
     accept_invitation(
         pool,
         AcceptInvitation {
-            token: issued.token.expose().to_owned(),
+            token,
             acceptor: verified(address),
             admin_end_override: None,
+            profile,
         },
         at,
     )

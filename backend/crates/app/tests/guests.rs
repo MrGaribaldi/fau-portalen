@@ -469,6 +469,7 @@ async fn accepting_a_guest_invitation_whose_group_was_archived_meanwhile_is_refu
                 token: issued.token.expose().to_owned(),
                 acceptor: verified("gjest@example.test"),
                 admin_end_override: None,
+                profile: fresh_profile(),
             },
             t0,
         )

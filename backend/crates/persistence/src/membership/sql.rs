@@ -248,37 +248,69 @@ pub(crate) async fn upsert_verified_account(
     .await?)
 }
 
-/// Finds or creates the account's membership in the tenant. A revoked membership is
-/// reopened rather than duplicated (one membership per account per FAU, #3412); the
-/// revocation stays in the audit log. Returns the id and whether it already existed.
+/// Finds or creates the account's membership in the tenant, as `expected_id`. A revoked
+/// membership is reopened rather than duplicated (one membership per account per FAU,
+/// #3412); the revocation stays in the audit log. Returns the id, whether it already
+/// existed, and whether it was already current -- not revoked -- before this call.
+///
+/// `expected_id` is the id the caller encrypted the member's profile for (#3502): the
+/// existing membership's id, or a fresh one that becomes the new row's. An existing
+/// membership under any other id is `AcceptanceTargetChanged`, so a profile can never land
+/// on a row its associated data does not name; an erased one is `MembershipErased`.
+///
+/// The third value, `already_current`, is true exactly when an existing row had not
+/// ended (`profile::membership_ended`, D3): an active member accepting a second
+/// invitation (a handover to a sitting member, or recovery). `write_profile` uses it to
+/// decide whether to keep a stored contact address the caller's profile leaves unstated
+/// (fix round 1, Q10) -- a freshly created or freshly reopened row is never
+/// `already_current`, and has no address to keep either way, since D3 clears both fields
+/// once a membership ends. A row whose roles simply ran out, re-invited before the sweep
+/// reaches it, is `already_current = false` too: it holds no address to keep (controller
+/// ruling, Task 5 review).
 pub(crate) async fn ensure_membership(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     account_id: Uuid,
-) -> Result<(Uuid, bool), MembershipError> {
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "select id from memberships where tenant_id = $1 and account_id = $2 for update",
-    )
-    .bind(tenant_id)
-    .bind(account_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some(id) = existing {
-        sqlx::query("update memberships set revoked_at = null where tenant_id = $1 and id = $2")
+    expected_id: Uuid,
+    today: Date,
+) -> Result<(Uuid, bool, bool), MembershipError> {
+    let sql = format!(
+        "select m.id, m.revoked_at is not null, m.name_erased_at is not null, {}
+           from memberships m
+          where m.tenant_id = $1 and m.account_id = $2 for update",
+        super::profile::membership_ended("$3")
+    );
+    let existing: Option<(Uuid, bool, bool, bool)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(date_param(today))
+        .fetch_optional(&mut *conn)
+        .await?;
+    if let Some((id, was_revoked, erased, ended)) = existing {
+        if id != expected_id {
+            return Err(MembershipError::AcceptanceTargetChanged);
+        }
+        if erased {
+            return Err(MembershipError::MembershipErased);
+        }
+        if was_revoked {
+            sqlx::query(
+                "update memberships set revoked_at = null where tenant_id = $1 and id = $2",
+            )
             .bind(tenant_id)
             .bind(id)
             .execute(&mut *conn)
             .await?;
-        return Ok((id, true));
+        }
+        return Ok((id, true, !ended));
     }
-    let id = Uuid::now_v7();
     sqlx::query("insert into memberships (tenant_id, id, account_id) values ($1, $2, $3)")
         .bind(tenant_id)
-        .bind(id)
+        .bind(expected_id)
         .bind(account_id)
         .execute(&mut *conn)
         .await?;
-    Ok((id, false))
+    Ok((expected_id, false, false))
 }
 
 /// Inserts a role assignment and returns its id.

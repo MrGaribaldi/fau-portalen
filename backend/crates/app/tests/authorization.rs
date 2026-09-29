@@ -7,8 +7,12 @@ use common::groups::*;
 use common::membership::*;
 use common::TestDb;
 use fau_domain::authz::{Action, Decision, Denied};
+use fau_domain::directory::listing::SectionId;
 use fau_domain::membership::vocabulary::{CapabilityClass, Visibility};
-use fau_persistence::membership::{authorize, grant_role, GrantRole, Resource, RoleChoice, Viewer};
+use fau_persistence::membership::{
+    authorize, grant_role, member_directory, GrantRole, MembershipError, Resource, RoleChoice,
+    Viewer,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -511,4 +515,126 @@ async fn a_revocation_takes_effect_on_the_next_call() {
     )
     .await;
     assert_eq!(check(&pool, v, Resource::Fau, Action::Read, T0).await, N);
+}
+
+/// Directory entries (§10 lists "directory entry" among the matrix's resource types; #3502).
+/// An entry's audience is its person's memberships (§3.2): the FAU-wide section, which only
+/// members and admins see and which never lists a guest, and each group the viewer may
+/// read. (viewer, sections seen, people seen); `none_*` are refused outright.
+#[rustfmt::skip]
+const DIRECTORY: &[(&str, &[&str], &[&str])] = &[
+    ("admin_in",   &["fau", "open", "closed", "other"],
+                   &["admin_in", "admin_out", "member_in", "member_out", "guest_in", "guest_out"]),
+    ("admin_out",  &["fau", "open", "closed", "other"],
+                   &["admin_in", "admin_out", "member_in", "member_out", "guest_in", "guest_out"]),
+    ("member_in",  &["fau", "open", "closed"],
+                   &["admin_in", "admin_out", "member_in", "member_out", "guest_in"]),
+    ("member_out", &["fau", "open"],
+                   &["admin_in", "admin_out", "member_in", "member_out", "guest_in"]),
+    ("guest_in",   &["open", "closed"], &["admin_in", "member_in", "guest_in"]),
+    ("guest_out",  &["other"],          &["guest_out"]),
+    ("none_in",    &[], &[]),
+    ("none_out",   &[], &[]),
+];
+
+/// What each section lists, whoever reads it: the same people for every viewer allowed to
+/// see the section. `none_in` was added to `open` and `closed` by hand but has no standing.
+#[rustfmt::skip]
+const SECTION_MEMBERS: &[(&str, &[&str])] = &[
+    ("fau",    &["admin_in", "admin_out", "member_in", "member_out"]),
+    ("open",   &["admin_in", "member_in", "guest_in"]),
+    ("closed", &["admin_in", "member_in", "guest_in"]),
+    ("other",  &["guest_out"]),
+];
+
+#[tokio::test]
+async fn directory_entries_in_the_matrix() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let w = world(&pool).await;
+    let section_name = |s: SectionId| match s {
+        SectionId::Fau => "fau",
+        SectionId::Group(g) if g == w.open => "open",
+        SectionId::Group(g) if g == w.closed => "closed",
+        SectionId::Group(g) if g == w.other => "other",
+        SectionId::Group(_) => "unexpected",
+    };
+    let person_name = |m: Uuid| {
+        VIEWERS
+            .iter()
+            .find(|n| w.membership(n) == m)
+            .copied()
+            .unwrap_or("unexpected")
+    };
+    let sorted = |mut v: Vec<&'static str>| {
+        v.sort_unstable();
+        v
+    };
+
+    let mut viewers: Vec<&str> = DIRECTORY.iter().map(|row| row.0).collect();
+    viewers.sort_unstable();
+    let mut all = VIEWERS.to_vec();
+    all.sort_unstable();
+    assert_eq!(viewers, all, "every viewer has a row");
+
+    let mut failures = Vec::new();
+    for &(viewer, sections, people) in DIRECTORY {
+        let read = member_directory(&pool, w.viewer(viewer), at(T0)).await;
+        if viewer.starts_with("none") {
+            if read != Err(MembershipError::NotAuthorized) {
+                failures.push(format!("{viewer}: want NotAuthorized, got {read:?}"));
+            }
+            continue;
+        }
+        let read = read.unwrap();
+        let got_sections = sorted(
+            read.sections
+                .iter()
+                .map(|s| section_name(s.section))
+                .collect(),
+        );
+        if got_sections != sorted(sections.to_vec()) {
+            failures.push(format!(
+                "{viewer} sections: want {sections:?}, got {got_sections:?}"
+            ));
+        }
+        let got_people = sorted(
+            read.people
+                .iter()
+                .map(|p| person_name(p.membership_id))
+                .collect(),
+        );
+        if got_people != sorted(people.to_vec()) {
+            failures.push(format!(
+                "{viewer} people: want {people:?}, got {got_people:?}"
+            ));
+        }
+        for s in &read.sections {
+            let name = section_name(s.section);
+            let want = SECTION_MEMBERS.iter().find(|(n, _)| *n == name).unwrap().1;
+            let got = sorted(s.members.iter().map(|m| person_name(*m)).collect());
+            if got != sorted(want.to_vec()) {
+                failures.push(format!("{viewer} sees {name} as {got:?}, want {want:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+
+    // Final review M6: a person in two sections carries both group ids, whoever reads them,
+    // and the FAU-wide section adds none. `admin_in` is in `open` and `closed`.
+    let mut want = vec![w.open, w.closed];
+    want.sort_unstable();
+    for viewer in ["admin_in", "member_in", "guest_in"] {
+        let read = member_directory(&pool, w.viewer(viewer), at(T0))
+            .await
+            .unwrap();
+        let entry = read
+            .people
+            .iter()
+            .find(|p| p.membership_id == w.membership("admin_in"))
+            .unwrap();
+        let mut got = entry.group_ids.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "admin_in's group_ids as {viewer} sees them");
+    }
 }

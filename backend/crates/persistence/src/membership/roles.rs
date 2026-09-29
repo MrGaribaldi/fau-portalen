@@ -11,6 +11,7 @@ use super::error::MembershipError;
 use super::events::{notify, Change};
 use super::groups::remove_from_all_groups;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
+use super::profile::membership_ended;
 use super::retention::{
     audit_profile_cleared, audit_profile_retained, clearing_cause, effective_keep_until,
     reopen_profile,
@@ -241,20 +242,27 @@ pub async fn revoke_membership(
     if !leaving {
         require_admin(&mut tx, req.tenant_id, req.actor_membership_id, at.today()).await?;
     }
-    let target: Option<(bool, bool, Option<String>)> = sqlx::query_as(
-        "select revoked_at is not null,
-                (encrypted_display_name is not null or encrypted_contact_email is not null),
-                to_char(profile_retained_until, 'YYYY-MM-DD')
-           from memberships where tenant_id = $1 and id = $2 for update",
-    )
+    let target: Option<(bool, bool, Option<String>, bool)> = sqlx::query_as(&format!(
+        "select m.revoked_at is not null,
+                (m.encrypted_display_name is not null or m.encrypted_contact_email is not null),
+                to_char(m.profile_retained_until, 'YYYY-MM-DD'),
+                {}
+           from memberships m where m.tenant_id = $1 and m.id = $2 for update",
+        membership_ended("$3")
+    ))
     .bind(req.tenant_id)
     .bind(req.membership_id)
+    .bind(date_param(at.today()))
     .fetch_optional(&mut *tx)
     .await?;
+    // A stamp counts only on a membership that had already ended (roles that ran out, the
+    // sweep having noticed). On a row active until this revocation it can only be a stale
+    // date left by a binary from before migration 0009, so it is ignored and the period is
+    // computed fresh.
     let (has_fields, stamped) = match target {
         None => return Err(MembershipError::UnknownMembership),
-        Some((true, _, _)) => return Err(MembershipError::MembershipRevoked),
-        Some((false, has_fields, stamped)) => (has_fields, stamped),
+        Some((true, _, _, _)) => return Err(MembershipError::MembershipRevoked),
+        Some((false, has_fields, stamped, ended)) => (has_fields, stamped.filter(|_| ended)),
     };
 
     let admins = AdminState::load(&mut tx, req.tenant_id).await?;

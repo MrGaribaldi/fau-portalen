@@ -432,7 +432,9 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
 /// clearing them at once. An active membership settles as `Active` and is left alone.
 ///
 /// Then writes the new setting on the account, and recalculates every period still
-/// stamped, in every FAU, from the day it ended: a longer setting extends a period that
+/// stamped on an *ended* membership, in every FAU, from the day it ended (an active row's
+/// date can only be a stale one left by a binary from before migration 0009, and is
+/// ignored): a longer setting extends a period that
 /// is still running, and a shorter one shortens it or clears it at once if the new period
 /// is already over (`retention_shortened`). **Every row reaching this step is guaranteed
 /// not yet over under the old setting** -- the settle-first step above already cleared
@@ -503,13 +505,18 @@ pub async fn set_retention_months(
     found.ok_or(MembershipError::UnknownAccount)?;
 
     for tenant_id in tenants {
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
-            "select id, to_char(profile_retained_until, 'YYYY-MM-DD') from memberships
-              where tenant_id = $1 and account_id = $2 and profile_retained_until is not null
-              order by id",
-        )
+        // Ended memberships only: an active row's date can only be a stale one an old
+        // binary left behind (migration 0009's rollout-window gap), and is never a period.
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
+            "select m.id, to_char(m.profile_retained_until, 'YYYY-MM-DD') from memberships m
+              where m.tenant_id = $1 and m.account_id = $2
+                and m.profile_retained_until is not null and {}
+              order by m.id",
+            membership_ended("$3")
+        ))
         .bind(tenant_id)
         .bind(account_id)
+        .bind(date_param(today))
         .fetch_all(&mut *tx)
         .await?;
         for (id, stamped) in rows {

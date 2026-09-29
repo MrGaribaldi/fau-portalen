@@ -931,6 +931,75 @@ async fn a_role_revoked_before_it_started_marks_the_end_even_after_a_later_leave
     );
 }
 
+/// What a binary from before 0009 can leave behind: an active row that still carries a
+/// date (its `ensure_membership` reopened a stamped row without clearing it).
+async fn stale_stamp(pool: &PgPool, m: Uuid, date: &str) {
+    sqlx::query("update memberships set profile_retained_until = $2::date where id = $1")
+        .bind(m)
+        .bind(date)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Migration 0009's rollout-window gap: a recalculation touches ended memberships only,
+/// so a stale date on an active row is never recalculated or cleared.
+///
+/// Mutation check: drop the `membership_ended` predicate from `set_retention_months`'s
+/// recalculation select and the active member's fields are cleared as
+/// `retention_shortened`.
+#[tokio::test]
+async fn a_recalculation_ignores_a_stale_date_on_an_active_row() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "active@example.test", year()).await;
+    with_contact(&pool, &a, m, 1).await;
+    stale_stamp(&pool, m, "2026-10-10").await;
+    let acc = account_of(&pool, m).await;
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::None,
+        at("2026-10-01T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    let (name, address, _) = state(&pool, m).await;
+    assert!(name && address, "an active member keeps both fields");
+    assert_eq!(
+        count_of(&audits(&pool, m).await, "membership.profile_cleared"),
+        0
+    );
+}
+
+/// The same gap on revocation: a stamp on a row that was active before this revocation
+/// is ignored, and the period is computed fresh from today.
+///
+/// Mutation check: keep the stale stamp in `revoke_membership` and the date stays
+/// 2026-10-10 with no `profile_retained`.
+#[tokio::test]
+async fn a_revocation_ignores_a_stale_date_on_an_active_row() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "active@example.test", year()).await;
+    with_contact(&pool, &a, m, 1).await;
+    stale_stamp(&pool, m, "2026-10-10").await;
+    leave(&pool, &a, m, "2026-10-01T10:00:00Z").await;
+    assert_eq!(
+        state(&pool, m).await,
+        (true, true, Some("2027-01-01".into()))
+    );
+    assert_eq!(
+        audits(&pool, m).await,
+        [(
+            "membership.profile_retained".to_owned(),
+            r#"{"until": "2027-01-01"}"#.to_owned()
+        )]
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_account_is_refused() {
     let db = TestDb::migrated().await;

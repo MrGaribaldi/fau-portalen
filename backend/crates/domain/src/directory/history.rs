@@ -20,6 +20,10 @@
 //! here. The proposed Bokmål source strings are `member.endedRole.oneYear` = "{role} {year}"
 //! and `member.endedRole.years` = "{role} {firstYear}–{lastYear}", with the years passed as
 //! strings so ICU does not group their digits.
+//!
+//! **A returner** (#3511, Erik's M1): someone active again after an earlier period is shown
+//! by name only for events in the current period; earlier events keep their role and year
+//! ([`active_period`]).
 
 use std::fmt;
 
@@ -105,6 +109,70 @@ pub fn role_label(held: &[HeldRole], on: Date) -> Option<RoleLabel> {
         first_year: chosen.from.year(),
         last_year: last_day.year(),
     })
+}
+
+/// The day a membership ended (#3511, plan Ruling R2): the latest day any of its roles
+/// stopped being held, never later than `today`. A membership revoked long after its roles
+/// ran out ended when they ran out. `today` when it held no role at all; persistence's
+/// `ended_on_for` falls back to the latest role revocation first, then the membership's
+/// (final review I2; Erik, 29 September 2026).
+pub fn ended_on(held: &[HeldRole], today: Date) -> Date {
+    held.iter()
+        .map(|r| r.until)
+        .max()
+        .map_or(today, |d| d.min(today))
+}
+
+/// An active membership's history split at its current period (#3511, M1): the period
+/// started on `since`, and `earlier` holds the roles of every earlier one. Most members
+/// have nothing earlier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePeriod {
+    pub since: Date,
+    pub earlier: Vec<HeldRole>,
+}
+
+impl ActivePeriod {
+    /// How an event on `on` shows the person: `None` for their name, or the role and year
+    /// from an earlier period.
+    pub fn label_on(&self, on: Date) -> Option<RoleLabel> {
+        if on >= self.since {
+            None
+        } else {
+            role_label(&self.earlier, on)
+        }
+    }
+}
+
+/// Splits an active membership's roles at its current period (plan Rulings R5, R6).
+/// Periods are runs of held spans that touch or overlap; a gap of a day or more starts a
+/// new one. The current period is the run that contains today, and `earlier` holds the
+/// roles that ended before it began. When today falls in a gap -- nothing running, a later
+/// run booked -- the current period counts from today and `earlier` holds every role that
+/// ended before today (R6's cost: the gap starts a new period).
+pub fn active_period(held: &[HeldRole], today: Date) -> ActivePeriod {
+    let mut spans: Vec<(Date, Date)> = held.iter().map(|r| (r.from, r.until)).collect();
+    spans.sort();
+    let mut runs: Vec<(Date, Date)> = Vec::new();
+    for (from, until) in spans {
+        match runs.last_mut() {
+            Some((_, u)) if from <= *u => *u = (*u).max(until),
+            _ => runs.push((from, until)),
+        }
+    }
+    match runs
+        .iter()
+        .find(|(from, until)| *from <= today && today < *until)
+    {
+        Some(&(start, _)) => ActivePeriod {
+            since: start,
+            earlier: held.iter().filter(|r| r.until < start).cloned().collect(),
+        },
+        None => ActivePeriod {
+            since: today,
+            earlier: held.iter().filter(|r| r.until <= today).cloned().collect(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +312,159 @@ mod tests {
         assert!(!format!("{h:?}").contains("Leder"));
         assert!(!format!("{h:?}").contains("Kasserer"));
         assert!(!format!("{label:?}").contains("Leder"));
+    }
+
+    #[test]
+    fn a_membership_ended_on_the_last_day_a_role_stopped_never_after_today() {
+        let h = two_years(); // Kasserer 2024-09-01..2025-09-01, Leder 2025-09-01..2026-09-01
+        assert_eq!(ended_on(&h, date(2026, 10, 15)), date(2026, 9, 1));
+        // Revoked the same day a running role was cut short: that role now ends today.
+        assert_eq!(ended_on(&h, date(2026, 3, 1)), date(2026, 3, 1));
+        assert_eq!(
+            ended_on(&[], date(2026, 3, 1)),
+            date(2026, 3, 1),
+            "held nothing"
+        );
+    }
+
+    #[test]
+    fn one_unbroken_run_of_roles_is_one_period_with_nothing_earlier() {
+        let p = active_period(&two_years(), date(2026, 3, 1));
+        assert_eq!(p.since, date(2024, 9, 1));
+        assert!(p.earlier.is_empty());
+        assert_eq!(p.label_on(date(2025, 1, 1)), None, "the name, all through");
+    }
+
+    #[test]
+    fn after_a_gap_the_current_period_starts_again_and_earlier_events_show_role_and_year() {
+        // Kasserer 2024-09-01..2025-09-01, then nothing, then a guest from 2026-02-01.
+        let mut h = vec![two_years().remove(0)];
+        h.push(held(
+            "Gjest",
+            CapabilityClass::Guest,
+            date(2026, 2, 1),
+            date(2026, 6, 1),
+        ));
+        let p = active_period(&h, date(2026, 3, 1));
+        assert_eq!(p.since, date(2026, 2, 1));
+        assert_eq!(p.earlier.len(), 1);
+        assert_eq!(
+            p.label_on(date(2025, 3, 1))
+                .map(|l| (l.role, l.first_year, l.last_year)),
+            Some(("Kasserer".into(), 2024, 2025))
+        );
+        assert_eq!(
+            p.label_on(date(2026, 2, 1)),
+            None,
+            "the first day of the new period"
+        );
+        assert_eq!(p.label_on(date(2026, 3, 1)), None);
+    }
+
+    #[test]
+    fn roles_that_touch_or_overlap_are_one_period_and_a_one_day_gap_splits() {
+        let touching = [
+            held(
+                "A",
+                CapabilityClass::Member,
+                date(2025, 1, 1),
+                date(2025, 6, 1),
+            ),
+            held(
+                "B",
+                CapabilityClass::Member,
+                date(2025, 6, 1),
+                date(2026, 6, 1),
+            ),
+        ];
+        assert_eq!(
+            active_period(&touching, date(2026, 1, 1)).since,
+            date(2025, 1, 1)
+        );
+        let overlapping = [
+            held(
+                "A",
+                CapabilityClass::Member,
+                date(2025, 1, 1),
+                date(2025, 9, 1),
+            ),
+            held(
+                "B",
+                CapabilityClass::Member,
+                date(2025, 6, 1),
+                date(2026, 6, 1),
+            ),
+        ];
+        assert_eq!(
+            active_period(&overlapping, date(2026, 1, 1)).since,
+            date(2025, 1, 1)
+        );
+        let gap = [
+            held(
+                "A",
+                CapabilityClass::Member,
+                date(2025, 1, 1),
+                date(2025, 6, 1),
+            ),
+            held(
+                "B",
+                CapabilityClass::Member,
+                date(2025, 6, 2),
+                date(2026, 6, 1),
+            ),
+        ];
+        let p = active_period(&gap, date(2026, 1, 1));
+        assert_eq!(p.since, date(2025, 6, 2));
+        assert_eq!(p.earlier.len(), 1);
+    }
+
+    #[test]
+    fn a_running_role_plus_a_booked_role_after_a_gap_has_nothing_earlier() {
+        // Kasserer is running today; Leder is booked after a gap. The current period is the
+        // run that contains today, not the booked one, so the name shows all through it.
+        // Mutation check: take the last run as current and `since` becomes today, with
+        // Kasserer counted as earlier.
+        let h = [
+            held(
+                "Kasserer",
+                CapabilityClass::Member,
+                date(2025, 9, 1),
+                date(2026, 9, 1),
+            ),
+            held(
+                "Leder",
+                CapabilityClass::Admin,
+                date(2026, 10, 15),
+                date(2027, 10, 15),
+            ),
+        ];
+        let p = active_period(&h, date(2026, 3, 1));
+        assert_eq!(p.since, date(2025, 9, 1), "the running run's start");
+        assert!(p.earlier.is_empty(), "nothing earlier");
+        assert_eq!(p.label_on(date(2025, 10, 1)), None);
+    }
+
+    #[test]
+    fn a_period_still_to_start_counts_from_today() {
+        // Returned by invitation today for a role that starts next month: what they do
+        // today is theirs, what they did in the old period is not.
+        let h = [
+            held(
+                "A",
+                CapabilityClass::Member,
+                date(2025, 1, 1),
+                date(2025, 6, 1),
+            ),
+            held(
+                "B",
+                CapabilityClass::Member,
+                date(2026, 4, 1),
+                date(2027, 4, 1),
+            ),
+        ];
+        let p = active_period(&h, date(2026, 3, 1));
+        assert_eq!(p.since, date(2026, 3, 1));
+        assert!(p.label_on(date(2025, 3, 1)).is_some());
+        assert_eq!(p.label_on(date(2026, 3, 1)), None);
     }
 }

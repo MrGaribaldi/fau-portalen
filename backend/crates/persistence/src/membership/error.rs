@@ -83,6 +83,8 @@ pub enum MembershipError {
     NotAdminRole,
     #[error("membership not found")]
     UnknownMembership,
+    #[error("account not found")]
+    UnknownAccount,
     #[error("the membership is revoked")]
     MembershipRevoked,
     #[error("role assignment not found")]
@@ -121,6 +123,14 @@ pub enum MembershipError {
     AlreadyInGroup,
     #[error("the membership was not added to the group by hand")]
     NotInGroup,
+    /// The membership has ended because its roles ran out (none is still running or yet to
+    /// start), so adding it to a group would grant nothing, and the sweep would remove the
+    /// row (Erik's M6). The screen should offer an invitation to this group as a guest
+    /// instead: `issue_invitation` with `RoleChoice::New { capability: Guest, group_id:
+    /// Some(g), .. }`, or an existing guest role for the group (Erik, 29 September 2026).
+    /// A revoked membership is `MembershipRevoked` instead: an admin removed them.
+    #[error("the membership has ended; invite as a guest to the group instead")]
+    MembershipEndedInviteAsGuest,
     #[error("the group name is not a well-formed ciphertext")]
     GroupNameMalformed,
     #[error("organization unit not found")]
@@ -145,7 +155,8 @@ pub enum MembershipError {
     #[error("the membership's name was erased")]
     MembershipErased,
     /// The membership has ended -- it is revoked, or none of its role assignments is still
-    /// running or yet to start -- so it holds no name (Erik's D3, 28 September 2026).
+    /// running or yet to start. Under D3, as amended by #3511 (M1-M4, 29 September 2026), a
+    /// retained name may still sit on the row, but it is never open to editing while ended.
     #[error("the membership has ended")]
     MembershipEnded,
     /// The export's audit trail (#3502 Task 8): a selection of nobody has nothing to hand

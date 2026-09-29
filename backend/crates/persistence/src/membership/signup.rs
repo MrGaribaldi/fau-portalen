@@ -383,7 +383,7 @@ pub async fn activate_tenant(
         tenant_id,
         account_id,
         activation.profile.membership_id,
-        at.today(),
+        at,
     )
     .await?;
     write_profile(&mut tx, tenant_id, &activation.profile, already_current).await?;

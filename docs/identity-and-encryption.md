@@ -602,11 +602,20 @@ six because it still survives the summer holiday, which is the gap the rule exis
 parent whose seat ends in June and who is re-elected in August is recognised rather than starting
 over. After that they sign up again from scratch.
 
+**Amended 29 September 2026 (Erik, #3511):** the lapse follows the member's own chosen period,
+`accounts.retention_months` (none, 3, 6, 12 or 24 months; 3 by default), not a fixed three
+months. So an account lapses that many months after its last membership anywhere ends, and at
+once for a period of none. The same field decides how long each FAU keeps a former member's
+name and address (docs/member-retention-design.md), so a remembered membership never outlives
+the account's email. The three months above remain the default.
+
 The distinction that makes this correct: accounts are **global across FAU-er**, so a person serving
 on a second school's FAU must not have their account swept because their first membership expired.
 The lapse test is "no active membership anywhere", not "no activity in this FAU".
 
-**Member-elected retention is designed for and not yet built.** Erik raised the real case: an FAU
+**Member-elected retention is designed for and not yet built.** *(Superseded 29 September 2026:
+#3511 builds it, capped at 24 months and counted from the end of the membership, so it expires on
+its own; setting it to none takes effect at once.)* Erik raised the real case: an FAU
 taking on extra helpers for a few weeks' project, some of whom expect to return next year and would
 rather we kept their data than re-registered. Letting the person choose is better data protection
 than a fixed rule imposed on them - it is consent with agency rather than policy by default - but
@@ -990,8 +999,8 @@ one who can unseal the key service after a restart. No single
   key service starts, decided 24 September (decision 5). This is a third item for #3481.
 - **Search in the MVP.** Filenames only, decrypted in-session, designed for extension to full
   text. Nothing leaves the encryption boundary - see decision 6.
-- **Retention of member data.** Per-membership, lapsing three months after the last membership
-  ends - see decision 6a.
+- **Retention of member data.** Per-membership, lapsing after the member's chosen period (three
+  months by default) once the last membership ends - see decision 6a as amended 29 September.
 - **Key service failure modes.** Answered by decision 5a: a session-scoped key handle in memory,
   refreshed by real activity, with a concurrency ceiling as the control that replaces
   per-operation logging.

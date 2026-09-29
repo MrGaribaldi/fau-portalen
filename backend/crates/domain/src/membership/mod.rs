@@ -5,5 +5,6 @@ pub mod acceptance;
 pub mod access;
 pub mod period;
 pub mod requests;
+pub mod retention;
 pub mod rules;
 pub mod vocabulary;

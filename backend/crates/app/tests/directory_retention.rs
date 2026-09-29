@@ -8,7 +8,7 @@ use common::groups::*;
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::Ciphertext;
-use fau_domain::directory::history::HeldRole;
+use fau_domain::directory::history::{ActivePeriod, HeldRole};
 use fau_domain::membership::period::Period;
 use fau_domain::membership::vocabulary::{CapabilityClass, Visibility};
 use fau_persistence::membership::*;
@@ -96,6 +96,17 @@ async fn name(pool: &PgPool, fau: &Fau, m: Uuid, at_: &str) -> MemberName {
     names.into_iter().next().unwrap().1
 }
 
+/// Sets the account's retention period (#3511). Call it after the account exists (its
+/// first acceptance); before that the update sets nothing.
+async fn set_months_by_sql(pool: &PgPool, address: &str, months: i32) {
+    sqlx::query("update accounts set retention_months = $2 where email = $1")
+        .bind(address)
+        .bind(months)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 /// "Medlem", held from `from` up to (not including) `until`.
 fn medlem(from: Date, until: Date) -> MemberName {
     MemberName::Ended(vec![HeldRole {
@@ -110,7 +121,8 @@ fn medlem(from: Date, until: Date) -> MemberName {
 /// stepped-down member keeps their fields; make `member_names` ignore `ended` and the read
 /// before the sweep returns the name.
 #[tokio::test]
-async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_come() {
+async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_come_with_a_period_of_none(
+) {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
@@ -153,6 +165,16 @@ async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_
     let stepped_down = join(&pool, &a, "down@example.test", long)
         .await
         .membership_id;
+    // #3511: with a period of none, every end clears at once, as under D3.
+    for address in [
+        "ends@example.test",
+        "quiet@example.test",
+        "renewed@example.test",
+        "kari@example.test",
+        "down@example.test",
+    ] {
+        set_months_by_sql(&pool, address, 0).await;
+    }
     for (fau, m, marker) in [
         (&a, ends, 1),
         (&a, renewed, 2),
@@ -208,9 +230,23 @@ async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_
         ),
         "another FAU's membership is its own"
     );
+    // #3511: the short role ran out and the next one has not started, so this membership
+    // has an earlier period too -- `Returned`, not `Named` (M1).
+    // This is plan Ruling R6's gap case (nothing running, a later role booked), not a sitting member.
     assert_eq!(
         name(&pool, &a, renewed, "2026-10-01T10:00:00Z").await,
-        MemberName::Named(placeholder_envelope())
+        MemberName::Returned {
+            name: placeholder_envelope(),
+            period: ActivePeriod {
+                since: day(2026, 10, 1),
+                earlier: vec![HeldRole {
+                    name: "Medlem".into(),
+                    class: CapabilityClass::Member,
+                    from: day(2026, 9, 1),
+                    until: day(2026, 10, 1),
+                }],
+            },
+        }
     );
     // Idempotent.
     assert_eq!(clear_ended_profiles(&pool, after).await.unwrap(), 0);
@@ -632,14 +668,16 @@ async fn grant(pool: &PgPool, fau: &Fau, m: Uuid, p: Period, at_: &str) {
 }
 
 /// Final review I1 (controller ruling Q13): a membership whose roles simply ran out is not
-/// revoked, so `grant_role` may reach it before the daily sweep has. Under D3 it holds
-/// neither field any more, so the grant clears both in its own transaction, audited the
-/// way the sweep audits, and the returning member states their name again.
+/// revoked, so `grant_role` may reach it before the daily sweep has. With a period of none
+/// (#3511) it holds neither field any more, so the grant clears both in its own
+/// transaction, audited the way the sweep audits, and the returning member states their
+/// name again. A retained profile is restored instead (`member_retention.rs`).
 ///
-/// Mutation check: drop the clearing from `grant_role` and the old name and address
-/// become valid again on the new role (shown RED in the final fix report).
+/// Mutation check: drop the `reopen_profile` call from `grant_role` and the old name and
+/// address become valid again on the new role.
 #[tokio::test]
-async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not() {
+async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not_with_a_period_of_none(
+) {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let a = active_fau(&pool, "admin-a@example.test", at(T0)).await;
@@ -652,6 +690,7 @@ async fn granting_a_role_to_an_ended_membership_clears_what_the_sweep_has_not() 
     .await
     .membership_id;
     with_contact(&pool, &a, m, 1).await;
+    set_months_by_sql(&pool, "tilbake@example.test", 0).await;
     let later = "2026-10-05T10:00:00Z";
     assert_eq!(
         fields(&pool, m).await,

@@ -34,6 +34,7 @@ use super::authz::{
 };
 use super::error::MembershipError;
 use super::events::{notify, Change};
+use super::profile::membership_ended;
 use super::sql::{
     date_param, lock_tenant, membership_and_account_state, require_open, ts_param, write_audit,
     Audit, USABLE_ACCOUNT,
@@ -402,7 +403,11 @@ pub async fn archive_group(
 }
 
 /// Adds a member by hand: anyone with a usable membership, a guest or a member of a bound
-/// group's unit included (§3.1). Admin only; refused while frozen or archived.
+/// group's unit included (§3.1). Admin only; refused while frozen or archived. A revoked
+/// membership is `MembershipRevoked`; one whose roles ran out (ended, not revoked) is
+/// `MembershipEndedInviteAsGuest`, so the screen can offer a guest invitation to this
+/// group instead (Erik, 29 September 2026). A membership whose roles are all still to
+/// start is active and is added. Nothing is written or audited on a refusal.
 pub async fn add_group_member(
     pool: &PgPool,
     req: GroupMemberChange,
@@ -427,6 +432,18 @@ pub async fn add_group_member(
         Some((true, _)) => return Err(MembershipError::MembershipRevoked),
         Some((false, false)) => return Err(MembershipError::AccountDisabled),
         Some((false, true)) => {}
+    }
+    let ended: bool = sqlx::query_scalar(&format!(
+        "select {} from memberships m where m.tenant_id = $1 and m.id = $2",
+        membership_ended("$3")
+    ))
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(date_param(at.today()))
+    .fetch_one(&mut *tx)
+    .await?;
+    if ended {
+        return Err(MembershipError::MembershipEndedInviteAsGuest);
     }
     let already: bool = sqlx::query_scalar(
         "select exists (select 1 from group_members
@@ -542,15 +559,22 @@ pub async fn remove_group_member(
     Ok(())
 }
 
-/// `revoke_membership`'s cascade (Ruling R15): the membership leaves every group it was
-/// added to by hand, each removal audited. Without it, a re-invite (which reopens the same
-/// membership row) would hand a removed person their closed groups back. Runs inside the
-/// caller's transaction, under its tenant lock.
+/// An ended membership leaves every group it was added to by hand, each removal audited
+/// `group.member_removed` with `{ "membership_id", "cause" }` and notified per group.
+/// Without it, a return (which reopens the same membership row) would hand the person
+/// their closed groups back. Runs inside the caller's transaction, under its tenant lock.
+///
+/// - `revoke_membership` (Ruling R15) passes `Some(actor)` and `"membership_revoked"`:
+///   audited as that member.
+/// - A membership whose roles ran out (Erik's M6, #3511) is ended by the sweep
+///   (`clear_ended_profiles`) or on return (`reopen_profile`), which pass `None` and
+///   `"membership_ended"`: audited as the system.
 pub(crate) async fn remove_from_all_groups(
     conn: &mut PgConnection,
     tenant_id: Uuid,
-    actor_membership_id: Uuid,
+    actor: Option<Uuid>,
     membership_id: Uuid,
+    cause: &'static str,
     at: Moment,
 ) -> Result<(), MembershipError> {
     let groups: Vec<Uuid> = sqlx::query_scalar(
@@ -564,18 +588,12 @@ pub(crate) async fn remove_from_all_groups(
     .fetch_all(&mut *conn)
     .await?;
     for group_id in groups {
-        write_audit(
-            conn,
-            at,
-            audit(
-                tenant_id,
-                actor_membership_id,
-                "group.member_removed",
-                group_id,
-                json!({ "membership_id": membership_id, "cause": "membership_revoked" }),
-            ),
-        )
-        .await?;
+        let params = json!({ "membership_id": membership_id, "cause": cause });
+        let entry = match actor {
+            Some(actor) => audit(tenant_id, actor, "group.member_removed", group_id, params),
+            None => Audit::system(tenant_id, "group.member_removed", "group", group_id, params),
+        };
+        write_audit(conn, at, entry).await?;
         notify(conn, tenant_id, Change::Changed(Resource::Group(group_id))).await?;
     }
     Ok(())

@@ -11,9 +11,14 @@
 //! mail is ever sent to it: login, invitations and recovery keep using the account address.
 //! So only the member sets it. An admin may correct a name, not an address.
 //!
-//! **Neither field outlives the membership** (Erik's D3, 28 September 2026). Once a
-//! membership has ended ([`membership_ended`]) it holds no name, so no edit gives it one;
-//! history shows it as its role and year instead (`member_names`).
+//! **A field may outlive the membership, hidden, for the member's chosen period** (Erik's
+//! D3, 28 September 2026, as amended by #3511 (M1-M4, 29 September 2026)). Once a
+//! membership has ended ([`membership_ended`]) its fields stay on the row until
+//! `retention::clear_ended_profiles` clears them -- at once for a period of none, otherwise
+//! after the account's chosen period -- but no edit reaches them ([`set_display_name`],
+//! [`set_contact_email`]) and nobody else sees them: history always shows role and year for
+//! that period (`member_names`), and only the member themself is recognised if they return
+//! within it.
 //!
 //! **Order** (as in the rest of `membership`): tenant state, then authority, then row state.
 
@@ -97,7 +102,8 @@ impl MemberProfile {
 }
 
 /// Writes the profile onto a membership that has just been created, reopened, or was
-/// already current -- `already_current`, from `ensure_membership`'s third return value.
+/// already current or retained -- `already_current`, from `ensure_membership`'s third
+/// return value.
 ///
 /// The display name always takes the accepted profile's value: an acceptance always states
 /// one (`check` requires it), and it is the name that applies from now on.
@@ -106,9 +112,11 @@ impl MemberProfile {
 /// carries none: an already-active, already-named member reached by a second invitation --
 /// a handover to a sitting member, or recovery -- must not have their stored address
 /// silently wiped just because that invitation's acceptance carried no address of its own
-/// (fix round 1, Q10). A freshly created row, or one just reopened from revoked, is never
-/// `already_current`, and has no address to keep either way (D3 cleared it on revocation),
-/// so there the profile's value -- `None` or not -- is written as given.
+/// (fix round 1, Q10). The same holds for a former member returning within their chosen
+/// period (#3511 §3): their retained address stays unless the new profile states one. A
+/// freshly created row, or one whose expired profile was just cleared, is never
+/// `already_current`, and has no address to keep either way, so there the profile's value
+/// -- `None` or not -- is written as given.
 pub(crate) async fn write_profile(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -169,8 +177,10 @@ pub(crate) fn membership_ended(date_param: &str) -> String {
 /// A member edits their own name, or an admin corrects the name of anyone whose membership
 /// is still active (§4.1). Refused while the FAU is frozen, for a name an Article 17
 /// erasure removed (`MembershipErased`), and for a membership that has ended
-/// (`MembershipEnded`): under D3 an ended membership holds no name, and history shows its
-/// role and year instead. A membership whose roles are all still to come is active.
+/// (`MembershipEnded`): under D3, as amended by #3511 (M1-M4, 29 September 2026), an ended
+/// membership's name may still be kept, hidden, for the account's chosen period, but it is
+/// never open to editing, and history keeps showing role and year for that period either
+/// way. A membership whose roles are all still to come is active.
 ///
 /// **Authority before state:** a member naming anyone but themselves gets `NotAuthorized`
 /// whether or not the id exists; only an admin learns `UnknownMembership` or

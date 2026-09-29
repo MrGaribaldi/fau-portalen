@@ -12,6 +12,10 @@ use super::events::{notify, Change};
 use super::groups::remove_from_all_groups;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
 use super::profile::membership_ended;
+use super::retention::{
+    audit_profile_cleared, audit_profile_retained, clearing_cause, effective_keep_until,
+    reopen_profile,
+};
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
     membership_and_account_state, parse_date, require_admin, require_open, ts_param, write_audit,
@@ -62,7 +66,8 @@ pub async fn grant_role(
     )
     .await?;
     let (role_id, capability, period) = resolved[0];
-    clear_if_ended(&mut tx, req.tenant_id, req.membership_id, at).await?;
+    // Restore if retained, clear if expired (#3511 §3, Ruling R4).
+    reopen_profile(&mut tx, req.tenant_id, req.membership_id, at).await?;
     let assignment_id = insert_assignment(
         &mut tx,
         req.tenant_id,
@@ -93,49 +98,6 @@ pub async fn grant_role(
     .await?;
     tx.commit().await?;
     Ok(assignment_id)
-}
-
-/// Under D3 an ended membership holds neither a name nor a contact address, but one whose
-/// roles simply ran out is not revoked, so the daily sweep (`clear_ended_profiles`) may not
-/// have reached it yet. A new role must not make the old fields valid again, so before the
-/// assignment is inserted, and under the tenant lock the caller holds, this clears both
-/// when the membership has ended today, audited exactly as the sweep audits it (final
-/// review I1, controller ruling Q13). The returning member states their name again.
-async fn clear_if_ended(
-    conn: &mut PgConnection,
-    tenant_id: Uuid,
-    membership_id: Uuid,
-    at: Moment,
-) -> Result<(), MembershipError> {
-    let cleared: Option<Uuid> = sqlx::query_scalar(&format!(
-        "update memberships m
-            set encrypted_display_name = null, encrypted_contact_email = null
-          where m.tenant_id = $1 and m.id = $2
-            and (m.encrypted_display_name is not null or m.encrypted_contact_email is not null)
-            and {}
-         returning m.id",
-        membership_ended("$3")
-    ))
-    .bind(tenant_id)
-    .bind(membership_id)
-    .bind(date_param(at.today()))
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some(id) = cleared {
-        write_audit(
-            conn,
-            at,
-            Audit::system(
-                tenant_id,
-                "membership.profile_cleared",
-                "membership",
-                id,
-                json!({ "cause": "membership_ended" }),
-            ),
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -280,18 +242,28 @@ pub async fn revoke_membership(
     if !leaving {
         require_admin(&mut tx, req.tenant_id, req.actor_membership_id, at.today()).await?;
     }
-    let target: Option<bool> = sqlx::query_scalar(
-        "select revoked_at is not null from memberships where tenant_id = $1 and id = $2 for update",
-    )
+    let target: Option<(bool, bool, Option<String>, bool)> = sqlx::query_as(&format!(
+        "select m.revoked_at is not null,
+                (m.encrypted_display_name is not null or m.encrypted_contact_email is not null),
+                to_char(m.profile_retained_until, 'YYYY-MM-DD'),
+                {}
+           from memberships m where m.tenant_id = $1 and m.id = $2 for update",
+        membership_ended("$3")
+    ))
     .bind(req.tenant_id)
     .bind(req.membership_id)
+    .bind(date_param(at.today()))
     .fetch_optional(&mut *tx)
     .await?;
-    match target {
+    // A stamp counts only on a membership that had already ended (roles that ran out, the
+    // sweep having noticed). On a row active until this revocation it can only be a stale
+    // date left by a binary from before migration 0009, so it is ignored and the period is
+    // computed fresh.
+    let (has_fields, stamped) = match target {
         None => return Err(MembershipError::UnknownMembership),
-        Some(true) => return Err(MembershipError::MembershipRevoked),
-        Some(false) => {}
-    }
+        Some((true, _, _, _)) => return Err(MembershipError::MembershipRevoked),
+        Some((false, has_fields, stamped, ended)) => (has_fields, stamped.filter(|_| ended)),
+    };
 
     let admins = AdminState::load(&mut tx, req.tenant_id).await?;
     let leaves_none = check_last_admin(&admins, at.today(), req.confirm_no_admin, |_, m| {
@@ -299,20 +271,6 @@ pub async fn revoke_membership(
     })?;
 
     let now = ts_param(at.now());
-    sqlx::query(
-        // Neither field outlives the membership (D3, 28 September 2026): history shows an
-        // ended membership as its role and year, never a name. Migration 0008's two
-        // *_only_while_current checks refuse a revocation that forgets either.
-        "update memberships
-            set revoked_at = $3::timestamptz,
-                encrypted_display_name = null, encrypted_contact_email = null
-          where tenant_id = $1 and id = $2",
-    )
-    .bind(req.tenant_id)
-    .bind(req.membership_id)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
     sqlx::query(
         "update role_assignments set revoked_at = $3::timestamptz
           where tenant_id = $1 and membership_id = $2
@@ -326,6 +284,54 @@ pub async fn revoke_membership(
     .await?;
     revoke_ended_admin_roles_with_open_window(&mut tx, req.tenant_id, req.membership_id, at)
         .await?;
+    // #3511: the fields are kept, hidden, for the account's period from the day the
+    // membership ended (plan Ruling R2, `ended_on_for`), or cleared now for a period of
+    // none. An end the sweep already stamped (roles that ran out) keeps its stamp: no new
+    // date and no second `profile_retained` (final review I2). Written after the
+    // assignment cascade, so the end date sees the spans it cut short. Migration 0009's
+    // *_only_while_current_or_retained checks refuse a revocation that keeps a field
+    // without the date.
+    let keep = if has_fields {
+        effective_keep_until(
+            &mut tx,
+            req.tenant_id,
+            req.membership_id,
+            stamped.as_deref(),
+            at.today(),
+        )
+        .await?
+    } else {
+        None
+    };
+    sqlx::query(
+        "update memberships
+            set revoked_at = $3::timestamptz,
+                profile_retained_until = $4::date,
+                encrypted_display_name =
+                  case when $4::date is null then null else encrypted_display_name end,
+                encrypted_contact_email =
+                  case when $4::date is null then null else encrypted_contact_email end
+          where tenant_id = $1 and id = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(&now)
+    .bind(keep.map(date_param))
+    .execute(&mut *tx)
+    .await?;
+    match keep {
+        Some(until) if stamped.is_none() => {
+            audit_profile_retained(&mut tx, req.tenant_id, req.membership_id, at, until).await?
+        }
+        Some(_) => {}
+        None if has_fields => {
+            let cause =
+                clearing_cause(&mut tx, req.tenant_id, req.membership_id, stamped.is_some())
+                    .await?;
+            audit_profile_cleared(&mut tx, req.tenant_id, req.membership_id, at, cause).await?
+        }
+        None => {}
+    }
     sqlx::query(
         "update handover_grants g set revoked_at = $3::timestamptz
            from role_assignments ra
@@ -349,8 +355,9 @@ pub async fn revoke_membership(
     remove_from_all_groups(
         &mut tx,
         req.tenant_id,
-        req.actor_membership_id,
+        Some(req.actor_membership_id),
         req.membership_id,
+        "membership_revoked",
         at,
     )
     .await?;

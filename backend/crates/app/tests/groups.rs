@@ -343,6 +343,84 @@ async fn members_are_added_once_and_removed_softly() {
     );
 }
 
+/// Erik, 29 September 2026: a membership whose roles ran out grants nothing and the sweep
+/// would remove a group row for it (M6), so adding it is refused with
+/// `MembershipEndedInviteAsGuest` -- the screen offers a guest invitation instead. Nothing
+/// is written or audited. A non-admin still gets `NotAuthorized` first: authority before
+/// row state.
+///
+/// Mutation check: drop the ended check in `add_group_member` and the admin's add succeeds.
+#[tokio::test]
+async fn adding_a_member_whose_roles_ran_out_offers_a_guest_invitation() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let admin = fau.admin_membership_id;
+    let group = seed_group(&pool, &fau, Visibility::Open).await;
+    let ran_out = add_member(
+        &pool,
+        &fau,
+        "ferdig@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 9, 1), day(2026, 10, 1)),
+        at(T0),
+    )
+    .await
+    .membership_id;
+    let other = member(&pool, &fau, "annen@example.test").await;
+    let later = at("2026-10-15T10:00:00Z");
+
+    assert_eq!(
+        add_group_member(&pool, change(&fau, other, group, ran_out), later)
+            .await
+            .unwrap_err(),
+        MembershipError::NotAuthorized
+    );
+    assert_eq!(
+        add_group_member(&pool, change(&fau, admin, group, ran_out), later)
+            .await
+            .unwrap_err(),
+        MembershipError::MembershipEndedInviteAsGuest
+    );
+    assert_eq!(
+        count(
+            &pool,
+            &format!("select count(*) from group_members where membership_id = '{ran_out}'")
+        )
+        .await,
+        0
+    );
+    assert_eq!(audit_count(&pool, "group.member_added").await, 0);
+}
+
+/// Controls for the refusal above: an active member is added, and so is a member whose
+/// only role is still to start -- not ended, so not refused.
+#[tokio::test]
+async fn an_active_member_or_one_whose_roles_start_later_is_added() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let admin = fau.admin_membership_id;
+    let group = seed_group(&pool, &fau, Visibility::Open).await;
+    let active = member(&pool, &fau, "aktiv@example.test").await;
+    let future = add_member(
+        &pool,
+        &fau,
+        "senere@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        period(day(2026, 11, 1), day(2027, 11, 1)),
+        at(T0),
+    )
+    .await
+    .membership_id;
+    for m in [active, future] {
+        add_group_member(&pool, change(&fau, admin, group, m), at(T0))
+            .await
+            .unwrap();
+    }
+    assert_eq!(audit_count(&pool, "group.member_added").await, 2);
+}
+
 #[tokio::test]
 async fn closing_opening_renaming_and_archiving() {
     let db = TestDb::migrated().await;

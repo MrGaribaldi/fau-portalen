@@ -148,6 +148,10 @@ pub enum MembershipError {
     /// running or yet to start -- so it holds no name (Erik's D3, 28 September 2026).
     #[error("the membership has ended")]
     MembershipEnded,
+    /// The export's audit trail (#3502 Task 8): a selection of nobody has nothing to hand
+    /// over and nothing to audit.
+    #[error("nothing was selected")]
+    EmptySelection,
 
     // Infrastructure.
     #[error("the operating system's random source failed")]

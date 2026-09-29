@@ -29,6 +29,7 @@ mod authz;
 mod directory;
 mod error;
 mod events;
+mod export;
 mod groups;
 mod handover;
 mod invitations;
@@ -48,6 +49,7 @@ pub use directory::{
 };
 pub use error::{ExistingFau, MembershipError};
 pub use events::{Change, Hub, HubClock, Subscription, EVENTS_CHANNEL, SUBSCRIPTION_BUFFER};
+pub use export::{export_addresses, AddressExport, ExportPurpose, ExportScope, ExportedRecipient};
 pub use groups::{
     add_group_member, archive_group, create_group, get_group, list_group_members, list_groups,
     remove_group_member, rename_group, set_group_visibility, ArchiveGroup, CreateGroup,

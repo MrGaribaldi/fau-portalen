@@ -31,8 +31,10 @@ mod events;
 mod groups;
 mod handover;
 mod invitations;
+mod names;
 mod profile;
 mod requests;
+mod retention;
 mod roles;
 mod signup;
 mod sql;
@@ -55,6 +57,7 @@ pub use invitations::{
     InvitationMessage, InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole,
     RoleChoice, INVITATION_MESSAGE_AAD,
 };
+pub use names::{member_names, MemberName};
 pub use profile::{
     set_contact_email, set_display_name, MemberProfile, SetContactEmail, SetDisplayName,
     CONTACT_EMAIL_AAD, DISPLAY_NAME_AAD, MEMBER_FIELD_CIPHERTEXT_BYTES,
@@ -64,6 +67,7 @@ pub use requests::{
     decline_request, lapse_requests, AccessRequestMessage, CreateAccessRequest,
     CreateReplacementProposal, RequestDecision, ACCESS_REQUEST_MESSAGE_AAD, MESSAGE_MAX_BYTES,
 };
+pub use retention::{clear_ended_profiles, erase_member_names};
 pub use roles::{
     grant_role, revoke_membership, revoke_role_assignment, GrantRole, RevokeAssignment,
     RevokeMembership,

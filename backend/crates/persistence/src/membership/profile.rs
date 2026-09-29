@@ -253,6 +253,11 @@ pub struct SetContactEmail {
 /// clearing one reduces what others see, so it is allowed while frozen. Either needs
 /// standing today: someone whose roles have ended has no address to show, and the
 /// retention sweep clears it.
+///
+/// Refused for a name an Article 17 erasure removed (`MembershipErased`), the same as
+/// `set_display_name`: without this check, writing (even clearing) hits migration 0008's
+/// `memberships_erasure_leaves_nothing` check constraint as a raw database error instead of
+/// a typed refusal (controller ruling, Task 5 review).
 pub async fn set_contact_email(
     pool: &PgPool,
     req: SetContactEmail,
@@ -269,6 +274,16 @@ pub async fn set_contact_email(
     let access = membership_access(&mut tx, req.tenant_id, req.membership_id, at.today()).await?;
     if access.capability == Capability::None {
         return Err(MembershipError::NotAuthorized);
+    }
+    let erased: bool = sqlx::query_scalar(
+        "select name_erased_at is not null from memberships where tenant_id = $1 and id = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if erased {
+        return Err(MembershipError::MembershipErased);
     }
     sqlx::query(
         "update memberships set encrypted_contact_email = $3 where tenant_id = $1 and id = $2",

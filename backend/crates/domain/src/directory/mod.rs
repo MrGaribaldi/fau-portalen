@@ -8,4 +8,5 @@
 
 pub mod address;
 pub mod collation;
+pub mod history;
 pub mod listing;

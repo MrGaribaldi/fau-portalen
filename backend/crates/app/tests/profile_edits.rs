@@ -500,3 +500,60 @@ async fn set_contact_email_refuses_a_cross_tenant_revoked_or_ended_membership() 
         "ended"
     );
 }
+
+/// Controller ruling (Task 5 review): `set_contact_email` had no `name_erased_at` check,
+/// so writing to (or clearing) an erased membership hit migration 0008's
+/// `memberships_erasure_leaves_nothing` check constraint -- a raw database error -- instead
+/// of the typed refusal every other write on an erased row returns.
+///
+/// Mutation check: drop the `name_erased_at` check from `set_contact_email`, and setting a
+/// value below returns `MembershipError::Database(..)` (sqlstate 23514, migration 0008's
+/// check constraint) instead of `MembershipErased`.
+#[tokio::test]
+async fn set_contact_email_on_an_erased_membership_is_refused_before_the_database_constraint() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let kari = add_member(
+        &pool,
+        &fau,
+        "kari@example.test",
+        new_role("Medlem", CapabilityClass::Member),
+        year(),
+        t0,
+    )
+    .await;
+    assert_eq!(
+        erase_member_names(&pool, kari.account_id, t0)
+            .await
+            .unwrap(),
+        1
+    );
+    let set = |v: Option<Ciphertext>| {
+        let pool = pool.clone();
+        async move {
+            set_contact_email(
+                &pool,
+                SetContactEmail {
+                    tenant_id: fau.tenant_id,
+                    membership_id: kari.membership_id,
+                    encrypted_contact_email: v,
+                },
+                t0,
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        set(Some(envelope(1))).await,
+        Err(MembershipError::MembershipErased),
+        "setting a value"
+    );
+    assert_eq!(
+        set(None).await,
+        Err(MembershipError::MembershipErased),
+        "clearing to None"
+    );
+    assert_eq!(contact_of(&pool, kari.membership_id).await, None);
+}

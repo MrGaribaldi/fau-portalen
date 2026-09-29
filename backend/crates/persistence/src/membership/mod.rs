@@ -26,6 +26,7 @@
 
 mod access;
 mod authz;
+mod directory;
 mod error;
 mod events;
 mod groups;
@@ -42,6 +43,9 @@ mod token;
 
 pub use access::effective_access;
 pub use authz::{authorize, read_transaction, Resource, Viewer};
+pub use directory::{
+    member_directory, DirectoryAddress, DirectoryPerson, DirectoryRead, DirectorySection,
+};
 pub use error::{ExistingFau, MembershipError};
 pub use events::{Change, Hub, HubClock, Subscription, EVENTS_CHANNEL, SUBSCRIPTION_BUFFER};
 pub use groups::{

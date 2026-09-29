@@ -337,6 +337,8 @@ pub(crate) async fn reopen_profile(
 /// FAU, under that FAU's lock, taken once for both passes, each row re-decided under it,
 /// so a role granted concurrently is never swept past. Returns how many profiles it
 /// cleared; group removals are not counted.
+///
+/// Runs on a frozen FAU too: it only reduces what is kept, a system privacy action.
 pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, MembershipError> {
     let today = date_param(at.today());
     let candidates = |tenant_filter: &str| {
@@ -443,6 +445,9 @@ pub async fn clear_ended_profiles(pool: &PgPool, at: Moment) -> Result<u64, Memb
 /// that pre-read list -- for instance one accepted into after this transaction's read --
 /// settles under whatever `retention_months` is visible to it at that moment, so it can
 /// be stamped under the old value if that happens before this transaction commits.
+///
+/// Runs on a frozen FAU too, with no `require_open`: it is the member's own privacy setting
+/// over their own fields, it grants nothing, and it never revives a period already over.
 pub async fn set_retention_months(
     pool: &PgPool,
     account_id: Uuid,

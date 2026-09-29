@@ -36,6 +36,13 @@ pub enum MemberName {
     /// encrypted as for `Named`, for events on or after `period.since`, and role and year
     /// for anything earlier (`period.label_on`). Others never see the returner's name on
     /// their old contributions. Never produced by the directory.
+    ///
+    /// **Rendering contract** (final review I4, binding on #3417 and every renderer): the
+    /// server resolves each event to exactly one of the decrypted name or the role label
+    /// from `period.label_on(event_date)`, and sends only that. For an event shown by role
+    /// it never sends this variant, `period.earlier`, or the author's membership id to a
+    /// viewer: together they link the returner to their earlier contributions, which M1
+    /// forbids.
     Returned {
         name: Ciphertext,
         period: ActivePeriod,

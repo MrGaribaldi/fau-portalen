@@ -3296,8 +3296,9 @@ throughout. The plan's rulings, one line each:
 - **R1:** the period is stored, not recomputed on every read — set when the end is noticed
   (`revoke_membership`, or `settle_profile` for a natural end), so changing the setting later is
   an explicit recalculation, never a silent side effect.
-- **R2:** `ended_on` is the latest day any role stopped being held, and never later than today —
-  a row that held no role at all ended today.
+- **R2:** `ended_on` is the latest day any role stopped being held, and never later than today.
+  A row that held no role at all ended on its revocation date (the membership's, else its latest
+  assignment's), so recomputing never moves a period (final review I2, `ended_on_for`).
 - **R3:** the check constraint holds only the shape — a revoked row keeps a field only while
   `profile_retained_until` is set — because a check cannot read the clock; the date comparison
   belongs to the sweep.
@@ -3330,9 +3331,9 @@ and year; and that the member can shorten their period to none at any time.
 
 **M5:** the account lapse follows `retention_months` (entry above); binds #3426.
 
-**M6:** group memberships end with the membership, however it ends (entry above); ended
-memberships are removed by the sweep or on return, audited as the system with cause
-`membership_ended`.
+**M6:** group memberships end with the membership, however it ends (entry above). A revocation
+removes them at once, audited as the revoking actor with cause `membership_revoked`; an end noticed
+by the sweep or on return is audited as the system with cause `membership_ended`.
 
 **Open question for Erik:** `add_group_member` still accepts a membership whose roles simply ran
 out (only a revoked one is refused). The row is removed by the next sweep or return and grants

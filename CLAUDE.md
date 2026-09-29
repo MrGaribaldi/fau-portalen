@@ -58,15 +58,15 @@ pending, and `db_memory_request` never belonged to the cloudnativepg operator. *
 provider is now declared in FAU's root (token from `persistent_outputs`, not upstream's
 `bootstrap_outputs`), the CCM adopted `lb-fau`, and nginx answers on 77.42.10.236 / port 443 with
 its default certificate. cert-manager is next and no longer waits for #3434: the placeholder
-`fau-lab.bim.graphics` resolves to the load balancer, `certificate_email` is
+`fau-lab.bim.graphics` resolves to the load balancer (replaced by the registered `fau-portalen.no`, 29 September), `certificate_email` is
 `kontakt@ewb-solutions.as`, the empty Cloudflare token is accepted as harmless clutter, and a
 `letsencrypt-staging` ClusterIssuer is proposed before production ACME sees a placeholder. Stages
 plan clean except one deliberate drift: `lb-fau` has delete protection turned on by hand (23
 September 2026) because the upstream module has no variable for it, so **stage 1 proposes
 `delete_protection: true -> false` on `module.bootstrap_network.hcloud_load_balancer.nginx[0]` —
 never apply that change**; the upstream fix is #3497. Two hygiene findings from inspecting the applied cluster are on
-#3488 (docs/cluster-hygiene-findings-2026-09-10.md): off-node etcd snapshot retention behaves as ~5
-hours rather than the configured 168, while local retention honours it; and there are **two default
+#3488 (docs/cluster-hygiene-findings-2026-09-10.md): off-node etcd snapshot retention behaved as ~5
+hours rather than the configured 168, fixed by a drop-in applied 10 September (verified 29 September: ~170 hourly snapshots in S3); and there are **two default
 StorageClasses** — `hcloud-volumes` from the CSI install and k3s's `local-path` — so every PVC and
 stateful workload must set `storageClassName` explicitly, or a Postgres volume can land on
 node-local disk. Details in docs/stage-2-readiness.md. Terraform state is remote in the private `fau-tfstate`
@@ -226,7 +226,14 @@ the nodes must run without swap) blocks
 one authorization function (`fau_domain::authz::decide` plus `fau_persistence::membership::authorize`),
 and the per-FAU change stream. There is no HTTP SSE route until #3417. Every read path must call
 `authorize` inside `read_transaction`. The shared dev Postgres crash-restarts under full parallel
-tests, so run `cargo test --workspace -- --test-threads=4`.
+tests (fixed 28 September by `shm_size: 256m`).
+
+**#3502 (member directory) is built** on branch `directory-3502` (29 September), not merged. It
+stores encrypted display names and contact addresses on memberships. Under Erik's D3, both
+exist only while a membership is active, and history shows role and year afterwards. It adds
+the directory read through #3501's rule and an audited address export. Screen and routes wait
+for #3417. The dev Postgres runs with `shm_size: 256m`, which fixed the crash, so default test
+parallelism is fine. Never run two workspace test runs at once (100-connection cap).
 
 **Archiving for non-payment** (#3509, docs/fau-archive-design.md, awaiting Erik's review) is paused,
 not deleted. It is read-only first with keys live, then keys are soft-deleted for up to 365 days.

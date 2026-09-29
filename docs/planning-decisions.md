@@ -3281,3 +3281,8 @@ or on erasure. Design in docs/member-retention-design.md. The new retention stat
 - Amended: ADR-003 §6a (docs/identity-and-encryption.md), docs/fau-creation-and-membership-flow.md,
   docs/member-retention-design.md §4. No lapse code exists yet; #3426 builds it to this rule.
 - Erik also chose subagent-driven execution of docs/superpowers/plans/2026-09-29-member-retention-3511.md.
+- **M6 (Erik, in chat, during the #3511 build):** a membership that ends, whether revoked or because its roles ran
+  out, leaves every group it was added to by hand. Before this, only revocation did (#3501 Ruling R15), so a member
+  whose roles ran out and who came back, for example as a guest, reached their old groups again. "They should not
+  retain group memberships, since they could be invited back to other groups. If the FAU wants to give further
+  access, they can give them a role instead of just being a guest." Built as Task 9 of the #3511 plan.

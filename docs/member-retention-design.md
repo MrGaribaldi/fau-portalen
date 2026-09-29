@@ -22,6 +22,7 @@ store the data."
 | M3 | Scope | **Per FAU.** Each FAU remembers its own former member, encrypted under that FAU's record key. Deleting or crypto-shredding the FAU removes it |
 | M4 | Timing | **A follow-up card after #3502 is merged**, with migration 0009 |
 | M5 | The account's login email | **Lapses after the same chosen period** once the last membership anywhere ends (at once for none), replacing ADR-003 §6a's fixed 3 months. Decided when reviewing the #3511 plan. #3426 builds the lapse |
+| M6 | Group memberships of an ended membership | **End with the membership, however it ends** (revoked or roles ran out). A returner starts with no groups; a guest reaches only the group its role names, and more access means a role. Decided during the #3511 build |
 
 ## 3. States of a membership's profile
 

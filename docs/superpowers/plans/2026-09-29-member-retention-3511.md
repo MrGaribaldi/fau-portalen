@@ -1965,6 +1965,7 @@ In each hit, change the statement to the #3511 rule: an ended membership's field
   - plan Rulings R1–R10, one line each;
   - the privacy text owed to #3426 (spec §5);
   - Erik's M5 (R10): the account lapse follows `retention_months`, which binds #3426;
+  - Erik's M6 (Task 9): group memberships end with the membership, however it ends; a returner starts with no groups, and more access means a role;
   - the Bokmål source strings the screen will need, as catalogue entries only: `retention.setting.label` = "Hvor lenge skal vi huske deg etter at du går ut?", with options `retention.none` = "Ikke i det hele tatt", `retention.months` = "{months} måneder" and `retention.default` = "(standard)". Mark them "proposed; the screen card (#3417) owns the final text".
 
 - [ ] **Step 4: Commit**
@@ -1975,6 +1976,39 @@ git commit -m "Record #3511: retention rulings, privacy text owed to #3426 (#351
 
 Co-Authored-By: <your trailer>"
 ```
+
+---
+
+### Task 9: Group memberships end with the membership (Erik, 29 September 2026)
+
+Erik's decision, made during execution: "they should not retain group memberships, since they could be invited back to other groups. If the FAU wants to give further access, they can give them a role instead of just being a guest." Today only `revoke_membership` removes the hand-added group memberships (`remove_from_all_groups`, #3501 Ruling R15). A membership whose roles simply ran out keeps its `group_members` rows, so if it comes back, as a guest through `grant_role` or as anyone through an invitation, the person reaches their old groups again. From now on, an ended membership leaves every group it was added to by hand, however it ended.
+
+**Files:**
+- Modify: `backend/crates/persistence/src/membership/groups.rs` (`remove_from_all_groups`)
+- Modify: `backend/crates/persistence/src/membership/roles.rs` (its call in `revoke_membership`)
+- Modify: `backend/crates/persistence/src/membership/retention.rs` (`reopen_profile`, `clear_ended_profiles`)
+- Modify: `backend/crates/app/tests/member_retention.rs`
+
+**Interfaces:**
+- Consumes: `reopen_profile`, `clear_ended_profiles`, `membership_ended` (earlier tasks); `add_group_member`, `list_groups` and the test helpers in `crates/app/tests/common/groups.rs`.
+- Produces: `remove_from_all_groups(conn, tenant_id, actor: Option<Uuid>, membership_id, cause: &'static str, at)`. `Some(actor)` audits as that member, as today. `None` audits as the system. Each removal is audited `group.member_removed` with `{ "membership_id", "cause" }`. `revoke_membership` passes `Some(actor)` and `"membership_revoked"`, exactly as today. The new callers pass `None` and `"membership_ended"`.
+
+- [ ] **Step 1: Write the failing tests** in `member_retention.rs`:
+  - `a_member_whose_roles_ran_out_leaves_their_groups_in_the_sweep`: a member is added by hand to a closed group, and their one role runs out. The next `clear_ended_profiles` removes the `group_members` row (`removed_at` set) and writes one `group.member_removed` audit with actor kind `system` and cause `membership_ended`. An active member added to the same group keeps their row (the control). *Mutation check: drop the sweep's group pass, and the row stays.*
+  - `a_guest_returning_before_any_sweep_reaches_only_the_guest_group`: a member is added by hand to closed group Y, and their roles run out. No sweep runs. `grant_role` gives them a guest role on group X. As that member, `list_groups` returns exactly [X]. *Mutation check: remove the group removal from `reopen_profile`, and Y comes back.*
+  - `returning_by_invitation_starts_with_no_groups`: the same setup, but the return is through an invitation (the `reinvite` helper) to a member role. The old hand-added group membership is gone, and `list_groups` shows Y only if Y is open, never as `viewer_in_group`. Assert `viewer_in_group == false` for Y.
+  - `an_active_member_keeps_their_groups_when_granted_another_role`: control. `grant_role` to an active member who is in Y by hand leaves the row in place and writes no removal audit.
+
+- [ ] **Step 2: Run and see them fail.** Run: `cargo test -p fau-app --test member_retention groups guest_returning invitation_starts active_member_keeps`
+
+- [ ] **Step 3: Implement.**
+  - Change `remove_from_all_groups` as in Interfaces. Build a system audit with `Audit::system(tenant_id, "group.member_removed", "group", group_id, params)` when `actor` is `None`. Look at the existing `audit(...)` helper in `groups.rs` for the subject type and use the same one. Keep the NOTIFY per group.
+  - In `reopen_profile`, before the reopening update, read `membership_ended` for the row (the caller holds the tenant lock). If it has ended, call `remove_from_all_groups(conn, tenant_id, None, membership_id, "membership_ended", at)`. Do this whatever `settle_profile` returned: a row with no fields (`Absent`) can still be ended and still hold group rows.
+  - In `clear_ended_profiles`, add a second pass. Collect the tenants that have an ended membership with a `group_members` row where `removed_at is null`, in tenant-id order, merged with the tenants of the existing pass. Under each tenant's lock, re-select those memberships and call `remove_from_all_groups(..., None, ..., "membership_ended", at)`. The function's return value still counts only cleared profiles; update its doc comment to say it also ends group memberships. Take each tenant's lock once per tenant, not once per pass.
+
+- [ ] **Step 4: Run the new tests, then the whole suite.** `groups.rs`/`guests.rs`/`group_reads.rs` tests that call `revoke_membership` must pass unchanged.
+
+- [ ] **Step 5: Commit** with the message `End group memberships when a membership ends, however it ends (#3511)`.
 
 ---
 

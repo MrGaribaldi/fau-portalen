@@ -17,7 +17,9 @@ use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::authz::read_transaction;
 use super::error::MembershipError;
+use super::profile::{write_profile, MemberProfile};
 use super::sql::{
     date_param, enqueue, ensure_membership, from_micros, handover_grant_valid, insert_assignment,
     is_admin_today, lock_tenant, membership_usable, period_from, recovery_notice_recipients,
@@ -720,6 +722,10 @@ pub struct AcceptInvitation {
     /// invitation offers (spec 3.4.3, 3.5), within the same 1–24 month range. Refused on
     /// any other mode.
     pub admin_end_override: Option<Date>,
+    /// The acceptor's display name, and optionally a contact address, encrypted for
+    /// `prepare_acceptance`'s membership id (groups design §4.1, #3502). Required: this is
+    /// where names enter the system.
+    pub profile: MemberProfile,
 }
 
 /// Hand-written so `token` never reaches a log line the way a derived `Debug` would.
@@ -729,6 +735,7 @@ impl fmt::Debug for AcceptInvitation {
             .field("token", &"[redacted]")
             .field("acceptor", &self.acceptor)
             .field("admin_end_override", &self.admin_end_override)
+            .field("profile", &self.profile)
             .finish()
     }
 }
@@ -755,6 +762,7 @@ pub async fn accept_invitation(
     if !looks_like_token(&req.token) {
         return Err(MembershipError::UnknownInvitation);
     }
+    req.profile.check()?;
     let hash = hash_token(&req.token);
     let mut tx = pool.begin().await?;
 
@@ -868,7 +876,15 @@ pub async fn accept_invitation(
     };
 
     let (account_id, _) = upsert_verified_account(&mut tx, &acceptor_email, at).await?;
-    let (membership_id, reused) = ensure_membership(&mut tx, tenant_id, account_id).await?;
+    let (membership_id, reused, already_current) = ensure_membership(
+        &mut tx,
+        tenant_id,
+        account_id,
+        req.profile.membership_id,
+        at.today(),
+    )
+    .await?;
+    write_profile(&mut tx, tenant_id, &req.profile, already_current).await?;
     let mut assignment_ids = Vec::with_capacity(roles.len());
     for (role_id, _, period) in &roles {
         assignment_ids.push(
@@ -932,6 +948,92 @@ pub async fn accept_invitation(
     })
 }
 
+/// Which FAU and which membership an acceptance will write to, so the caller can fetch that
+/// FAU's record key and encrypt the acceptor's profile for that membership's id before
+/// calling [`accept_invitation`] (#3502). The membership is the acceptor's existing one in
+/// that FAU -- a re-invited former member keeps theirs -- or a fresh UUIDv7 that becomes the
+/// new row's id.
+///
+/// Reads only, in one snapshot ([`read_transaction`], the read-path rule): the invitation
+/// lookup and the existing-membership lookup must see the same database state.
+///
+/// It answers for any invitation the token names, pending or not, as long as the verified
+/// address is its recipient: [`accept_invitation`] then gives the precise refusal (expired,
+/// withdrawn, already accepted). Every other failure is `UnknownInvitation`, so the answer
+/// never says which part failed.
+///
+/// `at` supplies the date the shared "has this membership ended?" predicate
+/// (`profile::membership_ended`, D3) is read against: rule-deciding time always comes from
+/// the caller, never the database clock.
+pub async fn prepare_acceptance(
+    pool: &PgPool,
+    token: &str,
+    acceptor: &VerifiedEmail,
+    at: Moment,
+) -> Result<AcceptanceTarget, MembershipError> {
+    if !looks_like_token(token) {
+        return Err(MembershipError::UnknownInvitation);
+    }
+    let mut tx = read_transaction(pool).await?;
+    let row: Option<(Uuid, String)> =
+        sqlx::query_as("select tenant_id, recipient_email from invitations where token_hash = $1")
+            .bind(hash_token(token))
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (tenant_id, recipient) = row.ok_or(MembershipError::UnknownInvitation)?;
+    if recipient != acceptor.email().as_str() {
+        return Err(MembershipError::UnknownInvitation);
+    }
+    // Whether the row is current -- has not ended (`profile::membership_ended`, D3 --
+    // shared with `ensure_membership` and with editing) and its name was not erased -- is
+    // what tells the caller "this is an already-current member accepting another
+    // invitation" (a handover to a sitting member, or recovery) -- so it can prefill, and
+    // so `accept_invitation`'s `write_profile` knows to keep a stored contact address the
+    // new profile leaves unstated (fix round 1, Q10). Found-but-not-current (ended, ran
+    // out ahead of the sweep, or erased) still names the row: acceptance reopens it (an
+    // erasure is refused later, by `ensure_membership`'s own `MembershipErased` check).
+    //
+    // Fix round 1, Q11 (minor): without `m.name_erased_at is null`, an unrevoked row
+    // whose name was erased -- or, before migration 0008, one created before names
+    // existed at all -- would report `existing_current = true` with no name to prefill.
+    let sql = format!(
+        "select m.id, (not ({ended}) and m.name_erased_at is null)
+           from memberships m join accounts a on a.id = m.account_id
+          where m.tenant_id = $1 and a.email = $2",
+        ended = super::profile::membership_ended("$3")
+    );
+    let existing: Option<(Uuid, bool)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .bind(acceptor.email().as_str())
+        .bind(date_param(at.today()))
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let (membership_id, existing_current) = match existing {
+        Some((id, current)) => (id, current),
+        None => (Uuid::now_v7(), false),
+    };
+    Ok(AcceptanceTarget {
+        tenant_id,
+        membership_id,
+        existing_current,
+    })
+}
+
+/// Where an acceptance will write: see [`prepare_acceptance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptanceTarget {
+    pub tenant_id: Uuid,
+    pub membership_id: Uuid,
+    /// Whether this is a current membership whose name the caller may prefill: it exists,
+    /// has not ended (`profile::membership_ended`, D3) and its name was not erased -- an
+    /// active member reached by a second invitation (a handover to a sitting member, or
+    /// recovery). The caller may prefill an acceptance form with it rather than asking
+    /// again, and knows `write_profile` will keep the stored contact address if the new
+    /// profile leaves it unstated (fix round 1, Q10).
+    pub existing_current: bool,
+}
+
 /// The invitee's view of the message (decision of 24 September 2026). Every failure is
 /// `UnknownInvitation`, so the answer never says which part failed.
 pub async fn invitation_message(
@@ -988,6 +1090,11 @@ mod tests {
             token: token.clone(),
             acceptor: VerifiedEmail::from_provider(Email::parse("ny@example.test").unwrap()),
             admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: Uuid::now_v7(),
+                encrypted_display_name: fau_crypto::Ciphertext::from_stored(vec![1; 42]),
+                encrypted_contact_email: None,
+            },
         };
         let debug = format!("{req:?}");
         assert!(!debug.contains(&token));

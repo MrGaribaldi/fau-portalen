@@ -40,6 +40,7 @@ impl Email {
             || !domain.contains('.')
             || domain.starts_with('.')
             || domain.ends_with('.')
+            || !domain.split('.').all(is_domain_label)
         {
             return Err(EmailError::Malformed);
         }
@@ -49,6 +50,16 @@ impl Email {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// A domain label: non-empty, Unicode alphanumerics or `-` only (so IDN domains like
+/// `blåbær.no` stay valid and address literals like `[1.2.3.4]` are refused), and never
+/// starting or ending with `-`.
+fn is_domain_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 
 impl fmt::Debug for Email {
@@ -107,6 +118,29 @@ mod tests {
         ] {
             assert_eq!(Email::parse(bad), Err(EmailError::Malformed), "{bad}");
         }
+    }
+
+    #[test]
+    fn parse_rejects_domains_with_invalid_characters() {
+        for bad in [
+            "a@fau,attacker.example",
+            "a@x;y.no",
+            "a@-x.no",
+            "a@x-.no",
+            "a@x..no",
+            "a@[1.2.3.4]",
+        ] {
+            assert_eq!(Email::parse(bad), Err(EmailError::Malformed), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_idn_and_hyphenated_domain_labels() {
+        assert_eq!(Email::parse("a@blåbær.no").unwrap().as_str(), "a@blåbær.no");
+        assert_eq!(
+            Email::parse("a@sub-domain.example.no").unwrap().as_str(),
+            "a@sub-domain.example.no"
+        );
     }
 
     #[test]

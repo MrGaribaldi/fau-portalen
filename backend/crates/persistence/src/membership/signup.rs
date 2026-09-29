@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::error::{ExistingFau, MembershipError};
 use super::invitations::{insert_invitation, IssuedInvitation, NewInvitation};
+use super::profile::{write_profile, MemberProfile};
 use super::sql::{
     date_param, enqueue, ensure_membership, from_micros, insert_assignment, lock_tenant,
     parse_date, ts_param, upsert_verified_account, write_audit, ActorKind, Audit,
@@ -310,6 +311,10 @@ pub struct Activation {
     pub tenant_id: Uuid,
     /// The registrant's address, just verified with a Hanko passcode (#3417).
     pub registrant: VerifiedEmail,
+    /// The registrant's display name, and optionally a contact address, encrypted under the
+    /// FAU's record key for a fresh membership id the caller chose (#3502). The FAU is
+    /// pending, so no membership exists yet and any fresh id becomes the new row's.
+    pub profile: MemberProfile,
 }
 
 #[derive(Debug)]
@@ -333,6 +338,7 @@ pub async fn activate_tenant(
     at: Moment,
 ) -> Result<Activated, MembershipError> {
     let tenant_id = activation.tenant_id;
+    activation.profile.check()?;
     let mut tx = pool.begin().await?;
     let state = lock_tenant(&mut tx, tenant_id).await?;
     if state.status != TenantStatus::Pending {
@@ -372,7 +378,15 @@ pub async fn activate_tenant(
     if disabled {
         return Err(MembershipError::AccountDisabled);
     }
-    let (membership_id, _) = ensure_membership(&mut tx, tenant_id, account_id).await?;
+    let (membership_id, _, already_current) = ensure_membership(
+        &mut tx,
+        tenant_id,
+        account_id,
+        activation.profile.membership_id,
+        at.today(),
+    )
+    .await?;
+    write_profile(&mut tx, tenant_id, &activation.profile, already_current).await?;
 
     let admin_role_id = Uuid::now_v7();
     sqlx::query(

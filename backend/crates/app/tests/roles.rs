@@ -532,13 +532,18 @@ async fn a_revoked_membership_with_an_unrevoked_admin_assignment_is_not_an_admin
     )
     .await;
     // No persistence function reaches this shape -- arranged directly with the
-    // superuser pool, per the global constraints (fix round 1, item 5).
-    sqlx::query("update memberships set revoked_at = now() where tenant_id = $1 and id = $2")
-        .bind(fau.tenant_id)
-        .bind(other.membership_id)
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    // superuser pool, per the global constraints (fix round 1, item 5). D3: a revoked
+    // membership holds no name, so the name goes with it (#3502).
+    sqlx::query(
+        "update memberships
+            set revoked_at = now(), encrypted_display_name = null, encrypted_contact_email = null
+          where tenant_id = $1 and id = $2",
+    )
+    .bind(fau.tenant_id)
+    .bind(other.membership_id)
+    .execute(&admin_pool)
+    .await
+    .unwrap();
     assert!(
         !revoked(&pool, "role_assignments", other.assignment_ids[0]).await,
         "the assignment itself stays unrevoked; only the membership was sabotaged"

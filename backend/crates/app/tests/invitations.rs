@@ -49,6 +49,7 @@ fn accept(token: &str, acceptor: &str) -> AcceptInvitation {
         token: token.to_owned(),
         acceptor: verified(acceptor),
         admin_end_override: None,
+        profile: fresh_profile(),
     }
 }
 
@@ -478,6 +479,7 @@ async fn the_leader_accepts_and_may_adjust_the_end_date_within_range() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -488,6 +490,7 @@ async fn the_leader_accepts_and_may_adjust_the_end_date_within_range() {
         token: token.expose().to_owned(),
         acceptor: verified("leder@example.test"),
         admin_end_override: Some(end),
+        profile: fresh_profile(),
     };
 
     let t2 = at("2026-09-25T10:00:00Z");
@@ -544,6 +547,7 @@ async fn an_override_that_would_empty_the_admin_period_is_refused() {
         Activation {
             tenant_id: pending.tenant_id,
             registrant: verified("reg@example.test"),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -563,6 +567,7 @@ async fn an_override_that_would_empty_the_admin_period_is_refused() {
             token: token.expose().to_owned(),
             acceptor: verified("leder@example.test"),
             admin_end_override: Some(day(2026, 9, 23)),
+            profile: fresh_profile(),
         },
         early,
     )
@@ -599,6 +604,7 @@ async fn only_an_activation_invitation_accepts_an_end_date_change() {
             token: issued.token.expose().to_owned(),
             acceptor: verified("ny@example.test"),
             admin_end_override: Some(day(2027, 12, 1)),
+            profile: fresh_profile(),
         },
         t0,
     )
@@ -642,11 +648,16 @@ async fn a_revoked_member_who_is_invited_again_gets_the_same_membership_back() {
         t0,
     )
     .await;
-    sqlx::query("update memberships set revoked_at = now() where id = $1")
-        .bind(first.membership_id)
-        .execute(&db.admin_pool())
-        .await
-        .unwrap();
+    // D3: a revoked membership holds no name, so the sabotage clears it too (#3502).
+    sqlx::query(
+        "update memberships
+            set revoked_at = now(), encrypted_display_name = null, encrypted_contact_email = null
+          where id = $1",
+    )
+    .bind(first.membership_id)
+    .execute(&db.admin_pool())
+    .await
+    .unwrap();
 
     let again = add_member(
         &pool,
@@ -1050,6 +1061,7 @@ async fn resend_keeps_the_message_and_acceptance_ends_it() {
             token: token.clone(),
             acceptor: verified("ny@example.test"),
             admin_end_override: None,
+            profile: fresh_profile(),
         },
         t0,
     )

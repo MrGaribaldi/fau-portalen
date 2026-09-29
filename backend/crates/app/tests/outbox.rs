@@ -131,6 +131,7 @@ async fn every_tenant_scoped_template_writes_its_tenant_id() {
             token: issued.token.expose().to_owned(),
             acceptor: verified("ny-leder@example.test"),
             admin_end_override: None,
+            profile: fresh_profile(),
         },
         t0,
     )

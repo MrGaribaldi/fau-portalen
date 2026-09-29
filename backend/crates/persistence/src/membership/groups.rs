@@ -654,14 +654,26 @@ pub async fn list_groups(
     if access.capability == Capability::None {
         return Err(MembershipError::NotAuthorized);
     }
+    let visible = readable_groups(&mut tx, viewer, access.capability, at).await?;
+    tx.commit().await?;
+    Ok(visible)
+}
+
+/// Every group `capability` may read, with its facts, on the caller's snapshot: the one
+/// source of [`list_groups`] and the member directory's group sections (#3502).
+pub(crate) async fn readable_groups(
+    conn: &mut PgConnection,
+    viewer: Viewer,
+    capability: Capability,
+    at: Moment,
+) -> Result<Vec<GroupView>, MembershipError> {
     let sql = format!("{} order by g.id", group_select());
     let rows: Vec<GroupRow> = sqlx::query_as(&sql)
         .bind(viewer.tenant_id)
         .bind(viewer.membership_id)
         .bind(date_param(at.today()))
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
-    tx.commit().await?;
     let mut visible = Vec::new();
     for row in rows {
         let group = view(row)?;
@@ -670,7 +682,7 @@ pub async fn list_groups(
             archived: group.archived,
             viewer_in_group: group.viewer_in_group,
         };
-        if decide(access.capability, Target::Group(facts), Action::Read).is_ok() {
+        if decide(capability, Target::Group(facts), Action::Read).is_ok() {
             visible.push(group);
         }
     }
@@ -717,27 +729,7 @@ pub async fn list_group_members(
     authorize(&mut tx, viewer, Resource::Group(group_id), Action::Read, at)
         .await?
         .map_err(|d| denied(d, MembershipError::UnknownGroup))?;
-    let sql = format!(
-        "select s.membership_id, bool_or(s.by_hand), bool_or(not s.by_hand)
-           from (select gm.membership_id, true as by_hand
-                   from group_members gm
-                  where gm.tenant_id = $1 and gm.group_id = $2 and gm.removed_at is null
-                 union all
-                 select ra.membership_id, false
-                   from groups g
-                   join roles r             on r.tenant_id = g.tenant_id and {ROLE_FOLLOWS_GROUP}
-                   join role_assignments ra on ra.tenant_id = r.tenant_id and ra.role_id = r.id
-                  where g.tenant_id = $1 and g.id = $2 and {ASSIGNMENT_VALID_ON_3}) s
-           join memberships m on m.tenant_id = $1 and m.id = s.membership_id
-           join accounts a    on a.id = m.account_id
-          where {USABLE_ACCOUNT}
-            and exists (select 1 from role_assignments ra
-                         where ra.tenant_id = m.tenant_id and ra.membership_id = m.id
-                           and {ASSIGNMENT_VALID_ON_3})
-          group by s.membership_id
-          order by s.membership_id"
-    );
-    let rows: Vec<(Uuid, bool, bool)> = sqlx::query_as(&sql)
+    let rows: Vec<(Uuid, Uuid, bool, bool)> = sqlx::query_as(&group_members_sql("= $2"))
         .bind(viewer.tenant_id)
         .bind(group_id)
         .bind(date_param(at.today()))
@@ -747,11 +739,52 @@ pub async fn list_group_members(
     Ok(rows
         .into_iter()
         .map(
-            |(membership_id, added_by_hand, through_role)| GroupMemberView {
+            |(_, membership_id, added_by_hand, through_role)| GroupMemberView {
                 membership_id,
                 added_by_hand,
                 through_role,
             },
         )
         .collect())
+}
+
+/// Whether membership `m` (joined to `accounts a` in the same query) has standing on the
+/// date bound as `$3`: a usable account, and some role assignment valid that day. The one
+/// source [`group_members_sql`] and the member directory's own top-level listing share, so
+/// the predicate is written once (controller ruling, Q5).
+pub(crate) fn standing_today_sql() -> String {
+    format!(
+        "{USABLE_ACCOUNT}
+            and exists (select 1 from role_assignments ra
+                         where ra.tenant_id = m.tenant_id and ra.membership_id = m.id
+                           and {ASSIGNMENT_VALID_ON_3})"
+    )
+}
+
+/// `(group_id, membership_id, added_by_hand, through_role)` for the current members of the
+/// groups `g.id <group_filter>` (for example `= $2` or `= any($2)`), with `$1` the tenant and
+/// `$3` the date: added by hand and not removed, or holding a role valid on `$3` that the
+/// group follows. Only people with standing that day count -- a usable membership with some
+/// role assignment valid then; a handover grant is a temporary admin-class recovery right
+/// (§6.2), not group membership. Ordered by group, then membership. The one source of
+/// [`list_group_members`] and the member directory's group sections (#3502).
+pub(crate) fn group_members_sql(group_filter: &str) -> String {
+    format!(
+        "select s.group_id, s.membership_id, bool_or(s.by_hand), bool_or(not s.by_hand)
+           from (select gm.group_id, gm.membership_id, true as by_hand
+                   from group_members gm
+                  where gm.tenant_id = $1 and gm.group_id {group_filter} and gm.removed_at is null
+                 union all
+                 select g.id, ra.membership_id, false
+                   from groups g
+                   join roles r             on r.tenant_id = g.tenant_id and {ROLE_FOLLOWS_GROUP}
+                   join role_assignments ra on ra.tenant_id = r.tenant_id and ra.role_id = r.id
+                  where g.tenant_id = $1 and g.id {group_filter} and {ASSIGNMENT_VALID_ON_3}) s
+           join memberships m on m.tenant_id = $1 and m.id = s.membership_id
+           join accounts a    on a.id = m.account_id
+          where {standing}
+          group by s.group_id, s.membership_id
+          order by s.group_id, s.membership_id",
+        standing = standing_today_sql()
+    )
 }

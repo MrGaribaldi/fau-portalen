@@ -7,7 +7,12 @@ use std::time::Duration;
 use common::membership::*;
 use common::TestDb;
 use fau_crypto::{decrypt, encrypt, Aad, Unit};
-use fau_domain::membership::vocabulary::{GroupName, Visibility};
+use fau_crypto::{Ciphertext, DataKey};
+use fau_domain::directory::address::{CopySeparator, Mailto, RecipientField, Recipients};
+use fau_domain::directory::collation::NameCollator;
+use fau_domain::directory::listing::{arrange, Person, Section, ShownName};
+use fau_domain::email::Email;
+use fau_domain::membership::vocabulary::{CapabilityClass, DisplayName, GroupName, Visibility};
 use fau_keys::{data_key, Auth, DataKeyError, KeyCache, KeyError, Keys, KeysConfig};
 use fau_persistence::membership::*;
 use jiff::SignedDuration;
@@ -216,4 +221,248 @@ async fn group_names_are_encrypted_under_the_record_key_and_bound_to_their_row()
     // Bound to its row: the same ciphertext under another group's id does not open.
     let elsewhere = Aad::new(fau.tenant_id, table, column, Uuid::now_v7());
     assert!(decrypt(&key, &elsewhere, &listed[0].encrypted_name).is_err());
+}
+
+fn seal(
+    key: &DataKey,
+    tenant: Uuid,
+    aad: (&'static str, &'static str),
+    row: Uuid,
+    text: &str,
+) -> Ciphertext {
+    encrypt(key, &Aad::new(tenant, aad.0, aad.1, row), text).unwrap()
+}
+
+fn open(
+    key: &DataKey,
+    tenant: Uuid,
+    aad: (&'static str, &'static str),
+    row: Uuid,
+    ct: &Ciphertext,
+) -> String {
+    decrypt(key, &Aad::new(tenant, aad.0, aad.1, row), ct)
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
+/// Groups design §4 end to end (#3502): names and contact addresses enter under the record
+/// key bound to their membership, nothing readable reaches Postgres, and the session turns
+/// the directory into an ordered listing and a `mailto:` link.
+#[tokio::test]
+async fn the_directory_end_to_end_under_the_record_key() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let t0 = at(T0);
+    let fau = active_fau(&pool, "admin@example.test", t0).await;
+    let tenant = fau.tenant_id;
+    let keys = keys().await;
+    let cache = KeyCache::new(
+        keys.clone(),
+        Arc::new(jiff::Timestamp::now),
+        SignedDuration::from_mins(30),
+    );
+    let key = {
+        let mut c = pool.acquire().await.unwrap();
+        data_key(
+            &mut c,
+            &keys,
+            &cache,
+            Uuid::now_v7(),
+            &Unit::Record { tenant },
+        )
+        .await
+        .unwrap()
+    };
+
+    // The admin names themself; two people join with names, one with a contact address.
+    set_display_name(
+        &pool,
+        SetDisplayName {
+            tenant_id: tenant,
+            actor_membership_id: fau.admin_membership_id,
+            membership_id: fau.admin_membership_id,
+            encrypted_display_name: seal(
+                &key,
+                tenant,
+                DISPLAY_NAME_AAD,
+                fau.admin_membership_id,
+                "Åse Admin",
+            ),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let mut joined = Vec::new();
+    for (address, name, contact) in [
+        (
+            "kari@example.test",
+            "Kari Nordmann",
+            Some("kari.privat@example.no"),
+        ),
+        ("oystein@example.test", "Øystein", None),
+    ] {
+        let token = issue_invitation(
+            &pool,
+            IssueInvitation {
+                tenant_id: tenant,
+                actor_membership_id: fau.admin_membership_id,
+                recipient: email(address),
+                roles: vec![OfferedRole {
+                    role: new_role("Medlem", CapabilityClass::Member),
+                    period: period(day(2026, 9, 1), day(2027, 9, 1)),
+                }],
+                handover_grant_id: None,
+                message: None,
+            },
+            t0,
+        )
+        .await
+        .unwrap()
+        .token
+        .expose()
+        .to_owned();
+        let target = prepare_acceptance(&pool, &token, &verified(address), t0)
+            .await
+            .unwrap();
+        let m = target.membership_id;
+        let name = DisplayName::parse(name).unwrap();
+        accept_invitation(
+            &pool,
+            AcceptInvitation {
+                token,
+                acceptor: verified(address),
+                admin_end_override: None,
+                profile: MemberProfile {
+                    membership_id: m,
+                    encrypted_display_name: seal(&key, tenant, DISPLAY_NAME_AAD, m, name.as_str()),
+                    encrypted_contact_email: contact.map(|c| {
+                        seal(
+                            &key,
+                            tenant,
+                            CONTACT_EMAIL_AAD,
+                            m,
+                            Email::parse(c).unwrap().as_str(),
+                        )
+                    }),
+                },
+            },
+            t0,
+        )
+        .await
+        .unwrap();
+        joined.push(m);
+    }
+    let (kari, oystein) = (joined[0], joined[1]);
+
+    // Nothing readable in Postgres.
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar(
+        "select coalesce(encrypted_display_name, '') || coalesce(encrypted_contact_email, '')
+           from memberships where tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for bytes in &stored {
+        for plain in ["Kari", "Admin", "privat", "ystein"] {
+            assert!(
+                !bytes.windows(plain.len()).any(|w| w == plain.as_bytes()),
+                "{plain}"
+            );
+        }
+    }
+
+    // The session decrypts the directory and orders it for Bokmål: Æ, Ø, Å after Z.
+    let viewer = Viewer {
+        tenant_id: tenant,
+        membership_id: kari,
+    };
+    let read = member_directory(&pool, viewer, t0).await.unwrap();
+    let people: Vec<Person> = read
+        .people
+        .iter()
+        .map(|p| Person {
+            membership_id: p.membership_id,
+            name: match &p.name {
+                MemberName::Named(ct) => ShownName::Named(
+                    DisplayName::parse(&open(&key, tenant, DISPLAY_NAME_AAD, p.membership_id, ct))
+                        .unwrap(),
+                ),
+                _ => ShownName::Unnamed,
+            },
+            address: match &p.address {
+                DirectoryAddress::Contact(ct) => {
+                    Email::parse(&open(&key, tenant, CONTACT_EMAIL_AAD, p.membership_id, ct))
+                        .unwrap()
+                }
+                DirectoryAddress::Login(e) => e.clone(),
+            },
+            is_guest: p.is_guest,
+            roles: p.roles.clone(),
+            groups: p.group_ids.clone(),
+        })
+        .collect();
+    let sections: Vec<Section> = read
+        .sections
+        .iter()
+        .map(|s| Section {
+            id: s.section,
+            title: None,
+            members: s.members.clone(),
+        })
+        .collect();
+    let listing = arrange(sections, people, &NameCollator::for_locale("nb-NO"));
+    assert_eq!(
+        listing.sections[0].members,
+        [kari, oystein, fau.admin_membership_id]
+    );
+
+    // "Skriv e-post" for everyone: the audited export, decrypted, becomes one link.
+    let exported = export_addresses(
+        &pool,
+        viewer,
+        AddressExport {
+            purpose: ExportPurpose::Mailto,
+            scope: ExportScope::Fau,
+            membership_ids: listing.sections[0].members.clone(),
+        },
+        t0,
+    )
+    .await
+    .unwrap();
+    let recipients = Recipients::new(exported.iter().map(|r| match &r.address {
+        DirectoryAddress::Contact(ct) => {
+            Email::parse(&open(&key, tenant, CONTACT_EMAIL_AAD, r.membership_id, ct)).unwrap()
+        }
+        DirectoryAddress::Login(e) => e.clone(),
+    }));
+    assert_eq!(recipients.default_field(), RecipientField::To);
+    assert_eq!(
+        recipients.mailto(RecipientField::To),
+        Mailto::Link(
+            "mailto:kari.privat@example.no,oystein@example.test,admin@example.test".into()
+        )
+    );
+    assert_eq!(
+        recipients.copy_text(CopySeparator::Comma),
+        "kari.privat@example.no, oystein@example.test, admin@example.test"
+    );
+
+    // Bound to its row: Kari's name does not open as Øystein's.
+    let kari_name = match &read
+        .people
+        .iter()
+        .find(|p| p.membership_id == kari)
+        .unwrap()
+        .name
+    {
+        MemberName::Named(ct) => ct.clone(),
+        other => panic!("{other:?}"),
+    };
+    let (t, c) = DISPLAY_NAME_AAD;
+    assert!(decrypt(&key, &Aad::new(tenant, t, c, oystein), &kari_name).is_err());
+    let (t, c) = CONTACT_EMAIL_AAD;
+    assert!(decrypt(&key, &Aad::new(tenant, t, c, kari), &kari_name).is_err());
 }

@@ -9,10 +9,10 @@ use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_domain::time::Moment;
 use fau_persistence::membership::{
     accept_invitation, approve_request, create_access_request, create_handover_grants,
-    effective_access, grant_role, issue_invitation, recovery_grant_admin, revoke_membership,
-    revoke_role_assignment, AcceptInvitation, CreateAccessRequest, GrantRole, IssueInvitation,
-    MembershipError, OfferedRole, RecoveryActor, RecoveryGrant, RequestDecision, RevokeAssignment,
-    RevokeMembership, RoleChoice,
+    effective_access, grant_role, issue_invitation, prepare_acceptance, recovery_grant_admin,
+    revoke_membership, revoke_role_assignment, AcceptInvitation, CreateAccessRequest, GrantRole,
+    IssueInvitation, MemberProfile, MembershipError, OfferedRole, RecoveryActor, RecoveryGrant,
+    RequestDecision, RevokeAssignment, RevokeMembership, RoleChoice,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -33,6 +33,7 @@ fn accept(token: &str, acceptor: &str) -> AcceptInvitation {
         token: token.to_owned(),
         acceptor: verified(acceptor),
         admin_end_override: None,
+        profile: fresh_profile(),
     }
 }
 
@@ -253,6 +254,133 @@ async fn an_outgoing_admin_brings_in_a_replacement_who_becomes_an_ordinary_admin
     )
     .await
     .expect("the replacement is an ordinary admin");
+}
+
+/// Fix round 1, item 1 (controller ruling Q10, IMPORTANT): an active, named member with a
+/// stored contact address reached by a second invitation -- here a handover to a sitting
+/// member -- must not have that address silently wiped just because the new acceptance's
+/// profile carries none. The display name is still replaced, since the acceptor did give
+/// one this time. `prepare_acceptance` also reports `existing_current` for the second
+/// invitation, so the caller could have prefilled the form instead of asking again.
+#[tokio::test]
+async fn a_handover_acceptance_by_an_already_active_member_keeps_their_stored_address() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let (fau, grant_id, inside) = outgoing_admin(&pool).await;
+
+    fn env(marker: u8) -> fau_crypto::Ciphertext {
+        let mut v = vec![1u8, marker];
+        v.extend_from_slice(&[0u8; 40]);
+        fau_crypto::Ciphertext::from_stored(v)
+    }
+    async fn fields(pool: &PgPool, membership: Uuid) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        sqlx::query_as(
+            "select encrypted_display_name, encrypted_contact_email
+               from memberships where id = $1",
+        )
+        .bind(membership)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // Kari joins as an ordinary member, named, with a contact address.
+    let first_issued = issue_invitation(
+        &pool,
+        IssueInvitation {
+            tenant_id: fau.tenant_id,
+            actor_membership_id: fau.admin_membership_id,
+            recipient: email("kari@example.test"),
+            roles: vec![OfferedRole {
+                role: new_role("Medlem", CapabilityClass::Member),
+                period: period(day(2026, 9, 23), day(2028, 9, 1)),
+            }],
+            handover_grant_id: None,
+            message: None,
+        },
+        at(T0),
+    )
+    .await
+    .unwrap();
+    let first_target = prepare_acceptance(
+        &pool,
+        first_issued.token.expose(),
+        &verified("kari@example.test"),
+        at(T0),
+    )
+    .await
+    .unwrap();
+    assert!(!first_target.existing_current, "kari is not yet a member");
+    let kari = accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token: first_issued.token.expose().to_owned(),
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: first_target.membership_id,
+                encrypted_display_name: env(1),
+                encrypted_contact_email: Some(env(2)),
+            },
+        },
+        at(T0),
+    )
+    .await
+    .unwrap()
+    .membership_id;
+    assert_eq!(
+        fields(&pool, kari).await,
+        (
+            Some(env(1).as_bytes().to_vec()),
+            Some(env(2).as_bytes().to_vec())
+        )
+    );
+
+    // A handover invitation reaches her again, offering the admin role.
+    let issued = issue_invitation(
+        &pool,
+        handover_invite(
+            &fau,
+            grant_id,
+            "kari@example.test",
+            RoleChoice::Existing(fau.admin_role_id),
+        ),
+        inside,
+    )
+    .await
+    .unwrap();
+    let target = prepare_acceptance(
+        &pool,
+        issued.token.expose(),
+        &verified("kari@example.test"),
+        inside,
+    )
+    .await
+    .unwrap();
+    assert_eq!(target.membership_id, kari, "the same membership");
+    assert!(target.existing_current, "already active and named");
+
+    let accepted = accept_invitation(
+        &pool,
+        AcceptInvitation {
+            token: issued.token.expose().to_owned(),
+            acceptor: verified("kari@example.test"),
+            admin_end_override: None,
+            profile: MemberProfile {
+                membership_id: target.membership_id,
+                encrypted_display_name: env(3),
+                encrypted_contact_email: None,
+            },
+        },
+        inside,
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.membership_id, kari);
+
+    let (name, contact) = fields(&pool, kari).await;
+    assert_eq!(name.as_deref(), Some(env(3).as_bytes()), "name replaced");
+    assert_eq!(contact.as_deref(), Some(env(2).as_bytes()), "address kept");
 }
 
 #[tokio::test]
@@ -1270,9 +1398,13 @@ async fn a_removed_admin_does_not_regain_handover_through_reopen_and_the_sweep()
     )
     .await
     .unwrap();
+    // A reopened membership keeps its id, so the profile is encrypted for it (#3502).
     let back = accept_invitation(
         &pool,
-        accept(issued.token.expose(), "admin@example.test"),
+        AcceptInvitation {
+            profile: profile_for(&pool, issued.token.expose(), "admin@example.test", d).await,
+            ..accept(issued.token.expose(), "admin@example.test")
+        },
         d,
     )
     .await

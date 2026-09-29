@@ -128,6 +128,31 @@ pub enum MembershipError {
     #[error("cohort not found")]
     UnknownCohort,
 
+    // The member directory (#3502).
+    #[error("the display name is not a well-formed ciphertext")]
+    DisplayNameMalformed,
+    #[error("the contact address is not a well-formed ciphertext")]
+    ContactEmailMalformed,
+    /// `MemberProfile::check` (fix round 1, Q10): the id must be a UUIDv7, the same as
+    /// every other id this schema mints, so an acceptance can never bind a name to
+    /// something a database index would treat as out of order or as attacker-chosen.
+    #[error("the membership id is not a well-formed uuidv7")]
+    MembershipIdMalformed,
+    /// The membership the profile was encrypted for is not the one acceptance found: another
+    /// acceptance created it in between. `prepare_acceptance` again and re-encrypt.
+    #[error("the membership changed since the acceptance was prepared")]
+    AcceptanceTargetChanged,
+    #[error("the membership's name was erased")]
+    MembershipErased,
+    /// The membership has ended -- it is revoked, or none of its role assignments is still
+    /// running or yet to start -- so it holds no name (Erik's D3, 28 September 2026).
+    #[error("the membership has ended")]
+    MembershipEnded,
+    /// The export's audit trail (#3502 Task 8): a selection of nobody has nothing to hand
+    /// over and nothing to audit.
+    #[error("nothing was selected")]
+    EmptySelection,
+
     // Infrastructure.
     #[error("the operating system's random source failed")]
     Randomness,

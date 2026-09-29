@@ -15,6 +15,8 @@ chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 getrandom = "0.4"
+icu_collator = "2.3"
+icu_locale_core = "2.3"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
 serde = { version = "1", features = ["derive"] }

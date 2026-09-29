@@ -26,12 +26,17 @@
 
 mod access;
 mod authz;
+mod directory;
 mod error;
 mod events;
+mod export;
 mod groups;
 mod handover;
 mod invitations;
+mod names;
+mod profile;
 mod requests;
+mod retention;
 mod roles;
 mod signup;
 mod sql;
@@ -39,8 +44,12 @@ mod token;
 
 pub use access::effective_access;
 pub use authz::{authorize, read_transaction, Resource, Viewer};
+pub use directory::{
+    member_directory, DirectoryAddress, DirectoryPerson, DirectoryRead, DirectorySection,
+};
 pub use error::{ExistingFau, MembershipError};
 pub use events::{Change, Hub, HubClock, Subscription, EVENTS_CHANNEL, SUBSCRIPTION_BUFFER};
+pub use export::{export_addresses, AddressExport, ExportPurpose, ExportScope, ExportedRecipient};
 pub use groups::{
     add_group_member, archive_group, create_group, get_group, list_group_members, list_groups,
     remove_group_member, rename_group, set_group_visibility, ArchiveGroup, CreateGroup,
@@ -49,16 +58,22 @@ pub use groups::{
 };
 pub use handover::{create_handover_grants, recovery_grant_admin, RecoveryActor, RecoveryGrant};
 pub use invitations::{
-    accept_invitation, invitation_message, issue_invitation, resend_invitation,
-    withdraw_invitation, AcceptInvitation, Accepted, InvitationChange, InvitationMessage,
-    InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole, RoleChoice,
-    INVITATION_MESSAGE_AAD,
+    accept_invitation, invitation_message, issue_invitation, prepare_acceptance, resend_invitation,
+    withdraw_invitation, AcceptInvitation, AcceptanceTarget, Accepted, InvitationChange,
+    InvitationMessage, InvitationMessageView, IssueInvitation, IssuedInvitation, OfferedRole,
+    RoleChoice, INVITATION_MESSAGE_AAD,
+};
+pub use names::{member_names, MemberName};
+pub use profile::{
+    set_contact_email, set_display_name, MemberProfile, SetContactEmail, SetDisplayName,
+    CONTACT_EMAIL_AAD, DISPLAY_NAME_AAD, MEMBER_FIELD_CIPHERTEXT_BYTES,
 };
 pub use requests::{
     access_request_message, approve_request, create_access_request, create_replacement_proposal,
     decline_request, lapse_requests, AccessRequestMessage, CreateAccessRequest,
     CreateReplacementProposal, RequestDecision, ACCESS_REQUEST_MESSAGE_AAD, MESSAGE_MAX_BYTES,
 };
+pub use retention::{clear_ended_profiles, erase_member_names};
 pub use roles::{
     grant_role, revoke_membership, revoke_role_assignment, GrantRole, RevokeAssignment,
     RevokeMembership,

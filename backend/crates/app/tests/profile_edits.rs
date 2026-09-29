@@ -101,8 +101,7 @@ async fn a_member_edits_their_own_name_and_the_audit_holds_no_name() {
 }
 
 /// Mutation check: drop the `membership_ended` test from `set_display_name`, and the
-/// revoked row fails on migration 0008's `memberships_display_name_only_while_current`
-/// while the ran-out row is renamed.
+/// revoked row, retained under #3511, is renamed to `envelope(9)`, as is the ran-out row.
 #[tokio::test]
 async fn an_admin_corrects_an_active_members_name_and_an_ended_membership_takes_none() {
     let db = TestDb::migrated().await;
@@ -136,7 +135,8 @@ async fn an_admin_corrects_an_active_members_name_and_an_ended_membership_takes_
         .await
         .unwrap();
 
-    // Revoked: the name went with it, and a correction cannot bring one back.
+    // Revoked: a correction is refused. Under #3511 the name is kept, hidden, for the
+    // default period, and the refused correction leaves it untouched.
     revoke_membership(
         &pool,
         RevokeMembership {
@@ -153,7 +153,10 @@ async fn an_admin_corrects_an_active_members_name_and_an_ended_membership_takes_
         rename(&pool, fau.tenant_id, fau.admin_membership_id, kari, 9).await,
         Err(MembershipError::MembershipEnded)
     );
-    assert_eq!(name_of(&pool, kari).await, None);
+    assert_eq!(
+        name_of(&pool, kari).await.as_deref(),
+        Some(envelope(8).as_bytes())
+    );
 
     // Ran out, and the sweep has not reached it yet: the old name stays untouched until
     // it does, and no new one is accepted.

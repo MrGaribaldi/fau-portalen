@@ -1,6 +1,8 @@
 //! Granting and revoking roles and memberships, with the last-admin safeguard (spec 7).
 
+use fau_domain::directory::history::ended_on;
 use fau_domain::membership::period::Period;
+use fau_domain::membership::retention::{keep_until, RetentionMonths};
 use fau_domain::membership::rules::handover_period;
 use fau_domain::time::Moment;
 use serde_json::json;
@@ -11,7 +13,9 @@ use super::error::MembershipError;
 use super::events::{notify, Change};
 use super::groups::remove_from_all_groups;
 use super::invitations::{resolve_roles, OfferedRole, RoleChoice};
+use super::names::held_roles;
 use super::profile::membership_ended;
+use super::retention::account_retention;
 use super::sql::{
     check_last_admin, date_param, insert_assignment, is_admin_today, lock_tenant,
     membership_and_account_state, parse_date, require_admin, require_open, ts_param, write_audit,
@@ -280,18 +284,20 @@ pub async fn revoke_membership(
     if !leaving {
         require_admin(&mut tx, req.tenant_id, req.actor_membership_id, at.today()).await?;
     }
-    let target: Option<bool> = sqlx::query_scalar(
-        "select revoked_at is not null from memberships where tenant_id = $1 and id = $2 for update",
+    let target: Option<(bool, bool)> = sqlx::query_as(
+        "select revoked_at is not null,
+                (encrypted_display_name is not null or encrypted_contact_email is not null)
+           from memberships where tenant_id = $1 and id = $2 for update",
     )
     .bind(req.tenant_id)
     .bind(req.membership_id)
     .fetch_optional(&mut *tx)
     .await?;
-    match target {
+    let has_fields = match target {
         None => return Err(MembershipError::UnknownMembership),
-        Some(true) => return Err(MembershipError::MembershipRevoked),
-        Some(false) => {}
-    }
+        Some((true, _)) => return Err(MembershipError::MembershipRevoked),
+        Some((false, has_fields)) => has_fields,
+    };
 
     let admins = AdminState::load(&mut tx, req.tenant_id).await?;
     let leaves_none = check_last_admin(&admins, at.today(), req.confirm_no_admin, |_, m| {
@@ -299,20 +305,6 @@ pub async fn revoke_membership(
     })?;
 
     let now = ts_param(at.now());
-    sqlx::query(
-        // Neither field outlives the membership (D3, 28 September 2026): history shows an
-        // ended membership as its role and year, never a name. Migration 0008's two
-        // *_only_while_current checks refuse a revocation that forgets either.
-        "update memberships
-            set revoked_at = $3::timestamptz,
-                encrypted_display_name = null, encrypted_contact_email = null
-          where tenant_id = $1 and id = $2",
-    )
-    .bind(req.tenant_id)
-    .bind(req.membership_id)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
     sqlx::query(
         "update role_assignments set revoked_at = $3::timestamptz
           where tenant_id = $1 and membership_id = $2
@@ -326,6 +318,71 @@ pub async fn revoke_membership(
     .await?;
     revoke_ended_admin_roles_with_open_window(&mut tx, req.tenant_id, req.membership_id, at)
         .await?;
+    // #3511: the fields are kept, hidden, for the account's period from the day the
+    // membership ended (plan Ruling R2), or cleared now for a period of none. Written after
+    // the assignment cascade, so `held_roles` sees the spans it cut short. Migration 0009's
+    // *_only_while_current_or_retained checks refuse a revocation that keeps a field
+    // without the date.
+    let today = at.today();
+    let months = account_retention(&mut tx, req.tenant_id, req.membership_id).await?;
+    let held = held_roles(&mut tx, req.tenant_id, &[req.membership_id])
+        .await?
+        .remove(&req.membership_id)
+        .unwrap_or_default();
+    let keep = keep_until(ended_on(&held, today), months, today).filter(|_| has_fields);
+    sqlx::query(
+        "update memberships
+            set revoked_at = $3::timestamptz,
+                profile_retained_until = $4::date,
+                encrypted_display_name =
+                  case when $4::date is null then null else encrypted_display_name end,
+                encrypted_contact_email =
+                  case when $4::date is null then null else encrypted_contact_email end
+          where tenant_id = $1 and id = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(req.membership_id)
+    .bind(&now)
+    .bind(keep.map(date_param))
+    .execute(&mut *tx)
+    .await?;
+    match keep {
+        Some(until) => {
+            write_audit(
+                &mut tx,
+                at,
+                Audit::system(
+                    req.tenant_id,
+                    "membership.profile_retained",
+                    "membership",
+                    req.membership_id,
+                    json!({ "until": date_param(until) }),
+                ),
+            )
+            .await?
+        }
+        None if has_fields => {
+            write_audit(
+                &mut tx,
+                at,
+                Audit::system(
+                    req.tenant_id,
+                    "membership.profile_cleared",
+                    "membership",
+                    req.membership_id,
+                    // Plan Ruling R9, as `settle_profile`: only a period of none is
+                    // `membership_ended`; otherwise the period was already over.
+                    json!({ "cause": if months == RetentionMonths::None {
+                        "membership_ended"
+                    } else {
+                        "retention_ended"
+                    } }),
+                ),
+            )
+            .await?
+        }
+        None => {}
+    }
     sqlx::query(
         "update handover_grants g set revoked_at = $3::timestamptz
            from role_assignments ra

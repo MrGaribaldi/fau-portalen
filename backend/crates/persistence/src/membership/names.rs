@@ -14,7 +14,7 @@ use fau_domain::authz::Action;
 use fau_domain::directory::history::HeldRole;
 use fau_domain::membership::vocabulary::CapabilityClass;
 use fau_domain::time::{oslo_today, Moment};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::authz::{authorize, denied, read_transaction, Resource, Viewer};
@@ -72,37 +72,8 @@ pub async fn member_names(
         .filter(|(_, _, erased, ended)| !erased && *ended)
         .map(|(id, ..)| *id)
         .collect();
-    let assignments: Vec<AssignmentRow> = sqlx::query_as(
-        "select ra.membership_id, r.name, r.capability_class,
-                to_char(ra.starts_on, 'YYYY-MM-DD'), to_char(ra.ends_on_exclusive, 'YYYY-MM-DD'),
-                (extract(epoch from ra.revoked_at) * 1000000)::bigint
-           from role_assignments ra
-           join roles r on r.tenant_id = ra.tenant_id and r.id = ra.role_id
-          where ra.tenant_id = $1 and ra.membership_id = any($2)
-          order by ra.membership_id, ra.starts_on, ra.id",
-    )
-    .bind(viewer.tenant_id)
-    .bind(&ended)
-    .fetch_all(&mut *tx)
-    .await?;
+    let mut held = held_roles(&mut tx, viewer.tenant_id, &ended).await?;
     tx.commit().await?;
-
-    let mut held: HashMap<Uuid, Vec<HeldRole>> = HashMap::new();
-    for (membership, name, class, starts, ends, revoked_us) in assignments {
-        let from = parse_date(&starts)?;
-        let mut until = parse_date(&ends)?;
-        if let Some(us) = revoked_us {
-            until = until.min(oslo_today(from_micros(us)?));
-        }
-        if from < until {
-            held.entry(membership).or_default().push(HeldRole {
-                name,
-                class: CapabilityClass::from_code(&class).ok_or_else(MembershipError::decode)?,
-                from,
-                until,
-            });
-        }
-    }
 
     let mut out: Vec<(Uuid, MemberName)> = Vec::with_capacity(rows.len());
     for id in membership_ids {
@@ -126,4 +97,45 @@ pub async fn member_names(
         out.push((*id, shown));
     }
     Ok(out)
+}
+
+/// The roles each membership in `ids` actually held, over the days held (an early
+/// revocation ends a span on its Oslo date), non-empty spans only, ordered by start.
+/// Shared by history (`member_names`) and retention (`settle_profile`, `revoke_membership`),
+/// so "when did it end" and "what did it hold" read the same facts.
+pub(crate) async fn held_roles(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<HeldRole>>, MembershipError> {
+    let assignments: Vec<AssignmentRow> = sqlx::query_as(
+        "select ra.membership_id, r.name, r.capability_class,
+                to_char(ra.starts_on, 'YYYY-MM-DD'), to_char(ra.ends_on_exclusive, 'YYYY-MM-DD'),
+                (extract(epoch from ra.revoked_at) * 1000000)::bigint
+           from role_assignments ra
+           join roles r on r.tenant_id = ra.tenant_id and r.id = ra.role_id
+          where ra.tenant_id = $1 and ra.membership_id = any($2)
+          order by ra.membership_id, ra.starts_on, ra.id",
+    )
+    .bind(tenant_id)
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut held: HashMap<Uuid, Vec<HeldRole>> = HashMap::new();
+    for (membership, name, class, starts, ends, revoked_us) in assignments {
+        let from = parse_date(&starts)?;
+        let mut until = parse_date(&ends)?;
+        if let Some(us) = revoked_us {
+            until = until.min(oslo_today(from_micros(us)?));
+        }
+        if from < until {
+            held.entry(membership).or_default().push(HeldRole {
+                name,
+                class: CapabilityClass::from_code(&class).ok_or_else(MembershipError::decode)?,
+                from,
+                until,
+            });
+        }
+    }
+    Ok(held)
 }

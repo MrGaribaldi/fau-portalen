@@ -96,6 +96,17 @@ async fn name(pool: &PgPool, fau: &Fau, m: Uuid, at_: &str) -> MemberName {
     names.into_iter().next().unwrap().1
 }
 
+/// Sets the account's retention period (#3511). Call it after the account exists (its
+/// first acceptance); before that the update sets nothing.
+async fn set_months_by_sql(pool: &PgPool, address: &str, months: i32) {
+    sqlx::query("update accounts set retention_months = $2 where email = $1")
+        .bind(address)
+        .bind(months)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 /// "Medlem", held from `from` up to (not including) `until`.
 fn medlem(from: Date, until: Date) -> MemberName {
     MemberName::Ended(vec![HeldRole {
@@ -110,7 +121,8 @@ fn medlem(from: Date, until: Date) -> MemberName {
 /// stepped-down member keeps their fields; make `member_names` ignore `ended` and the read
 /// before the sweep returns the name.
 #[tokio::test]
-async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_come() {
+async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_come_with_a_period_of_none(
+) {
     let db = TestDb::migrated().await;
     let pool = db.app_pool().await;
     let t0 = at(T0);
@@ -153,6 +165,16 @@ async fn the_sweep_clears_the_name_and_address_once_no_role_runs_or_is_still_to_
     let stepped_down = join(&pool, &a, "down@example.test", long)
         .await
         .membership_id;
+    // #3511: with a period of none, every end clears at once, as under D3.
+    for address in [
+        "ends@example.test",
+        "quiet@example.test",
+        "renewed@example.test",
+        "kari@example.test",
+        "down@example.test",
+    ] {
+        set_months_by_sql(&pool, address, 0).await;
+    }
     for (fau, m, marker) in [
         (&a, ends, 1),
         (&a, renewed, 2),

@@ -231,6 +231,8 @@ async fn a_non_uuidv7_membership_id_is_refused_before_anything_is_written() {
     }
 }
 
+// Task 5: passes a revoked member through re-acceptance; under #3511 the revocation keeps
+// the name for the default period, so this fails until Task 5 settles re-acceptance.
 #[tokio::test]
 async fn a_profile_for_another_membership_is_refused() {
     let db = TestDb::migrated().await;
@@ -737,21 +739,15 @@ async fn a_membership_whose_roles_ran_out_reports_existing_current_false_and_dro
     );
 }
 
-/// Both fields go with the membership (D3). Without the clearing in `revoke_membership`,
-/// migration 0008's `memberships_display_name_only_while_current` or
-/// `memberships_contact_email_only_while_current` refuses the revocation outright.
-#[tokio::test]
-async fn revoking_a_membership_clears_its_name_and_contact_address() {
-    let db = TestDb::migrated().await;
-    let pool = db.app_pool().await;
+/// Accepts kari's invitation with name `envelope(3)` and address `envelope(4)`.
+async fn kari_with_both_fields(pool: &PgPool, fau: &Fau) -> Uuid {
     let t0 = at(T0);
-    let fau = active_fau(&pool, "admin@example.test", t0).await;
-    let token = invite(&pool, &fau, "kari@example.test").await;
-    let target = prepare_acceptance(&pool, &token, &verified("kari@example.test"), t0)
+    let token = invite(pool, fau, "kari@example.test").await;
+    let target = prepare_acceptance(pool, &token, &verified("kari@example.test"), t0)
         .await
         .unwrap();
-    let kari = accept_invitation(
-        &pool,
+    accept_invitation(
+        pool,
         AcceptInvitation {
             token,
             acceptor: verified("kari@example.test"),
@@ -766,18 +762,70 @@ async fn revoking_a_membership_clears_its_name_and_contact_address() {
     )
     .await
     .unwrap()
-    .membership_id;
+    .membership_id
+}
+
+async fn leave_at_t0(pool: &PgPool, fau: &Fau, m: Uuid) {
     revoke_membership(
-        &pool,
+        pool,
         RevokeMembership {
             tenant_id: fau.tenant_id,
-            actor_membership_id: kari,
-            membership_id: kari,
+            actor_membership_id: m,
+            membership_id: m,
             confirm_no_admin: false,
         },
-        t0,
+        at(T0),
     )
     .await
     .unwrap();
+}
+
+async fn retained_until(pool: &PgPool, m: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "select to_char(profile_retained_until, 'YYYY-MM-DD') from memberships where id = $1",
+    )
+    .bind(m)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// With a period of none (#3511), both fields go with the membership, as under D3.
+/// Without the clearing in `revoke_membership`, migration 0009's
+/// `memberships_*_only_while_current_or_retained` checks refuse the revocation outright.
+#[tokio::test]
+async fn revoking_a_membership_with_a_period_of_none_clears_both_fields() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let kari = kari_with_both_fields(&pool, &fau).await;
+    sqlx::query("update accounts set retention_months = 0 where email = 'kari@example.test'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    leave_at_t0(&pool, &fau, kari).await;
     assert_eq!(fields(&pool, kari).await, (None, None));
+    assert_eq!(retained_until(&pool, kari).await, None);
+}
+
+/// The default period (3 months, #3511 M2) keeps both fields, hidden, from the day the
+/// membership ended (T0, 23 September 2026) until 23 December 2026.
+#[tokio::test]
+async fn revoking_a_membership_keeps_both_fields_for_the_default_period() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let fau = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let kari = kari_with_both_fields(&pool, &fau).await;
+    leave_at_t0(&pool, &fau, kari).await;
+    assert_eq!(
+        fields(&pool, kari).await,
+        (
+            Some(envelope(3).as_bytes().to_vec()),
+            Some(envelope(4).as_bytes().to_vec())
+        )
+    );
+    assert_eq!(
+        retained_until(&pool, kari).await.as_deref(),
+        Some("2026-12-23")
+    );
 }

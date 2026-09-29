@@ -884,6 +884,53 @@ async fn revoking_a_stamped_natural_end_keeps_the_stamp() {
     }
 }
 
+/// Erik, 29 September 2026 ("use the revocation date"): a membership that held no role
+/// ended on the day its last booked role was revoked, even if the member leaves later.
+/// The sweep stamps that day plus 3 months, the later leave keeps the stamp, and a
+/// recalculation with the same setting a month on moves nothing and audits nothing.
+///
+/// Mutation check: put `m.revoked_at` first in `ended_on_for`'s coalesce again and the
+/// recalculation takes the leave day, moving the date to 2027-01-20 with a
+/// `retention_changed`.
+#[tokio::test]
+async fn a_role_revoked_before_it_started_marks_the_end_even_after_a_later_leave() {
+    let db = TestDb::migrated().await;
+    let pool = db.app_pool().await;
+    let a = active_fau(&pool, "admin@example.test", at(T0)).await;
+    let m = join(&pool, &a, "never@example.test", booked()).await;
+    revoke(
+        &pool,
+        &a,
+        live_assignment(&pool, m).await,
+        at("2026-10-01T10:00:00Z"),
+    )
+    .await;
+    clear_ended_profiles(&pool, at("2026-10-15T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(state(&pool, m).await.2.as_deref(), Some("2027-01-01"));
+    leave(&pool, &a, m, "2026-10-20T10:00:00Z").await;
+    assert_eq!(state(&pool, m).await.2.as_deref(), Some("2027-01-01"));
+    let acc = account_of(&pool, m).await;
+    set_retention_months(
+        &pool,
+        acc,
+        RetentionMonths::Three,
+        at("2026-11-20T10:00:00Z"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state(&pool, m).await.2.as_deref(),
+        Some("2027-01-01"),
+        "the role's revocation day, not the leave day"
+    );
+    assert_eq!(
+        count_of(&audits(&pool, m).await, "membership.retention_changed"),
+        0
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_account_is_refused() {
     let db = TestDb::migrated().await;

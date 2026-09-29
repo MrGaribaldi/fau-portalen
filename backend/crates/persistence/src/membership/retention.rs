@@ -72,9 +72,13 @@ pub(crate) async fn account_retention(
 /// The day an ended membership ended (plan Ruling R2; final review I2), the one end date
 /// every retention path uses: the latest day any of its roles stopped being held. A
 /// membership that held no role at all -- revoked, or its only roles revoked, before any
-/// started -- ended on the Oslo date of `memberships.revoked_at`, or else of its latest
-/// assignment revocation. Never later than `today`; `today` only when none of those exist.
-/// A fact of the past, so recomputing it never moves a period.
+/// started -- ended on the Oslo date of its latest assignment revocation (Erik, 29
+/// September 2026: "use the revocation date"): `revoke_membership` revokes every live
+/// assignment at the same moment, so that revocation always marks the end, and a member
+/// who leaves after their last booked role was revoked had already ended then.
+/// `memberships.revoked_at` is only the fallback for a membership with no assignment rows.
+/// Never later than `today`; `today` only when none of those exist. A fact of the past,
+/// so recomputing it never moves a period.
 pub(crate) async fn ended_on_for(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -90,9 +94,9 @@ pub(crate) async fn ended_on_for(
     }
     let revoked_us: Option<i64> = sqlx::query_scalar(
         "select (extract(epoch from coalesce(
-                    m.revoked_at,
                     (select max(ra.revoked_at) from role_assignments ra
-                      where ra.tenant_id = m.tenant_id and ra.membership_id = m.id)
+                      where ra.tenant_id = m.tenant_id and ra.membership_id = m.id),
+                    m.revoked_at
                 )) * 1000000)::bigint
            from memberships m where m.tenant_id = $1 and m.id = $2",
     )
@@ -507,7 +511,9 @@ pub async fn set_retention_months(
         .await?;
         for (id, stamped) in rows {
             // Once a membership has ended, its end date is a fact of the past, so
-            // `ended_on_for` recomputed here is the same day as at stamping.
+            // `ended_on_for` recomputed here is the same day as at stamping: the last held
+            // role's end, else the latest role revocation (not a later leave), else the
+            // membership's revocation.
             let ended = ended_on_for(&mut tx, tenant_id, id, today).await?;
             match keep_until(ended, months, today) {
                 None => clear_profile(&mut tx, tenant_id, id, at, "retention_shortened").await?,

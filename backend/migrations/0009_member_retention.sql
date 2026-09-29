@@ -19,9 +19,14 @@
 -- which the checks below would refuse on a stamped row. The BEFORE UPDATE trigger
 -- memberships_retention_follows_fields nulls the date when an update clears both fields
 -- or sets name_erased_at, so old code keeps working. It grants nothing: it only rewrites
--- the row being updated. One gap remains, and it is harmless: an old ensure_membership can
--- reopen a stamped row (revoked_at null) and leave its date on an active row. New code
--- settles an active row as Active, never reading the date, and nulls it on its own reopen.
+-- the row being updated. One gap remains, and it matters only during a rollout window: an
+-- old ensure_membership can reopen a stamped row (revoked_at null) and leave its date on an
+-- active row. New code does read profile_retained_until on that row: a revocation keeps
+-- the stale date as the membership's period instead of stamping a new one, and a
+-- set_retention_months recalculation treats it as a running period, so it can move the
+-- date or, under a shorter setting, clear the active member's fields. Only an old binary
+-- reopens a row that way, so new stale dates stop once none is running; new code nulls
+-- the date on its own reopen.
 alter table memberships add column profile_retained_until date;
 
 alter table memberships
